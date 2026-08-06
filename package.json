@@ -1,0 +1,12 @@
+{
+  "name": "raw-http-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTTP/HTTPS server built directly on net/tls sockets, without the http module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:https": "node src/https-server.js",
+    "gen-cert": "bash scripts/generate-cert.sh"
+  }
+}
