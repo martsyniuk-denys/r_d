@@ -1,15 +1,18 @@
+name: mini-nest
+
 services:
-  # `docker compose run --rm api npm test` runs the suite inside the image.
-  # The builder stage is the one that carries dev dependencies (TypeScript) and test/.
   api:
     build:
       context: .
       target: builder
     command: npm test
 
-  # `docker compose run --rm demo` runs the slim production image (prod deps + dist only).
   demo:
     build:
       context: .
       target: runner
+    environment:
+      PORT: 3000
+    ports:
+      - "3000:3000"
     profiles: ["demo"]
