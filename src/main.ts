@@ -1,48 +1,25 @@
 import 'reflect-metadata';
 
 import { Container } from './container';
-import { Inject } from './decorators/inject';
-import { Injectable } from './decorators/injectable';
-import { CONFIG_TOKEN, LOGGER_TOKEN, type AppConfig, type Logger } from './tokens';
+import { HealthController } from './controllers/health.controller';
+import { UsersController } from './controllers/users.controller';
+import { Dispatcher } from './dispatcher';
+import { Router } from './router';
 
-@Injectable()
-class Database {
-  private readonly rows = new Map<number, string>([[1, 'Ada Lovelace']]);
+const PORT = Number(process.env.PORT ?? 3000);
+const HOST = process.env.HOST ?? '0.0.0.0';
 
-  findUser(id: number): string | undefined {
-    return this.rows.get(id);
+async function bootstrap(): Promise<void> {
+  const container = new Container();
+  const router = new Router().register(HealthController).register(UsersController);
+  const dispatcher = new Dispatcher(container, router);
+
+  const url = await dispatcher.listen(PORT, HOST);
+
+  console.log(`mini-nest listening on ${url}`);
+  for (const route of router.list()) {
+    console.log(`  ${route.method.padEnd(4)} ${route.path} -> ${route.controller.name}.${route.handlerName}()`);
   }
 }
 
-@Injectable()
-class UserService {
-  constructor(
-    private readonly db: Database,
-    @Inject(LOGGER_TOKEN) private readonly logger: Logger,
-    @Inject(CONFIG_TOKEN) private readonly config: AppConfig,
-  ) {}
-
-  greet(id: number): string {
-    const user = this.db.findUser(id) ?? 'stranger';
-    this.logger.log(`[${this.config.appName}] greeting ${user}`);
-    return `Hello, ${user}!`;
-  }
-}
-
-@Injectable({ scope: 'transient' })
-class RequestId {
-  readonly value = Math.random().toString(16).slice(2, 8);
-}
-
-const container = new Container();
-
-container.register(LOGGER_TOKEN, { useValue: { log: (m: string) => console.log('  ' + m) } });
-container.register(CONFIG_TOKEN, { useValue: { appName: 'demo', port: 3000 } satisfies AppConfig });
-
-const users = container.resolve(UserService);
-
-console.log('graph resolved from constructor metadata only:');
-console.log(' ', users.greet(1));
-console.log('singleton:', container.resolve(UserService) === container.resolve(UserService));
-console.log('transient:', container.resolve(RequestId) === container.resolve(RequestId));
-console.log('ids:', container.resolve(RequestId).value, container.resolve(RequestId).value);
+void bootstrap();
