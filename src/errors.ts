@@ -30,12 +30,26 @@ export class HttpError extends Error {
   }
 }
 
-export class ValidationFailedError extends HttpError {
+export class NotFoundError extends HttpError {
+  constructor(message: string) {
+    super(404, message);
+    this.name = 'NotFoundError';
+  }
+}
+
+export class ForbiddenError extends HttpError {
+  constructor(message = 'Forbidden') {
+    super(403, message);
+    this.name = 'ForbiddenError';
+  }
+}
+
+export class ValidationError extends HttpError {
   readonly errors: readonly FieldError[];
 
   constructor(errors: FieldError[]) {
     super(400, 'Validation failed');
-    this.name = 'ValidationFailedError';
+    this.name = 'ValidationError';
     this.errors = errors;
   }
 }

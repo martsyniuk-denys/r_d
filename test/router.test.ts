@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 import { Controller } from '../src/decorators/controller';
 import { Get, Post } from '../src/decorators/methods';
 import { Body, Param, Query } from '../src/decorators/params';
-import { CreateUserDto } from '../src/dto/create-user.dto';
+import { createUserSchema, type CreateUserDto } from '../src/dto/create-user.dto';
 import { PARAMS_METADATA, ROUTES_METADATA } from '../src/metadata';
 import { Router, joinPath } from '../src/router';
 
@@ -23,7 +23,7 @@ class UsersRoutes {
   }
 
   @Post()
-  create(@Body() dto: CreateUserDto): unknown {
+  create(@Body(createUserSchema) dto: CreateUserDto): unknown {
     return dto;
   }
 }
@@ -112,8 +112,8 @@ describe('router', () => {
       .list()
       .find((candidate) => candidate.handlerName === 'create');
 
-    assert.deepEqual(route?.params, { 0: { source: 'body', name: undefined } });
-    assert.deepEqual(route?.paramTypes, [CreateUserDto]);
+    assert.deepEqual(route?.params, { 0: { source: 'body', schema: createUserSchema } });
+    assert.deepEqual(route?.paramTypes, [Object]);
   });
 
   it('runs parameter decorators first, then the method decorator, then the class one', () => {

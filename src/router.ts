@@ -1,7 +1,10 @@
 import 'reflect-metadata';
 
+import type { CanActivate, Component, Interceptor } from './lifecycle';
 import {
   CONTROLLER_METADATA,
+  GUARDS_METADATA,
+  INTERCEPTORS_METADATA,
   PARAMS_METADATA,
   ROUTES_METADATA,
   type Constructor,
@@ -18,6 +21,8 @@ export interface Route {
   handlerName: string;
   params: ParamMap;
   paramTypes: unknown[];
+  guards: Component<CanActivate>[];
+  interceptors: Component<Interceptor>[];
 }
 
 export interface RouteMatch {
@@ -54,6 +59,8 @@ export class Router {
           (Reflect.getMetadata('design:paramtypes', prototype, route.handlerName) as
             | unknown[]
             | undefined) ?? [],
+        guards: collect(GUARDS_METADATA, controller, prototype, route.handlerName),
+        interceptors: collect(INTERCEPTORS_METADATA, controller, prototype, route.handlerName),
       });
     }
 
@@ -105,6 +112,18 @@ export function joinPath(prefix: string, path: string): string {
 
 export function splitPath(path: string): string[] {
   return path.split('/').filter((segment) => segment.length > 0);
+}
+
+function collect<T>(
+  key: symbol,
+  controller: Constructor,
+  prototype: object,
+  handlerName: string,
+): T[] {
+  const onClass = (Reflect.getMetadata(key, controller) as T[] | undefined) ?? [];
+  const onMethod = (Reflect.getMetadata(key, prototype, handlerName) as T[] | undefined) ?? [];
+
+  return [...onClass, ...onMethod];
 }
 
 function countDynamic(route: Route): number {

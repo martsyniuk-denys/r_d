@@ -1,3 +1,5 @@
+import type { ZodType } from 'zod';
+
 export const INJECTABLE_METADATA = Symbol('ioc:injectable');
 
 export const SCOPE_METADATA = Symbol('ioc:scope');
@@ -9,6 +11,10 @@ export const CONTROLLER_METADATA = Symbol('http:controller');
 export const ROUTES_METADATA = Symbol('http:routes');
 
 export const PARAMS_METADATA = Symbol('http:params');
+
+export const GUARDS_METADATA = Symbol('http:guards');
+
+export const INTERCEPTORS_METADATA = Symbol('http:interceptors');
 
 export type Constructor<T = unknown> = new (...args: any[]) => T;
 
@@ -33,6 +39,7 @@ export type ParamSource = 'body' | 'param' | 'query';
 export interface ParamDefinition {
   source: ParamSource;
   name?: string;
+  schema?: ZodType;
 }
 
 export type ParamMap = Record<number, ParamDefinition>;
