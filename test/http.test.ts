@@ -3,48 +3,43 @@ import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
-import { Container } from '../src/container';
 import { HealthController } from '../src/controllers/health.controller';
 import { UsersController } from '../src/controllers/users.controller';
 import { Controller } from '../src/decorators/controller';
 import { Post } from '../src/decorators/methods';
 import { Body } from '../src/decorators/params';
-import { Dispatcher } from '../src/dispatcher';
-import { CreateUserDto } from '../src/dto/create-user.dto';
-import { Router } from '../src/router';
+import { createUserSchema, type CreateUserDto } from '../src/dto/create-user.dto';
 import { UsersService, type User } from '../src/services/users.service';
+import { AUTH, startApp, type TestApp } from './support/app';
 
 @Controller('echo')
 class EchoController {
   static received: unknown;
 
   @Post()
-  create(@Body() dto: CreateUserDto): unknown {
+  create(@Body(createUserSchema) dto: CreateUserDto): unknown {
     EchoController.received = dto;
     return { name: dto.name };
   }
 }
 
-const container = new Container();
-const router = new Router()
-  .register(HealthController)
-  .register(UsersController)
-  .register(EchoController);
-const dispatcher = new Dispatcher(container, router);
-
+let app: TestApp;
 let baseUrl = '';
+let container: TestApp['container'];
 
 before(async () => {
-  baseUrl = await dispatcher.listen(0);
+  app = await startApp([HealthController, UsersController, EchoController]);
+  baseUrl = app.url;
+  container = app.container;
 });
 
 after(async () => {
-  await dispatcher.close();
+  await app.close();
 });
 
 describe('http dispatcher', () => {
   it('serves GET /users/42 through the controller prefix and @Param', async () => {
-    const response = await fetch(`${baseUrl}/users/42`);
+    const response = await fetch(`${baseUrl}/users/42`, { headers: AUTH });
     const text = await response.text();
 
     assert.equal(response.status, 200);
@@ -60,7 +55,7 @@ describe('http dispatcher', () => {
   });
 
   it('passes @Query values to the handler as a separate argument', async () => {
-    const response = await fetch(`${baseUrl}/users?limit=1`);
+    const response = await fetch(`${baseUrl}/users?limit=1`, { headers: AUTH });
     const users = (await response.json()) as User[];
 
     assert.equal(response.status, 200);
@@ -68,7 +63,7 @@ describe('http dispatcher', () => {
   });
 
   it('converts a @Query value to the declared parameter type', async () => {
-    const response = await fetch(`${baseUrl}/users?limit=not-a-number`);
+    const response = await fetch(`${baseUrl}/users?limit=not-a-number`, { headers: AUTH });
     const body = (await response.json()) as { message: string };
 
     assert.equal(response.status, 400);
@@ -78,7 +73,7 @@ describe('http dispatcher', () => {
   it('parses the JSON body and answers 201 for a valid POST', async () => {
     const response = await fetch(`${baseUrl}/users`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ name: 'Alan Turing', email: 'alan@example.com', age: 41 }),
     });
     const created = (await response.json()) as User;
@@ -88,24 +83,23 @@ describe('http dispatcher', () => {
     assert.equal(typeof created.id, 'number');
   });
 
-  it('hands the handler an instance of the DTO class, not a plain object', async () => {
+  it('hands the handler the value the schema parsed, not the raw body', async () => {
     EchoController.received = undefined;
 
     const response = await fetch(`${baseUrl}/echo`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ name: 'Ada', email: 'ada@example.com' }),
     });
 
     assert.equal(response.status, 201);
-    assert.ok(EchoController.received instanceof CreateUserDto);
-    assert.equal((EchoController.received as CreateUserDto).email, 'ada@example.com');
+    assert.deepEqual(EchoController.received, { name: 'Ada', email: 'ada@example.com' });
   });
 
   it('rejects an invalid body with 400 and names every failing field', async () => {
     const response = await fetch(`${baseUrl}/users`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ name: 'x', email: 'not-an-email' }),
     });
     const text = await response.text();
@@ -123,7 +117,7 @@ describe('http dispatcher', () => {
   it('answers 400 for a malformed JSON body', async () => {
     const response = await fetch(`${baseUrl}/users`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...AUTH },
       body: '{ not json',
     });
     const body = (await response.json()) as { message: string };
@@ -134,7 +128,7 @@ describe('http dispatcher', () => {
 
   it('answers 404 for an unknown route and for a wrong method', async () => {
     const unknown = await fetch(`${baseUrl}/nope`);
-    const wrongMethod = await fetch(`${baseUrl}/users/42`, { method: 'POST' });
+    const wrongMethod = await fetch(`${baseUrl}/users/42`, { method: 'POST', headers: AUTH });
 
     assert.equal(unknown.status, 404);
     assert.equal(wrongMethod.status, 404);
@@ -149,7 +143,7 @@ describe('http dispatcher', () => {
     assert.equal(container.resolve(UsersController), controller);
 
     const created = service.create({ name: 'Katherine Johnson', email: 'kj@example.com' });
-    const response = await fetch(`${baseUrl}/users/${created.id}`);
+    const response = await fetch(`${baseUrl}/users/${created.id}`, { headers: AUTH });
 
     assert.equal(response.status, 200);
     assert.equal(((await response.json()) as User).name, 'Katherine Johnson');
