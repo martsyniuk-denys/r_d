@@ -14,13 +14,6 @@ export interface Replayable<T> {
   replayed: boolean;
 }
 
-/**
- * Idempotency-Key semantics:
- *   same key + same body      → the same response, flagged as a replay
- *   same key + different body → 422 problem+json
- *
- * Keys are namespaced per route, so POST /orders and POST /products never collide.
- */
 @Injectable()
 export class IdempotencyService {
   private readonly entries = new Map<string, Entry>();
@@ -29,10 +22,6 @@ export class IdempotencyService {
     return createHash('sha256').update(JSON.stringify(body ?? null)).digest('hex');
   }
 
-  /**
-   * Runs `create` only the first time a key is seen. A repeat with an identical
-   * body replays the stored response; a repeat with a different body is rejected.
-   */
   run<T>(route: string, key: string, body: unknown, create: () => T): Replayable<T> {
     const id = `${route}:${key}`;
     const seen = this.entries.get(id);

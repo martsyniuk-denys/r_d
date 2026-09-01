@@ -39,8 +39,6 @@ export class OrdersService {
   }
 
   create(lines: CreateOrderLine[]): Order {
-    // Prices come from the catalogue on the server — the client does not dictate them.
-    // An unknown product_id surfaces as the 404 ProductsService.get already throws.
     const items: OrderItem[] = lines.map((line) => {
       const product = this.products.get(line.product_id);
       return { product_id: product.id, qty: line.qty, unit_price_cents: product.price_cents };
@@ -51,7 +49,6 @@ export class OrdersService {
       status: 'created',
       currency: 'UAH',
       items,
-      // Money is integer cents — no floating-point arithmetic anywhere.
       total_cents: items.reduce((sum, i) => sum + i.unit_price_cents * i.qty, 0),
       created_at: new Date().toISOString(),
     };

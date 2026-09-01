@@ -1,9 +1,5 @@
 import { badRequest } from './problem';
 
-/**
- * Opaque cursor. The format — base64url of "offset:<n>" — is an implementation
- * detail: the spec tells clients not to parse it, so it can change freely.
- */
 export function encodeCursor(offset: number): string {
   return Buffer.from(`offset:${offset}`, 'utf8').toString('base64url');
 }
@@ -26,7 +22,6 @@ export interface Page<T> {
   next_cursor: string | null;
 }
 
-/** A page of items plus next_cursor (null = no more pages). */
 export function paginate<T>(collection: T[], limit: number, cursor?: string): Page<T> {
   const offset = decodeCursor(cursor);
   const items = collection.slice(offset, offset + limit);

@@ -48,7 +48,6 @@ export class ProductsService {
     return paginate(this.products, limit, cursor);
   }
 
-  /** Returns the product or throws a 404 problem — callers never see undefined. */
   get(id: string): Product {
     const product = this.products.find((p) => p.id === id);
     if (!product) throw notFound(`Product '${id}' does not exist.`);

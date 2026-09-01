@@ -1,9 +1,5 @@
 'use strict';
 
-/**
- * Runs the acceptance criteria against the spec itself (homework items 1-4).
- * Same commands as in the assignment, but in a single run: npm run check
- */
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');

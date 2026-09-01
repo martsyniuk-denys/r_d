@@ -1,8 +1,3 @@
-/**
- * Runs the option B acceptance criteria: boots the compiled Nest app on a free
- * port and verifies that the express-openapi-validator boundary really does
- * reject anything that contradicts the spec. Run with: npm run smoke
- */
 import { createApp } from '../dist/bootstrap.js';
 
 const KEY = '6f1f8f4e-4d4b-4a53-9a0e-2c1f0b7a1c11';

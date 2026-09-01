@@ -3,10 +3,6 @@ import { Request, Response } from 'express';
 
 import { toProblem } from './problem';
 
-/**
- * Catches everything raised inside Nest's pipeline (controllers, services and
- * the response validator) and serves it as application/problem+json.
- */
 @Catch()
 export class ProblemFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {

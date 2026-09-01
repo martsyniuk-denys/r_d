@@ -21,7 +21,6 @@ export class ProductsController {
 
   @Post()
   create(
-    // The validator has already guaranteed the header is present and the body valid.
     @Headers('idempotency-key') key: string,
     @Body() body: CreateProduct,
     @Res({ passthrough: true }) res: Response,

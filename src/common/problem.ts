@@ -2,7 +2,6 @@ import { Request } from 'express';
 
 export const TYPE_BASE = 'https://marketplace.example/problems';
 
-/** RFC 9457 problem details — the single error shape this API serves. */
 export interface Problem {
   type: string;
   title: string;
@@ -11,10 +10,6 @@ export interface Problem {
   instance: string;
 }
 
-/**
- * An error a handler raises deliberately. Everything that is not a ProblemError
- * (validator errors included) is normalised into problem+json all the same.
- */
 export class ProblemError extends Error {
   readonly status: number;
   readonly title: string;
@@ -63,18 +58,11 @@ const SLUGS: Record<number, string> = {
   500: 'internal-server-error',
 };
 
-/**
- * The one place that decides what a thrown value looks like on the wire.
- * Shared by the Nest exception filter and the Express error middleware, because
- * express-openapi-validator rejects requests before Nest's pipeline ever runs.
- */
 export function toProblem(err: unknown, req: Request): Problem {
   const e = (err ?? {}) as Record<string, unknown>;
   const status = Number(e.status || e.statusCode || 500);
   const title = (e.title as string) || TITLES[status] || 'Error';
   const type = (e.type as string) || `${TYPE_BASE}/${SLUGS[status] || 'error'}`;
-  // In express-openapi-validator `message` is already the assembled detail,
-  // e.g. "request/headers must have required property 'idempotency-key'".
   const detail = (e.detail as string) || (e.message as string) || 'Unexpected error.';
 
   if (status >= 500 && !(err instanceof ProblemError)) {
