@@ -1,13 +1,13 @@
 # Marketplace API — Homework 09: contract first
 
 Chosen contract option: **B — runtime validation at the boundary**
-(`express` + `express-openapi-validator`).
+(NestJS + `express-openapi-validator`).
 
 `openapi/openapi.yaml` is not documentation sitting next to the code — it is the
 source of truth the validator checks **both requests and responses** against.
 Anything that contradicts the spec does not cross the boundary: an invalid request
-is rejected before it reaches a handler (400), and a response that has drifted away
-from its schema never reaches the client (500 instead of silent drift).
+is rejected before it reaches a controller (400), and a response that has drifted
+away from its schema never reaches the client (500 instead of silent drift).
 
 ## Quick start
 
@@ -20,11 +20,13 @@ npm start          # http://localhost:3000
 
 | Command | What it does |
 | --- | --- |
-| `npm start` | runs the app with the validator on port 3000 (`PORT=3001 npm start` for another port) |
+| `npm start` | builds and runs the Nest app on port 3000 (`nest start`) |
+| `npm run start:dev` | the same in watch mode |
+| `npm run build` | compiles TypeScript into `dist/` |
 | `npm run lint` | `redocly lint openapi/openapi.yaml` |
 | `npm run bundle` | `redocly bundle openapi/openapi.yaml -o spec.json` |
 | `npm run check` | every acceptance criterion for the spec (items 1–4) in one run |
-| `npm run smoke` | every option B acceptance criterion plus the extra challenge, against the live app |
+| `npm run smoke` | builds, then runs every option B criterion plus the extra challenge against the live app |
 
 `npm run check` and `npm run smoke` perform exactly the same checks as the raw
 commands below, just collected into one run with readable output.
@@ -33,14 +35,14 @@ commands below, just collected into one run with readable output.
 
 **2 resources, 6 operations:**
 
-| Operation | `operationId` |
-| --- | --- |
-| `GET /products` | `listProducts` |
-| `POST /products` | `createProduct` |
-| `GET /products/{productId}` | `getProduct` |
-| `GET /orders` | `listOrders` |
-| `POST /orders` | `createOrder` |
-| `GET /orders/{orderId}` | `getOrder` |
+| Operation | `operationId` | Handler |
+| --- | --- | --- |
+| `GET /products` | `listProducts` | `ProductsController.list` |
+| `POST /products` | `createProduct` | `ProductsController.create` |
+| `GET /products/{productId}` | `getProduct` | `ProductsController.get` |
+| `GET /orders` | `listOrders` | `OrdersController.list` |
+| `POST /orders` | `createOrder` | `OrdersController.create` |
+| `GET /orders/{orderId}` | `getOrder` | `OrdersController.get` |
 
 * **Cursor pagination** on both list operations: query `limit` (1..100, default 20)
   and `cursor`. The response is `{ items, next_cursor }`, where `next_cursor: null`
@@ -49,7 +51,7 @@ commands below, just collected into one run with readable output.
   have no right to parse it.
 * **Idempotency-Key** — a header parameter with `required: true` on both POST
   operations. It is `required: true` that lets the validator demand the header
-  instead of an `if` in the code.
+  instead of an `if` in a controller.
 * **problem+json** — every 4xx/5xx response is served as `application/problem+json`
   with the `Problem` schema (`type`, `title`, `status`, `detail`, `instance`, all required).
 * **Money is integer cents:** `price_cents`, `unit_price_cents`, `total_cents` are
@@ -58,6 +60,30 @@ commands below, just collected into one run with readable output.
 The API deliberately has no authentication yet, so the root carries an explicit
 `security: []` — without it the redocly `security-defined` rule raises an error and
 `lint` exits with code 1.
+
+## How the boundary is wired into Nest
+
+The middleware order in `src/bootstrap.ts` is the whole point of option B:
+
+```
+express.json()  →  OpenApiValidator  →  Nest router  →  problem+json
+```
+
+Three details make it work, and each one is a trap if you miss it:
+
+1. **Nest's own body parser is switched off** (`NestFactory.create(AppModule, { bodyParser: false })`).
+   Nest registers it during `app.init()`, which runs *after* our `app.use()` calls,
+   so the validator would otherwise inspect an unparsed body. We mount
+   `express.json()` ourselves, ahead of the validator.
+2. **Two error paths, one mapping.** The validator rejects requests *before* Nest's
+   pipeline runs, so its errors never reach a Nest exception filter — they surface
+   as Express errors. `ProblemFilter` covers everything raised inside Nest
+   (controllers, services, the response validator); an Express error middleware
+   registered after `app.init()` covers the validator. Both call the same
+   `toProblem()`, so the wire format cannot diverge.
+3. **`incremental` is off in `tsconfig.json`.** Combined with `deleteOutDir: true`
+   it produces an empty `dist/`: `tsc` sees an up-to-date `.tsbuildinfo`, emits
+   nothing, and Nest has already deleted the output.
 
 ## Verifying the acceptance criteria with raw commands
 
@@ -108,7 +134,7 @@ grep -c 'application/problem+json' openapi/openapi.yaml # 7  (>= 2)
 Start the server with `npm start`, then in another terminal:
 
 **Without `Idempotency-Key` → 400 `application/problem+json`** (the header is demanded
-by the spec, not by an `if` in the code):
+by the spec, not by an `if` in a controller):
 
 ```bash
 curl -i -X POST localhost:3000/orders \
@@ -196,8 +222,8 @@ Content-Type: application/problem+json; charset=utf-8
  "instance":"/orders"}
 ```
 
-Request bodies are compared by their sha256 fingerprint, and keys are stored per
-route (`POST /orders` and `POST /products` never collide with each other).
+`IdempotencyService` compares request bodies by their sha256 fingerprint and stores
+keys per route, so `POST /orders` and `POST /products` never collide with each other.
 
 ## Cursor pagination in action
 
@@ -216,16 +242,16 @@ curl -s 'localhost:3000/products?limit=100'
 
 A spec on its own enforces nothing. The boundary enforces it in both directions:
 
-```js
+```ts
 OpenApiValidator.middleware({
-  apiSpec: 'openapi/openapi.yaml',
-  validateRequests: true,   // an invalid request never reaches a handler
+  apiSpec: API_SPEC,
+  validateRequests: true,   // an invalid request never reaches a controller
   validateResponses: true,  // an invalid response never reaches the client
 })
 ```
 
-Verified against real drift: rename `total_cents` to `totalCents` in the
-`POST /orders` handler — the classic refactoring slip — and the app no longer serves
+Verified against real drift: rename `total_cents` to `totalCents` in
+`OrdersService.create` — the classic refactoring slip — and the app no longer serves
 an "almost correct" 201:
 
 ```
@@ -240,20 +266,33 @@ This is the runtime counterpart of the lecture's `contract/check.mjs` that caugh
 ## Layout
 
 ```
-openapi/openapi.yaml   the spec: 2 resources, 6 operations, cursor pagination,
-                       Idempotency-Key, problem+json
-src/app.js             express app: the validator boundary plus handlers
-src/server.js          entry point (npm start)
-src/store.js           in-memory data, cursor, idempotency key storage
-src/problem.js         error types and problem+json factories
-scripts/check-spec.js  acceptance criteria for the spec (npm run check)
-scripts/smoke.js       acceptance criteria for the app (npm run smoke)
+openapi/openapi.yaml              the spec: 2 resources, 6 operations
+src/main.ts                       entry point
+src/bootstrap.ts                  Nest app + validator boundary + error wiring
+src/app.module.ts                 root module
+src/common/problem.ts             Problem types and the shared toProblem() mapping
+src/common/problem.filter.ts      Nest exception filter → application/problem+json
+src/common/cursor.ts              opaque cursor encode/decode + paginate
+src/common/idempotency.service.ts replay semantics for Idempotency-Key
+src/products/                     ProductsController + ProductsService
+src/orders/                       OrdersController + OrdersService
+scripts/check-spec.js             acceptance criteria for the spec (npm run check)
+scripts/smoke.mjs                 acceptance criteria for the app (npm run smoke)
 ```
+
+Data is in-memory: the point of this homework is the contract and the boundary,
+not persistence.
 
 ## Versions
 
-Pinned to the same versions the criteria were verified on:
-`express@4.22.2`, `express-openapi-validator@5.6.2`, `@redocly/cli@2.46.0`.
-`express@4` is deliberate — `express-openapi-validator` works with it without surprises.
-`package.json` has no `"type": "module"`, so both the application code and the
-`node -e "require('./spec.json')"` command from the criteria work as written.
+`@nestjs/*@10` is deliberate — it brings Express 4, and the assignment recommends
+`express@4` because `express-openapi-validator` works with it without surprises.
+Nest 11 would pull Express 5 instead.
+
+| Package | Version |
+| --- | --- |
+| `@nestjs/common` / `core` / `platform-express` | 10.4.22 |
+| `express` | 4.22.2 |
+| `express-openapi-validator` | 5.6.2 |
+| `@redocly/cli` | 2.46.0 |
+| `typescript` | 5.x |

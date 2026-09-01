@@ -1,12 +1,9 @@
-'use strict';
-
 /**
- * Runs the option B acceptance criteria: boots the app on a free port and
- * verifies that the express-openapi-validator boundary really does reject
- * anything that contradicts the spec. Run with: npm run smoke
+ * Runs the option B acceptance criteria: boots the compiled Nest app on a free
+ * port and verifies that the express-openapi-validator boundary really does
+ * reject anything that contradicts the spec. Run with: npm run smoke
  */
-const { createApp } = require('../src/app');
-const store = require('../src/store');
+import { createApp } from '../dist/bootstrap.js';
 
 const KEY = '6f1f8f4e-4d4b-4a53-9a0e-2c1f0b7a1c11';
 const ORDER_BODY = { items: [{ product_id: 'p_1', qty: 2 }] };
@@ -18,11 +15,9 @@ function check(label, ok, actual) {
 }
 
 async function main() {
-  store.seed();
-  const server = await new Promise((resolve) => {
-    const s = createApp().listen(0, () => resolve(s));
-  });
-  const base = `http://127.0.0.1:${server.address().port}`;
+  const app = await createApp();
+  await app.listen(0);
+  const base = `http://127.0.0.1:${app.getHttpServer().address().port}`;
 
   const call = async (method, path, { body, key } = {}) => {
     const headers = {};
@@ -87,9 +82,12 @@ async function main() {
   check('GET /orders/o_999 → 404 problem+json', missing.res.status === 404 && missing.json.status === 404, missing.json.detail);
   check('  … all Problem fields present', ['type', 'title', 'status', 'detail', 'instance'].every((f) => f in missing.json));
 
-  server.close();
+  await app.close();
   console.log(failed === 0 ? '\n✅ All application checks passed\n' : `\n❌ Checks failed: ${failed}\n`);
   process.exit(failed === 0 ? 0 : 1);
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
