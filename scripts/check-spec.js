@@ -57,7 +57,8 @@ check("grep -c 'application/problem+json' >= 2", countOf('application/problem+js
 console.log('\n5. Cursor pagination on list operations');
 for (const [p, m] of ops) {
   const op = spec.paths[p][m];
-  const isList = m === 'get' && !p.includes('{');
+  const hasItemRoute = Object.keys(spec.paths).some((other) => other.startsWith(`${p}/{`));
+  const isList = m === 'get' && !p.includes('{') && hasItemRoute;
   if (!isList) continue;
   const names = (op.parameters ?? []).map((x) => x.name);
   const schemaRef = op.responses['200'].content['application/json'].schema.$ref;

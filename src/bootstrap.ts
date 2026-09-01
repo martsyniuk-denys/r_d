@@ -12,7 +12,10 @@ import { toProblem } from './common/problem';
 export const API_SPEC = join(__dirname, '..', 'openapi', 'openapi.yaml');
 
 export async function createApp(): Promise<NestExpressApplication> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bodyParser: false,
+    abortOnError: false,
+  });
   app.disable('x-powered-by');
 
   app.use(express.json());

@@ -22,7 +22,12 @@ export class IdempotencyService {
     return createHash('sha256').update(JSON.stringify(body ?? null)).digest('hex');
   }
 
-  run<T>(route: string, key: string, body: unknown, create: () => T): Replayable<T> {
+  async run<T>(
+    route: string,
+    key: string,
+    body: unknown,
+    create: () => Promise<T> | T,
+  ): Promise<Replayable<T>> {
     const id = `${route}:${key}`;
     const seen = this.entries.get(id);
 
@@ -35,7 +40,7 @@ export class IdempotencyService {
       return { body: seen.body as T, replayed: true };
     }
 
-    const created = create();
+    const created = await create();
     this.entries.set(id, {
       fingerprint: IdempotencyService.fingerprint(body),
       status: 201,

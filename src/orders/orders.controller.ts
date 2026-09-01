@@ -25,12 +25,14 @@ export class OrdersController {
   }
 
   @Post()
-  create(
+  async create(
     @Headers('idempotency-key') key: string,
     @Body() body: CreateOrderBody,
     @Res({ passthrough: true }) res: Response,
-  ): Order {
-    const result = this.idempotency.run(ROUTE, key, body, () => this.orders.create(body.items));
+  ): Promise<Order> {
+    const result = await this.idempotency.run(ROUTE, key, body, () =>
+      this.orders.create(body.items),
+    );
     if (result.replayed) res.setHeader('Idempotency-Replay', 'true');
     return result.body;
   }
