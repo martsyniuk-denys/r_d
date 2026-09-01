@@ -38,11 +38,12 @@ export class OrdersService {
     return this.orders.find((o) => o.id === id);
   }
 
-  create(lines: CreateOrderLine[]): Order {
-    const items: OrderItem[] = lines.map((line) => {
-      const product = this.products.get(line.product_id);
-      return { product_id: product.id, qty: line.qty, unit_price_cents: product.price_cents };
-    });
+  async create(lines: CreateOrderLine[]): Promise<Order> {
+    const items: OrderItem[] = [];
+    for (const line of lines) {
+      const product = await this.products.get(line.product_id);
+      items.push({ product_id: product.id, qty: line.qty, unit_price_cents: product.price_cents });
+    }
 
     const order: Order = {
       id: `o_${++this.seq}`,

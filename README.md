@@ -13,30 +13,178 @@ away from its schema never reaches the client (500 instead of silent drift).
 
 ```bash
 npm install
-npm start          # http://localhost:3000
+cp .env.example .env          # real values live here; .env is git-ignored
+docker compose up -d --wait   # Postgres on localhost:55432, seeded from db/init.sql
+npm start                     # http://localhost:3000
 ```
+
+`npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode.
+A watcher never exits, so it can never report a non-zero exit code, and the
+fail-fast criterion below would be untestable. Watch mode lives in `npm run start:dev`.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `npm start` | builds and runs the Nest app on port 3000 (`nest start`) |
-| `npm run start:dev` | the same in watch mode |
+| `npm start` | builds and runs the app on the configured `PORT` |
+| `npm run start:dev` | watch mode (`nest start --watch`) |
 | `npm run build` | compiles TypeScript into `dist/` |
+| `npm run check:env` | verifies `.env.example` still matches the zod schema |
 | `npm run lint` | `redocly lint openapi/openapi.yaml` |
 | `npm run bundle` | `redocly bundle openapi/openapi.yaml -o spec.json` |
-| `npm run check` | every acceptance criterion for the spec (items 1–4) in one run |
-| `npm run smoke` | builds, then runs every option B criterion plus the extra challenge against the live app |
+| `npm run check` | every acceptance criterion for the spec in one run |
+| `npm run smoke` | builds, then runs every contract criterion against the live app (needs Postgres up) |
 
 `npm run check` and `npm run smoke` perform exactly the same checks as the raw
 commands below, just collected into one run with readable output.
 
+# Configuration
+
+Configuration flows in one direction, and every step is enforced rather than assumed:
+
+```
+process.env  →  zod schema (fail-fast)  →  ConfigService<Env, true>  →  code
+secrets/db_password  →  password: () => readFile()  →  pg.Pool  →  database
+```
+
+Nothing reads `process.env` directly outside `src/config/env.schema.ts`: the schema
+is the only door, and `ConfigService<Env, true>` is the only way the code sees a value.
+
+## Variables
+
+Every variable is declared once, in `src/config/env.schema.ts`, and documented in
+`.env.example`. Types come from `z.coerce` because everything arriving from the
+environment is a string.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `NODE_ENV` | no | `development` | Runtime mode: `development` \| `test` \| `production`. |
+| `PORT` | no | `3000` | HTTP port. Coerced to a number. |
+| `DB_URL` | **yes** | — | Postgres connection string **without a password**. The schema rejects a URL that contains one. |
+| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | File holding the database password. Re-read on every new connection. |
+| `DB_POOL_MAX` | no | `10` | Maximum connections in the pool. |
+| `DB_CONNECTION_TIMEOUT_MS` | no | `5000` | How long to wait for a pooled connection. |
+| `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error`. |
+
+The password is deliberately **not** an environment variable. It lives in a file so it
+can be replaced while the process is running — see the rotation section below.
+
+## Fail-fast on a broken variable
+
+`validate` from the schema is passed to `ConfigModule.forRoot`, so it runs before the
+DI graph is built. It reports **all** broken variables at once, not one per restart:
+
+```bash
+mv .env /tmp                    # otherwise dotenv quietly supplies the value
+env -u DB_URL npm run start
+echo $?                         # 1
+mv /tmp/.env .
+```
+
+```
+Invalid environment configuration — 1 problem(s):
+  - DB_URL: Required (not set)
+
+Every variable is documented in .env.example. Fix the values above and start again.
+```
+
+## Keeping .env.example honest
+
+`.env.example` is a contract in git: every variable from the schema, each with a
+comment, and only fake secret values. `npm run check:env` compares the two and fails
+if the file has fallen behind:
+
+```bash
+npm run check:env     # exit 0
+# delete any line from .env.example
+npm run check:env     # exit 1, naming the missing variable
+```
+
+It checks three things: no variable is missing, no variable is extra, and the
+documented values actually satisfy the schema.
+
+## Rotating the database password without a restart
+
+This is the part that separates "secrets as env" from "secrets as a managed
+resource". The password is supplied to `pg.Pool` as a **function**, so every new
+connection re-reads the file:
+
+```ts
+password: async () => (await readFile(passwordFile, 'utf8')).trim(),
+```
+
+Step by step:
+
+```bash
+# 1. note the uptime and pid
+curl -s localhost:3000/health
+# {"status":"ok","uptime_seconds":20.436,"pid":84709}
+
+# 2. rotate
+bash rotate.sh
+
+# 3. a request that goes to the database still answers
+curl -s -o /dev/null -w '%{http_code}\n' 'localhost:3000/products?limit=2'
+# 200
+
+# 4. uptime kept growing and the pid is unchanged — nothing restarted
+curl -s localhost:3000/health
+# {"status":"ok","uptime_seconds":20.87,"pid":84709}
+```
+
+`rotate.sh` does three things, and the order is the whole point:
+
+1. `ALTER ROLE` — the database learns the new password first.
+2. Write `secrets/db_password` — new connections start using it.
+3. `pg_terminate_backend` — connections opened with the old password are dropped, and
+   the pool transparently reopens them.
+
+Writing the file first would leave a window where every new connection authenticates
+with a password the database does not know yet.
+
+`src/db/database.module.ts` registers `pool.on('error', …)`. Without it, the idle
+clients killed by `pg_terminate_backend` would emit an unhandled `'error'` event and
+take the process down — which looks like a broken rotation but is really a missing
+handler.
+
+### After `docker compose down -v`
+
+The volume is deleted, so Postgres comes back with the password from
+`docker-compose.yml`, while `secrets/db_password` still holds the rotated one. Restore
+it, or authentication fails:
+
+```bash
+printf 'marketplace_dev_password' > secrets/db_password
+```
+
+## Secrets stay out of git and out of the image
+
+`.env` and `secrets/` are in `.gitignore`; only `.env.example` is tracked.
+
+```bash
+git check-ignore .env                                  # .env
+git ls-files | grep -c '.env$'                         # 0
+git status --ignored --porcelain | grep -E '^!! .*\.env$'   # !! .env
+```
+
+`.dockerignore` keeps the same two out of every layer, and the Dockerfile declares no
+`ENV` of its own:
+
+```bash
+docker build -t myapp .
+docker run --rm myapp ls -a /app                       # .env.example, no .env, no secrets/
+docker run --rm myapp sh -c 'cat /app/.env' 2>&1       # No such file or directory
+docker inspect --format '{{.Config.Env}}' myapp        # only PATH, NODE_VERSION, YARN_VERSION
+docker history --no-trunc myapp | grep -i password     # empty
+```
+
 ## What the spec contains
 
-**2 resources, 6 operations:**
+**3 resources, 7 operations:**
 
 | Operation | `operationId` | Handler |
 | --- | --- | --- |
+| `GET /health` | `getHealth` | `HealthController.get` |
 | `GET /products` | `listProducts` | `ProductsController.list` |
 | `POST /products` | `createProduct` | `ProductsController.create` |
 | `GET /products/{productId}` | `getProduct` | `ProductsController.get` |
@@ -113,7 +261,7 @@ The `node -e` snippet is reproduced verbatim from the assignment, so its output
 labels are in Ukrainian. Actual output:
 
 ```
-операцій: 6 · ресурсів: 2
+операцій: 7 · ресурсів: 3
 Idempotency-Key: required = true · опис, символів = 412
 ```
 
@@ -266,22 +414,32 @@ This is the runtime counterpart of the lecture's `contract/check.mjs` that caugh
 ## Layout
 
 ```
-openapi/openapi.yaml              the spec: 2 resources, 6 operations
+openapi/openapi.yaml              the spec: 3 resources, 7 operations
 src/main.ts                       entry point
 src/bootstrap.ts                  Nest app + validator boundary + error wiring
-src/app.module.ts                 root module
+src/app.module.ts                 root module: ConfigModule.forRoot({ validate })
+src/config/env.schema.ts          zod schema + validate (fail-fast)
+src/db/database.module.ts         pg.Pool with password: () => readFile()
+src/health/health.controller.ts   /health, reports uptime and pid
 src/common/problem.ts             Problem types and the shared toProblem() mapping
 src/common/problem.filter.ts      Nest exception filter → application/problem+json
 src/common/cursor.ts              opaque cursor encode/decode + paginate
 src/common/idempotency.service.ts replay semantics for Idempotency-Key
-src/products/                     ProductsController + ProductsService
-src/orders/                       OrdersController + OrdersService
+src/products/                     ProductsController + ProductsService (Postgres)
+src/orders/                       OrdersController + OrdersService (in-memory)
+db/init.sql                       products table + seed, run by compose on first start
 scripts/check-spec.js             acceptance criteria for the spec (npm run check)
+scripts/check-env-example.mjs     .env.example vs schema (npm run check:env)
 scripts/smoke.mjs                 acceptance criteria for the app (npm run smoke)
+rotate.sh                         database password rotation without a restart
+docker-compose.yml                Postgres for local development
+Dockerfile / .dockerignore        image built without secrets in any layer
+.env.example                      the variable contract; .env and secrets/ are ignored
 ```
 
-Data is in-memory: the point of this homework is the contract and the boundary,
-not persistence.
+Products live in Postgres — that is the request which proves the pool survives a
+password rotation. Orders stay in memory: they read product prices from the database
+but persisting them adds nothing to what this homework demonstrates.
 
 ## Versions
 

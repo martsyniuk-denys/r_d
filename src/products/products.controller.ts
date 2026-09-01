@@ -15,23 +15,23 @@ export class ProductsController {
   ) {}
 
   @Get()
-  list(@Query('limit') limit?: string, @Query('cursor') cursor?: string): Page<Product> {
+  list(@Query('limit') limit?: string, @Query('cursor') cursor?: string): Promise<Page<Product>> {
     return this.products.list(Number(limit ?? 20), cursor);
   }
 
   @Post()
-  create(
+  async create(
     @Headers('idempotency-key') key: string,
     @Body() body: CreateProduct,
     @Res({ passthrough: true }) res: Response,
-  ): Product {
-    const result = this.idempotency.run(ROUTE, key, body, () => this.products.create(body));
+  ): Promise<Product> {
+    const result = await this.idempotency.run(ROUTE, key, body, () => this.products.create(body));
     if (result.replayed) res.setHeader('Idempotency-Replay', 'true');
     return result.body;
   }
 
   @Get(':productId')
-  get(@Param('productId') productId: string): Product {
+  get(@Param('productId') productId: string): Promise<Product> {
     return this.products.get(productId);
   }
 }

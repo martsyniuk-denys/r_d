@@ -32,8 +32,29 @@ tags:
     description: Marketplace product catalogue.
   - name: orders
     description: Customer orders.
+  - name: ops
+    description: Operational endpoints used by probes and deployment tooling.
 
 paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe
+      description: |
+        Reports that the process is alive and how long it has been running.
+        `uptime_seconds` is what proves a database password rotation did not
+        restart the service: it keeps growing across a rotation.
+      tags: [ops]
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /products:
     get:
       operationId: listProducts
@@ -361,6 +382,23 @@ components:
           type: string
           description: Reference to this specific occurrence (the request path that caused it).
           example: /orders
+
+    Health:
+      type: object
+      required: [status, uptime_seconds, pid]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        uptime_seconds:
+          type: number
+          minimum: 0
+          description: Seconds since this process started. Survives a password rotation.
+          example: 42.137
+        pid:
+          type: integer
+          description: Process id, so a restart is visible even if uptime is read twice.
+          example: 4711
 
     Product:
       type: object

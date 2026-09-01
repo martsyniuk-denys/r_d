@@ -3,3 +3,9 @@ dist/
 spec.json
 *.tsbuildinfo
 *.log
+
+# Secrets: the real env file and the password file never enter git.
+.env
+.env.*
+!.env.example
+secrets/

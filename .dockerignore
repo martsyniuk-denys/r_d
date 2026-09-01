@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.gitignore
+*.log
+spec.json
+*.tsbuildinfo
+
+# Secrets never enter a layer: the real env file and the password file stay out.
+# .env.example is deliberately NOT ignored — it is the contract, not a secret.
+.env
+.env.local
+.env.development
+.env.production
+secrets
