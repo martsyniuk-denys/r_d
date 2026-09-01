@@ -3,9 +3,9 @@
 const TYPE_BASE = 'https://marketplace.example/problems';
 
 /**
- * Помилка, яку хендлер кидає свідомо. Все, що не є ProblemError
- * (включно з помилками валідатора), теж приводиться до problem+json
- * у центральному error-handler'і.
+ * An error a handler raises deliberately. Everything that is not a ProblemError
+ * (validator errors included) is normalised into problem+json by the central
+ * error handler as well.
  */
 class ProblemError extends Error {
   constructor({ status, title, detail, type }) {

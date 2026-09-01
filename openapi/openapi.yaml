@@ -4,14 +4,14 @@ info:
   title: Marketplace API
   version: 1.0.0
   description: |
-    Контракт Marketplace API (курсовий проєкт, ДЗ-09).
+    Marketplace API contract (course project, homework 09).
 
-    Три наскрізні правила, які цей документ фіксує машинно:
-      * списки віддаються тільки з cursor-пагінацією (`limit` + непрозорий `cursor`);
-      * створення ресурсів вимагає заголовка `Idempotency-Key`;
-      * будь-яка помилка 4xx/5xx — це `application/problem+json` (RFC 9457).
+    Three cross-cutting rules this document pins down in a machine-checkable way:
+      * lists are served only with cursor pagination (`limit` + an opaque `cursor`);
+      * creating a resource requires an `Idempotency-Key` header;
+      * every 4xx/5xx error is `application/problem+json` (RFC 9457).
 
-    Гроші — завжди цілі копійки (`*_cents`, integer), ніколи не float і не decimal-рядок.
+    Money is always integer minor units (`*_cents`), never a float and never a decimal string.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -21,32 +21,32 @@ info:
 
 servers:
   - url: http://localhost:3000
-    description: Локальний сервер розробки
+    description: Local development server
 
-# Авторизації в API поки свідомо немає — v1 працює без автентифікації.
-# Явний порожній масив закриває redocly-правило security-defined.
+# The API deliberately has no authentication in v1.
+# The explicit empty array satisfies the redocly `security-defined` rule.
 security: []
 
 tags:
   - name: products
-    description: Каталог товарів маркетплейсу.
+    description: Marketplace product catalogue.
   - name: orders
-    description: Замовлення покупців.
+    description: Customer orders.
 
 paths:
   /products:
     get:
       operationId: listProducts
-      summary: Список товарів (cursor-пагінація)
+      summary: List products (cursor pagination)
       description: |
-        Повертає сторінку товарів. Наступна сторінка запитується тим самим URL
-        із `cursor`, який прийшов у `next_cursor` попередньої відповіді.
+        Returns a page of products. The next page is requested from the same URL
+        with the `cursor` value returned as `next_cursor` by the previous response.
       tags: [products]
       parameters:
         - name: limit
           in: query
           required: false
-          description: Максимальна кількість елементів на сторінці.
+          description: Maximum number of items per page.
           schema:
             type: integer
             minimum: 1
@@ -56,17 +56,17 @@ paths:
           in: query
           required: false
           description: |
-            Непрозорий (opaque) токен позиції. Клієнт НЕ повинен його розбирати,
-            декодувати чи конструювати самостійно — його формат є деталлю реалізації
-            і може змінитися без зміни версії API. Єдине коректне використання —
-            передати сюди без змін значення `next_cursor` з попередньої відповіді.
+            Opaque position token. Clients MUST NOT parse, decode or construct it
+            themselves — its format is an implementation detail and may change
+            without an API version bump. The only correct use is to pass back,
+            unchanged, the `next_cursor` value from the previous response.
           schema:
             type: string
             minLength: 1
           example: b2Zmc2V0OjIw
       responses:
         '200':
-          description: Сторінка товарів.
+          description: A page of products.
           content:
             application/json:
               schema:
@@ -78,20 +78,21 @@ paths:
 
     post:
       operationId: createProduct
-      summary: Створити товар
-      description: Створює новий товар у каталозі. Операція ідемпотентна за заголовком `Idempotency-Key`.
+      summary: Create a product
+      description: Creates a new product in the catalogue. The operation is idempotent on the `Idempotency-Key` header.
       tags: [products]
       parameters:
         - name: Idempotency-Key
           in: header
           required: true
           description: |
-            Унікальний ключ повтору, який генерує клієнт (рекомендовано UUID v4).
-            Семантика: той самий ключ + те саме тіло запиту → та сама відповідь
-            (той самий 201 і той самий ресурс), новий ресурс НЕ створюється,
-            а у відповіді додається заголовок `Idempotency-Replay: true`.
-            Той самий ключ, але ІНШЕ тіло запиту → 422 application/problem+json,
-            бо ключ уже закріплений за іншим запитом. Ключі зберігаються 24 години.
+            Client-generated replay key (UUID v4 recommended).
+            Semantics: the same key with the same request body returns the same
+            response (the same 201 and the same resource), no new resource is
+            created, and the response carries `Idempotency-Replay: true`.
+            The same key with a DIFFERENT request body returns 422
+            application/problem+json, because the key is already bound to
+            another request. Keys are retained for 24 hours.
           schema:
             type: string
             minLength: 8
@@ -105,7 +106,7 @@ paths:
               $ref: '#/components/schemas/CreateProductRequest'
       responses:
         '201':
-          description: Товар створено (або повернуто раніше створений — за тим самим ключем ідемпотентності).
+          description: Product created (or a previously created one replayed for the same idempotency key).
           headers:
             Idempotency-Replay:
               $ref: '#/components/headers/IdempotencyReplay'
@@ -125,19 +126,19 @@ paths:
       - name: productId
         in: path
         required: true
-        description: Ідентифікатор товару.
+        description: Product identifier.
         schema:
           type: string
           minLength: 1
         example: p_1
     get:
       operationId: getProduct
-      summary: Отримати товар за ідентифікатором
-      description: Повертає один товар каталогу.
+      summary: Get a product by identifier
+      description: Returns a single catalogue product.
       tags: [products]
       responses:
         '200':
-          description: Товар знайдено.
+          description: Product found.
           content:
             application/json:
               schema:
@@ -152,16 +153,16 @@ paths:
   /orders:
     get:
       operationId: listOrders
-      summary: Список замовлень (cursor-пагінація)
+      summary: List orders (cursor pagination)
       description: |
-        Повертає сторінку замовлень. Наступна сторінка запитується тим самим URL
-        із `cursor`, який прийшов у `next_cursor` попередньої відповіді.
+        Returns a page of orders. The next page is requested from the same URL
+        with the `cursor` value returned as `next_cursor` by the previous response.
       tags: [orders]
       parameters:
         - name: limit
           in: query
           required: false
-          description: Максимальна кількість елементів на сторінці.
+          description: Maximum number of items per page.
           schema:
             type: integer
             minimum: 1
@@ -171,17 +172,17 @@ paths:
           in: query
           required: false
           description: |
-            Непрозорий (opaque) токен позиції. Клієнт НЕ повинен його розбирати,
-            декодувати чи конструювати самостійно — його формат є деталлю реалізації
-            і може змінитися без зміни версії API. Єдине коректне використання —
-            передати сюди без змін значення `next_cursor` з попередньої відповіді.
+            Opaque position token. Clients MUST NOT parse, decode or construct it
+            themselves — its format is an implementation detail and may change
+            without an API version bump. The only correct use is to pass back,
+            unchanged, the `next_cursor` value from the previous response.
           schema:
             type: string
             minLength: 1
           example: b2Zmc2V0OjIw
       responses:
         '200':
-          description: Сторінка замовлень.
+          description: A page of orders.
           content:
             application/json:
               schema:
@@ -193,23 +194,24 @@ paths:
 
     post:
       operationId: createOrder
-      summary: Створити замовлення
+      summary: Create an order
       description: |
-        Створює замовлення з позицій каталогу. Ціни позицій та `total_cents`
-        рахує сервер — клієнт передає лише `product_id` і `qty`.
-        Операція ідемпотентна за заголовком `Idempotency-Key`.
+        Creates an order from catalogue items. Line prices and `total_cents` are
+        computed by the server — the client sends only `product_id` and `qty`.
+        The operation is idempotent on the `Idempotency-Key` header.
       tags: [orders]
       parameters:
         - name: Idempotency-Key
           in: header
           required: true
           description: |
-            Унікальний ключ повтору, який генерує клієнт (рекомендовано UUID v4).
-            Семантика: той самий ключ + те саме тіло запиту → та сама відповідь
-            (той самий 201 і той самий ресурс), новий ресурс НЕ створюється,
-            а у відповіді додається заголовок `Idempotency-Replay: true`.
-            Той самий ключ, але ІНШЕ тіло запиту → 422 application/problem+json,
-            бо ключ уже закріплений за іншим запитом. Ключі зберігаються 24 години.
+            Client-generated replay key (UUID v4 recommended).
+            Semantics: the same key with the same request body returns the same
+            response (the same 201 and the same resource), no new resource is
+            created, and the response carries `Idempotency-Replay: true`.
+            The same key with a DIFFERENT request body returns 422
+            application/problem+json, because the key is already bound to
+            another request. Keys are retained for 24 hours.
           schema:
             type: string
             minLength: 8
@@ -223,7 +225,7 @@ paths:
               $ref: '#/components/schemas/CreateOrderRequest'
       responses:
         '201':
-          description: Замовлення створено (або повернуто раніше створене — за тим самим ключем ідемпотентності).
+          description: Order created (or a previously created one replayed for the same idempotency key).
           headers:
             Idempotency-Replay:
               $ref: '#/components/headers/IdempotencyReplay'
@@ -245,19 +247,19 @@ paths:
       - name: orderId
         in: path
         required: true
-        description: Ідентифікатор замовлення.
+        description: Order identifier.
         schema:
           type: string
           minLength: 1
         example: o_1
     get:
       operationId: getOrder
-      summary: Отримати замовлення за ідентифікатором
-      description: Повертає одне замовлення разом із його позиціями.
+      summary: Get an order by identifier
+      description: Returns a single order together with its line items.
       tags: [orders]
       responses:
         '200':
-          description: Замовлення знайдено.
+          description: Order found.
           content:
             application/json:
               schema:
@@ -272,14 +274,14 @@ paths:
 components:
   headers:
     IdempotencyReplay:
-      description: Присутній зі значенням `true`, якщо відповідь відтворена за раніше використаним `Idempotency-Key`.
+      description: Present with the value `true` when the response was replayed for a previously used `Idempotency-Key`.
       schema:
         type: string
         enum: ['true']
 
   responses:
     BadRequest:
-      description: Запит не відповідає контракту (невалідні параметри, тіло або відсутній обовʼязковий заголовок).
+      description: The request violates the contract (invalid parameters, invalid body, or a missing required header).
       content:
         application/problem+json:
           schema:
@@ -292,7 +294,7 @@ components:
             instance: /orders
 
     NotFound:
-      description: Ресурс не знайдено.
+      description: The resource does not exist.
       content:
         application/problem+json:
           schema:
@@ -305,7 +307,7 @@ components:
             instance: /orders/o_999
 
     IdempotencyKeyReuse:
-      description: Ключ `Idempotency-Key` уже використано з іншим тілом запиту.
+      description: The `Idempotency-Key` has already been used with a different request body.
       content:
         application/problem+json:
           schema:
@@ -318,7 +320,7 @@ components:
             instance: /orders
 
     InternalServerError:
-      description: Внутрішня помилка сервера.
+      description: Internal server error.
       content:
         application/problem+json:
           schema:
@@ -333,31 +335,31 @@ components:
   schemas:
     Problem:
       type: object
-      description: Формат помилки за RFC 9457 (problem details for HTTP APIs).
+      description: Error format per RFC 9457 (problem details for HTTP APIs).
       required: [type, title, status, detail, instance]
       properties:
         type:
           type: string
           format: uri
-          description: URI типу помилки — стабільний ідентифікатор, за яким клієнт розрізняє класи помилок.
+          description: URI identifying the error type — a stable identifier clients use to tell classes of errors apart.
           example: https://marketplace.example/problems/validation-error
         title:
           type: string
-          description: Коротка людиночитна назва типу помилки, незалежна від конкретного випадку.
+          description: Short, human-readable name of the error type, independent of this particular occurrence.
           example: Bad Request
         status:
           type: integer
           minimum: 400
           maximum: 599
-          description: HTTP-код відповіді, продубльований у тілі.
+          description: HTTP status code, mirrored in the body.
           example: 400
         detail:
           type: string
-          description: Що саме пішло не так у цьому конкретному запиті.
+          description: What exactly went wrong with this specific request.
           example: "request/body/items must NOT have fewer than 1 items"
         instance:
           type: string
-          description: Посилання на конкретний випадок помилки (шлях запиту, який її спричинив).
+          description: Reference to this specific occurrence (the request path that caused it).
           example: /orders
 
     Product:
@@ -369,11 +371,11 @@ components:
           example: p_1
         title:
           type: string
-          example: Механічна клавіатура
+          example: Mechanical keyboard
         price_cents:
           type: integer
           minimum: 0
-          description: Ціна в мінімальних одиницях валюти (копійки/центи). Ціле число, ніколи не float.
+          description: Price in minor currency units (cents). An integer, never a float.
           example: 260000
         currency:
           type: string
@@ -395,7 +397,7 @@ components:
         price_cents:
           type: integer
           minimum: 0
-          description: Ціна в мінімальних одиницях валюти (копійки/центи).
+          description: Price in minor currency units (cents).
         currency:
           type: string
           enum: [UAH, USD, EUR]
@@ -406,14 +408,14 @@ components:
       properties:
         items:
           type: array
-          description: Елементи поточної сторінки.
+          description: Items on the current page.
           items:
             $ref: '#/components/schemas/Product'
         next_cursor:
           type: string
           nullable: true
           description: |
-            Непрозорий токен наступної сторінки. `null` означає, що сторінок більше немає.
+            Opaque token for the next page. `null` means there are no more pages.
           example: b2Zmc2V0OjIw
 
     OrderItem:
@@ -430,7 +432,7 @@ components:
         unit_price_cents:
           type: integer
           minimum: 0
-          description: Ціна одиниці на момент створення замовлення, у копійках.
+          description: Unit price captured when the order was created, in cents.
           example: 260000
 
     Order:
@@ -456,7 +458,7 @@ components:
         total_cents:
           type: integer
           minimum: 0
-          description: Сума замовлення в копійках. Ціле число — жодних "2600.00".
+          description: Order total in cents. An integer — no "2600.00" strings.
           example: 520000
         created_at:
           type: string
@@ -470,7 +472,7 @@ components:
         items:
           type: array
           minItems: 1
-          description: Позиції замовлення; щонайменше одна.
+          description: Order lines; at least one.
           items:
             type: object
             additionalProperties: false
@@ -490,12 +492,12 @@ components:
       properties:
         items:
           type: array
-          description: Елементи поточної сторінки.
+          description: Items on the current page.
           items:
             $ref: '#/components/schemas/Order'
         next_cursor:
           type: string
           nullable: true
           description: |
-            Непрозорий токен наступної сторінки. `null` означає, що сторінок більше немає.
+            Opaque token for the next page. `null` means there are no more pages.
           example: b2Zmc2V0OjIw

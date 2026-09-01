@@ -2,7 +2,7 @@
   "name": "marketplace-api-contract",
   "version": "1.0.0",
   "private": true,
-  "description": "ДЗ-09: OpenAPI-контракт Marketplace API + runtime-валідація на кордоні (варіант Б)",
+  "description": "Homework 09: OpenAPI contract for the Marketplace API + runtime validation at the boundary (option B)",
   "main": "src/app.js",
   "scripts": {
     "start": "node src/server.js",

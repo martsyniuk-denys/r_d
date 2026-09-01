@@ -3,11 +3,11 @@
 const crypto = require('node:crypto');
 const { badRequest } = require('./problem');
 
-// ── In-memory дані ───────────────────────────────────────────────────────────
+// ── In-memory data ───────────────────────────────────────────────────────────
 const products = [];
 const orders = [];
 
-// Ключі ідемпотентності: `${route}:${key}` -> { fingerprint, status, body }
+// Idempotency keys: `${route}:${key}` -> { fingerprint, status, body }
 const idempotency = new Map();
 
 let productSeq = 0;
@@ -15,13 +15,13 @@ let orderSeq = 0;
 
 function seed() {
   const catalog = [
-    ['Механічна клавіатура', 260000],
-    ['Бездротова миша', 89000],
-    ['Монітор 27"', 1149900],
-    ['USB-C хаб', 45000],
-    ['Навушники ANC', 799900],
-    ['Веб-камера 1080p', 210000],
-    ['Підставка для ноутбука', 68000],
+    ['Mechanical keyboard', 260000],
+    ['Wireless mouse', 89000],
+    ['27" monitor', 1149900],
+    ['USB-C hub', 45000],
+    ['ANC headphones', 799900],
+    ['1080p webcam', 210000],
+    ['Laptop stand', 68000],
   ];
   for (const [title, price_cents] of catalog) {
     products.push({
@@ -34,8 +34,9 @@ function seed() {
   }
 }
 
-// ── Непрозорий курсор ────────────────────────────────────────────────────────
-// Формат — деталь реалізації: base64url від "offset:<n>". Клієнт його не парсить.
+// ── Opaque cursor ────────────────────────────────────────────────────────────
+// The format is an implementation detail: base64url of "offset:<n>".
+// Clients never parse it.
 function encodeCursor(offset) {
   return Buffer.from(`offset:${offset}`, 'utf8').toString('base64url');
 }
@@ -53,7 +54,7 @@ function decodeCursor(cursor) {
   return Number(match[1]);
 }
 
-/** Сторінка з items + next_cursor (null = сторінок більше немає). */
+/** A page of items plus next_cursor (null = no more pages). */
 function paginate(collection, { limit, cursor }) {
   const offset = decodeCursor(cursor);
   const items = collection.slice(offset, offset + limit);
@@ -62,7 +63,7 @@ function paginate(collection, { limit, cursor }) {
   return { items, next_cursor: hasMore ? encodeCursor(nextOffset) : null };
 }
 
-// ── Ідемпотентність ──────────────────────────────────────────────────────────
+// ── Idempotency ──────────────────────────────────────────────────────────────
 const fingerprint = (body) =>
   crypto.createHash('sha256').update(JSON.stringify(body ?? null)).digest('hex');
 

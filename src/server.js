@@ -8,6 +8,6 @@ const PORT = Number(process.env.PORT || 3000);
 store.seed();
 
 createApp().listen(PORT, () => {
-  console.log(`Marketplace API слухає http://localhost:${PORT}`);
-  console.log('Спека: openapi/openapi.yaml (запити й відповіді валідуються проти неї)');
+  console.log(`Marketplace API listening on http://localhost:${PORT}`);
+  console.log('Spec: openapi/openapi.yaml (requests and responses are validated against it)');
 });

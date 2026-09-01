@@ -14,9 +14,9 @@ function createApp() {
   app.disable('x-powered-by');
   app.use(express.json());
 
-  // ── Кордон: усе, що суперечить openapi.yaml, далі не проходить ─────────────
-  // validateRequests  — відхиляє невалідні запити (у т.ч. відсутній Idempotency-Key);
-  // validateResponses — не дає застосунку віддати те, чого немає у спеці (drift).
+  // ── The boundary: nothing that contradicts openapi.yaml gets through ──────
+  // validateRequests  — rejects invalid requests (a missing Idempotency-Key included);
+  // validateResponses — stops the app from serving anything the spec does not describe.
   app.use(
     OpenApiValidator.middleware({
       apiSpec: API_SPEC,
@@ -60,7 +60,7 @@ function createApp() {
 
   app.post('/orders', (req, res) => {
     withIdempotency(req, res, 'POST /orders', () => {
-      // Ціни бере сервер із каталогу — клієнт їх не диктує.
+      // Prices come from the catalogue on the server — the client does not dictate them.
       const lines = req.body.items.map((line) => {
         const product = store.products.find((p) => p.id === line.product_id);
         if (!product) throw notFound(`Product '${line.product_id}' does not exist.`);
@@ -72,7 +72,7 @@ function createApp() {
         status: 'created',
         currency: 'UAH',
         items: lines,
-        // Гроші — цілі копійки, ніякої плаваючої арифметики.
+        // Money is integer cents — no floating-point arithmetic anywhere.
         total_cents: lines.reduce((sum, l) => sum + l.unit_price_cents * l.qty, 0),
         created_at: new Date().toISOString(),
       };
@@ -87,19 +87,19 @@ function createApp() {
     res.json(order);
   });
 
-  // ── problem+json для всього, що впало ─────────────────────────────────────
+  // ── problem+json for everything that failed ───────────────────────────────
   app.use(problemHandler);
 
   return app;
 }
 
 /**
- * Семантика Idempotency-Key:
- *   той самий ключ + те саме тіло  → та сама відповідь + Idempotency-Replay: true
- *   той самий ключ + інше тіло     → 422 problem+json
+ * Idempotency-Key semantics:
+ *   same key + same body      → the same response plus Idempotency-Replay: true
+ *   same key + different body → 422 problem+json
  */
 function withIdempotency(req, res, route, create) {
-  const key = req.headers['idempotency-key']; // валідатор уже гарантував наявність
+  const key = req.headers['idempotency-key']; // presence already guaranteed by the validator
   const seen = store.recallKey(route, key);
 
   if (seen) {
@@ -122,8 +122,8 @@ function problemHandler(err, req, res, _next) {
   const status = Number(err.status || err.statusCode || 500);
   const title = err.title || TITLES[status] || 'Error';
   const type = err.type || `${TYPE_BASE}/${SLUGS[status] || 'error'}`;
-  // У express-openapi-validator `message` — це вже зібраний детальний опис,
-  // напр. "request/headers must have required property 'idempotency-key'".
+  // In express-openapi-validator `message` is already the assembled detail,
+  // e.g. "request/headers must have required property 'idempotency-key'".
   const detail = err.detail || err.message || 'Unexpected error.';
 
   if (status >= 500 && !(err instanceof ProblemError)) {

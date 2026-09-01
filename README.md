@@ -1,38 +1,39 @@
-# Marketplace API — ДЗ-09: контракт першим
+# Marketplace API — Homework 09: contract first
 
-Обраний варіант contract-частини: **Б — runtime-валідація на кордоні**
+Chosen contract option: **B — runtime validation at the boundary**
 (`express` + `express-openapi-validator`).
 
-Спека `openapi/openapi.yaml` — це не документація «поруч із кодом», а джерело правди,
-проти якого валідатор перевіряє **і запити, і відповіді**. Усе, що суперечить спеці,
-не проходить кордон: невалідний запит відхиляється до хендлера (400), а відповідь,
-яка розійшлася зі схемою, не доїжджає до клієнта (500 замість тихого дрейфу).
+`openapi/openapi.yaml` is not documentation sitting next to the code — it is the
+source of truth the validator checks **both requests and responses** against.
+Anything that contradicts the spec does not cross the boundary: an invalid request
+is rejected before it reaches a handler (400), and a response that has drifted away
+from its schema never reaches the client (500 instead of silent drift).
 
-## Швидкий старт
+## Quick start
 
 ```bash
 npm install
 npm start          # http://localhost:3000
 ```
 
-## Команди
+## Commands
 
-| Команда | Що робить |
+| Command | What it does |
 | --- | --- |
-| `npm start` | піднімає застосунок із валідатором на порті 3000 (`PORT=3001 npm start` — інший порт) |
+| `npm start` | runs the app with the validator on port 3000 (`PORT=3001 npm start` for another port) |
 | `npm run lint` | `redocly lint openapi/openapi.yaml` |
 | `npm run bundle` | `redocly bundle openapi/openapi.yaml -o spec.json` |
-| `npm run check` | усі acceptance-критерії по спеці (пункти 1–4) одним прогоном |
-| `npm run smoke` | усі acceptance-критерії варіанта Б + додатковий виклик, на живому застосунку |
+| `npm run check` | every acceptance criterion for the spec (items 1–4) in one run |
+| `npm run smoke` | every option B acceptance criterion plus the extra challenge, against the live app |
 
-`npm run check` і `npm run smoke` — це та сама перевірка, що й «сирі» команди нижче,
-просто зібрана в один запуск із читабельним виводом.
+`npm run check` and `npm run smoke` perform exactly the same checks as the raw
+commands below, just collected into one run with readable output.
 
-## Що є у спеці
+## What the spec contains
 
-**2 ресурси, 6 операцій:**
+**2 resources, 6 operations:**
 
-| Операція | `operationId` |
+| Operation | `operationId` |
 | --- | --- |
 | `GET /products` | `listProducts` |
 | `POST /products` | `createProduct` |
@@ -41,33 +42,36 @@ npm start          # http://localhost:3000
 | `POST /orders` | `createOrder` |
 | `GET /orders/{orderId}` | `getOrder` |
 
-* **Cursor-пагінація** — на обох спискових операціях: query `limit` (1..100, default 20)
-  і `cursor`. Відповідь — `{ items, next_cursor }`, де `next_cursor: null` означає,
-  що сторінок більше немає. Курсор непрозорий: у реалізації це base64url від
-  `offset:<n>`, але це деталь реалізації, і клієнт не має права її розбирати.
-* **Idempotency-Key** — header-параметр із `required: true` на обох POST-операціях.
-  Саме `required: true` дає валідатору право вимагати заголовок замість `if` у коді.
-* **problem+json** — кожна 4xx/5xx-відповідь віддається як `application/problem+json`
-  зі схемою `Problem` (`type`, `title`, `status`, `detail`, `instance` — усі обовʼязкові).
-* **Гроші — цілі копійки:** `price_cents`, `unit_price_cents`, `total_cents` — `integer`.
-  Жодних float і жодних decimal-рядків на кшталт `"2600.00"`.
+* **Cursor pagination** on both list operations: query `limit` (1..100, default 20)
+  and `cursor`. The response is `{ items, next_cursor }`, where `next_cursor: null`
+  means there are no more pages. The cursor is opaque: the implementation happens to
+  use base64url of `offset:<n>`, but that is an implementation detail and clients
+  have no right to parse it.
+* **Idempotency-Key** — a header parameter with `required: true` on both POST
+  operations. It is `required: true` that lets the validator demand the header
+  instead of an `if` in the code.
+* **problem+json** — every 4xx/5xx response is served as `application/problem+json`
+  with the `Problem` schema (`type`, `title`, `status`, `detail`, `instance`, all required).
+* **Money is integer cents:** `price_cents`, `unit_price_cents`, `total_cents` are
+  all `integer`. No floats and no decimal strings like `"2600.00"`.
 
-Авторизації в API поки свідомо немає, тому на корені стоїть явний `security: []` —
-без нього redocly-правило `security-defined` дає error і `lint` завершується з exit 1.
+The API deliberately has no authentication yet, so the root carries an explicit
+`security: []` — without it the redocly `security-defined` rule raises an error and
+`lint` exits with code 1.
 
-## Перевірка acceptance criteria «сирими» командами
+## Verifying the acceptance criteria with raw commands
 
-### 1. Спека валідна (exit code 0)
+### 1. Spec is valid (exit code 0)
 
 ```bash
 npx @redocly/cli lint openapi/openapi.yaml
 echo $?   # 0
 ```
 
-Одне попередження (`no-server-example.com` на `http://localhost:3000`) — очікуване:
-warnings дозволені, errors — ні.
+One warning (`no-server-example.com` for `http://localhost:3000`) is expected:
+warnings are allowed, errors are not.
 
-### 2. Обсяг спеки
+### 2. Spec size
 
 ```bash
 npx @redocly/cli bundle openapi/openapi.yaml -o spec.json
@@ -79,30 +83,32 @@ console.log('операцій:',ops.length,'· ресурсів:',new Set(Object
 console.log('Idempotency-Key: required =',idem?.required,'· опис, символів =',(idem?.description??'').trim().length)"
 ```
 
-Фактичний вивід:
+The `node -e` snippet is reproduced verbatim from the assignment, so its output
+labels are in Ukrainian. Actual output:
 
 ```
 операцій: 6 · ресурсів: 2
-Idempotency-Key: required = true · опис, символів = 405
+Idempotency-Key: required = true · опис, символів = 412
 ```
 
-Параметри навмисно записані в операціях inline, а не через
-`$ref: '#/components/parameters/...'`: `redocly bundle` зберігає `$ref` у результаті,
-і перевірка вище тоді побачила б `{ $ref: ... }` замість `in`/`name`/`required`.
+Parameters are written inline in the operations on purpose, rather than via
+`$ref: '#/components/parameters/...'`: `redocly bundle` keeps `$ref`s in its output,
+so the check above would have seen `{ $ref: ... }` instead of `in`/`name`/`required`.
 
-### 3–5. Grep-критерії
+### 3–5. Grep criteria
 
 ```bash
-grep -c 'Idempotency-Key' openapi/openapi.yaml          # 8  (≥ 1)
-grep -c 'next_cursor' openapi/openapi.yaml              # 8  (≥ 1)
-grep -c 'application/problem+json' openapi/openapi.yaml # 7  (≥ 2)
+grep -c 'Idempotency-Key' openapi/openapi.yaml          # 8  (>= 1)
+grep -c 'next_cursor' openapi/openapi.yaml              # 8  (>= 1)
+grep -c 'application/problem+json' openapi/openapi.yaml # 7  (>= 2)
 ```
 
-### 6. Contract-частина працює (варіант Б)
+### 6. The contract part works (option B)
 
-Підняти сервер: `npm start`. Далі, в іншому терміналі:
+Start the server with `npm start`, then in another terminal:
 
-**Без `Idempotency-Key` → 400 `application/problem+json`** (заголовок вимагає спека, а не `if` у коді):
+**Without `Idempotency-Key` → 400 `application/problem+json`** (the header is demanded
+by the spec, not by an `if` in the code):
 
 ```bash
 curl -i -X POST localhost:3000/orders \
@@ -119,11 +125,11 @@ Content-Type: application/problem+json; charset=utf-8
  "instance":"/orders"}
 ```
 
-`detail` каже `'idempotency-key'` з маленької літери: валідатор шукає header-параметри
-у `req.headers`, а Node приводить імена заголовків до lowercase. У спеці при цьому
-заголовок записаний як заведено — `Idempotency-Key`.
+The `detail` says `'idempotency-key'` in lowercase: the validator looks header
+parameters up in `req.headers`, and Node lowercases header names. The spec itself
+still spells the header the conventional way — `Idempotency-Key`.
 
-**Невалідне тіло (порожній `items`) → 400 з деталлю від валідатора:**
+**Invalid body (empty `items`) → 400 with a detail from the validator:**
 
 ```bash
 curl -i -X POST localhost:3000/orders \
@@ -137,7 +143,7 @@ HTTP/1.1 400 Bad Request
 detail: "request/body/items must NOT have fewer than 1 items"
 ```
 
-**Валідний запит → 201:**
+**Valid request → 201:**
 
 ```bash
 curl -i -X POST localhost:3000/orders \
@@ -154,10 +160,10 @@ HTTP/1.1 201 Created
  "total_cents":520000,"created_at":"..."}
 ```
 
-## Додатковий виклик: повна семантика Idempotency-Key
+## Extra challenge: full Idempotency-Key semantics
 
-**Той самий ключ + те саме тіло → той самий 201 + `Idempotency-Replay: true`**
-(нового замовлення не створюється, повертається те саме `id`):
+**Same key + same body → the same 201 plus `Idempotency-Replay: true`**
+(no new order is created, the same `id` comes back):
 
 ```bash
 curl -i -X POST localhost:3000/orders \
@@ -171,7 +177,7 @@ HTTP/1.1 201 Created
 Idempotency-Replay: true
 ```
 
-**Той самий ключ + інше тіло → 422 `application/problem+json`:**
+**Same key + a different body → 422 `application/problem+json`:**
 
 ```bash
 curl -i -X POST localhost:3000/orders \
@@ -190,10 +196,10 @@ Content-Type: application/problem+json; charset=utf-8
  "instance":"/orders"}
 ```
 
-Тіло запиту порівнюється за sha256-відбитком, ключі зберігаються окремо для кожного
-маршруту (`POST /orders` і `POST /products` не конфліктують між собою).
+Request bodies are compared by their sha256 fingerprint, and keys are stored per
+route (`POST /orders` and `POST /products` never collide with each other).
 
-## Cursor-пагінація в дії
+## Cursor pagination in action
 
 ```bash
 curl -s 'localhost:3000/products?limit=3'
@@ -203,24 +209,24 @@ curl -s 'localhost:3000/products?limit=3&cursor=b2Zmc2V0OjM'
 # {"items":[p_4,p_5,p_6],"next_cursor":"b2Zmc2V0OjY"}
 
 curl -s 'localhost:3000/products?limit=100'
-# {"items":[...усі 7...],"next_cursor":null}   ← сторінок більше немає
+# {"items":[...all 7...],"next_cursor":null}   ← no more pages
 ```
 
-## Чому `validateResponses: true`
+## Why `validateResponses: true`
 
-Спека сама по собі нічого не примушує. Кордон примушує в обидва боки:
+A spec on its own enforces nothing. The boundary enforces it in both directions:
 
 ```js
 OpenApiValidator.middleware({
   apiSpec: 'openapi/openapi.yaml',
-  validateRequests: true,   // невалідний запит не доходить до хендлера
-  validateResponses: true,  // невалідна відповідь не доходить до клієнта
+  validateRequests: true,   // an invalid request never reaches a handler
+  validateResponses: true,  // an invalid response never reaches the client
 })
 ```
 
-Перевірено на живому дрейфі: якщо в хендлері `POST /orders` перейменувати
-`total_cents` → `totalCents` (класична помилка при рефакторингу), застосунок віддає
-не «майже правильний» 201, а:
+Verified against real drift: rename `total_cents` to `totalCents` in the
+`POST /orders` handler — the classic refactoring slip — and the app no longer serves
+an "almost correct" 201:
 
 ```
 HTTP/1.1 500 Internal Server Error
@@ -229,25 +235,25 @@ HTTP/1.1 500 Internal Server Error
  "detail":"/response must have required property 'total_cents'","instance":"/orders"}
 ```
 
-Це рантайм-аналог `contract/check.mjs` із лекції, який ловив `DRIFT=1`.
+This is the runtime counterpart of the lecture's `contract/check.mjs` that caught `DRIFT=1`.
 
-## Структура
+## Layout
 
 ```
-openapi/openapi.yaml   спека: 2 ресурси, 6 операцій, cursor-пагінація,
+openapi/openapi.yaml   the spec: 2 resources, 6 operations, cursor pagination,
                        Idempotency-Key, problem+json
-src/app.js             express-застосунок: валідатор на кордоні + хендлери
-src/server.js          точка входу (npm start)
-src/store.js           in-memory дані, курсор, сховище ключів ідемпотентності
-src/problem.js         типи помилок і фабрики problem+json
-scripts/check-spec.js  acceptance-критерії по спеці (npm run check)
-scripts/smoke.js       acceptance-критерії застосунку (npm run smoke)
+src/app.js             express app: the validator boundary plus handlers
+src/server.js          entry point (npm start)
+src/store.js           in-memory data, cursor, idempotency key storage
+src/problem.js         error types and problem+json factories
+scripts/check-spec.js  acceptance criteria for the spec (npm run check)
+scripts/smoke.js       acceptance criteria for the app (npm run smoke)
 ```
 
-## Версії
+## Versions
 
-Зафіксовані ті самі, на яких прогнані критерії:
+Pinned to the same versions the criteria were verified on:
 `express@4.22.2`, `express-openapi-validator@5.6.2`, `@redocly/cli@2.46.0`.
-`express@4` — свідомо, з ним `express-openapi-validator` працює без сюрпризів.
-У `package.json` немає `"type": "module"`, тому і код застосунку, і команда
-`node -e "require('./spec.json')"` з критеріїв працюють як є.
+`express@4` is deliberate — `express-openapi-validator` works with it without surprises.
+`package.json` has no `"type": "module"`, so both the application code and the
+`node -e "require('./spec.json')"` command from the criteria work as written.
