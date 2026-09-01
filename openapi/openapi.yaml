@@ -1,0 +1,503 @@
+openapi: 3.0.3
+
+info:
+  title: Marketplace API
+  version: 1.0.0
+  description: |
+    Marketplace API contract (course project, homework 09).
+
+    Three cross-cutting rules this document pins down in a machine-checkable way:
+      * lists are served only with cursor pagination (`limit` + an opaque `cursor`);
+      * creating a resource requires an `Idempotency-Key` header;
+      * every 4xx/5xx error is `application/problem+json` (RFC 9457).
+
+    Money is always integer minor units (`*_cents`), never a float and never a decimal string.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  contact:
+    name: Marketplace API team
+    url: https://example.com/marketplace
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+# The API deliberately has no authentication in v1.
+# The explicit empty array satisfies the redocly `security-defined` rule.
+security: []
+
+tags:
+  - name: products
+    description: Marketplace product catalogue.
+  - name: orders
+    description: Customer orders.
+
+paths:
+  /products:
+    get:
+      operationId: listProducts
+      summary: List products (cursor pagination)
+      description: |
+        Returns a page of products. The next page is requested from the same URL
+        with the `cursor` value returned as `next_cursor` by the previous response.
+      tags: [products]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of items per page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            Opaque position token. Clients MUST NOT parse, decode or construct it
+            themselves — its format is an implementation detail and may change
+            without an API version bump. The only correct use is to pass back,
+            unchanged, the `next_cursor` value from the previous response.
+          schema:
+            type: string
+            minLength: 1
+          example: b2Zmc2V0OjIw
+      responses:
+        '200':
+          description: A page of products.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      operationId: createProduct
+      summary: Create a product
+      description: Creates a new product in the catalogue. The operation is idempotent on the `Idempotency-Key` header.
+      tags: [products]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Client-generated replay key (UUID v4 recommended).
+            Semantics: the same key with the same request body returns the same
+            response (the same 201 and the same resource), no new resource is
+            created, and the response carries `Idempotency-Replay: true`.
+            The same key with a DIFFERENT request body returns 422
+            application/problem+json, because the key is already bound to
+            another request. Keys are retained for 24 hours.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 255
+          example: 6f1f8f4e-4d4b-4a53-9a0e-2c1f0b7a1c11
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProductRequest'
+      responses:
+        '201':
+          description: Product created (or a previously created one replayed for the same idempotency key).
+          headers:
+            Idempotency-Replay:
+              $ref: '#/components/headers/IdempotencyReplay'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/IdempotencyKeyReuse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /products/{productId}:
+    parameters:
+      - name: productId
+        in: path
+        required: true
+        description: Product identifier.
+        schema:
+          type: string
+          minLength: 1
+        example: p_1
+    get:
+      operationId: getProduct
+      summary: Get a product by identifier
+      description: Returns a single catalogue product.
+      tags: [products]
+      responses:
+        '200':
+          description: Product found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders:
+    get:
+      operationId: listOrders
+      summary: List orders (cursor pagination)
+      description: |
+        Returns a page of orders. The next page is requested from the same URL
+        with the `cursor` value returned as `next_cursor` by the previous response.
+      tags: [orders]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of items per page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            Opaque position token. Clients MUST NOT parse, decode or construct it
+            themselves — its format is an implementation detail and may change
+            without an API version bump. The only correct use is to pass back,
+            unchanged, the `next_cursor` value from the previous response.
+          schema:
+            type: string
+            minLength: 1
+          example: b2Zmc2V0OjIw
+      responses:
+        '200':
+          description: A page of orders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Creates an order from catalogue items. Line prices and `total_cents` are
+        computed by the server — the client sends only `product_id` and `qty`.
+        The operation is idempotent on the `Idempotency-Key` header.
+      tags: [orders]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Client-generated replay key (UUID v4 recommended).
+            Semantics: the same key with the same request body returns the same
+            response (the same 201 and the same resource), no new resource is
+            created, and the response carries `Idempotency-Replay: true`.
+            The same key with a DIFFERENT request body returns 422
+            application/problem+json, because the key is already bound to
+            another request. Keys are retained for 24 hours.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 255
+          example: 6f1f8f4e-4d4b-4a53-9a0e-2c1f0b7a1c11
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created (or a previously created one replayed for the same idempotency key).
+          headers:
+            Idempotency-Replay:
+              $ref: '#/components/headers/IdempotencyReplay'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/IdempotencyKeyReuse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        description: Order identifier.
+        schema:
+          type: string
+          minLength: 1
+        example: o_1
+    get:
+      operationId: getOrder
+      summary: Get an order by identifier
+      description: Returns a single order together with its line items.
+      tags: [orders]
+      responses:
+        '200':
+          description: Order found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  headers:
+    IdempotencyReplay:
+      description: Present with the value `true` when the response was replayed for a previously used `Idempotency-Key`.
+      schema:
+        type: string
+        enum: ['true']
+
+  responses:
+    BadRequest:
+      description: The request violates the contract (invalid parameters, invalid body, or a missing required header).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/validation-error
+            title: Bad Request
+            status: 400
+            detail: "request/headers must have required property 'idempotency-key'"
+            instance: /orders
+
+    NotFound:
+      description: The resource does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/not-found
+            title: Not Found
+            status: 404
+            detail: Order 'o_999' does not exist.
+            instance: /orders/o_999
+
+    IdempotencyKeyReuse:
+      description: The `Idempotency-Key` has already been used with a different request body.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/idempotency-key-reuse
+            title: Unprocessable Entity
+            status: 422
+            detail: Idempotency-Key '6f1f8f4e...' was already used with a different request body.
+            instance: /orders
+
+    InternalServerError:
+      description: Internal server error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/internal-server-error
+            title: Internal Server Error
+            status: 500
+            detail: Unexpected error.
+            instance: /orders
+
+  schemas:
+    Problem:
+      type: object
+      description: Error format per RFC 9457 (problem details for HTTP APIs).
+      required: [type, title, status, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI identifying the error type — a stable identifier clients use to tell classes of errors apart.
+          example: https://marketplace.example/problems/validation-error
+        title:
+          type: string
+          description: Short, human-readable name of the error type, independent of this particular occurrence.
+          example: Bad Request
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          description: HTTP status code, mirrored in the body.
+          example: 400
+        detail:
+          type: string
+          description: What exactly went wrong with this specific request.
+          example: "request/body/items must NOT have fewer than 1 items"
+        instance:
+          type: string
+          description: Reference to this specific occurrence (the request path that caused it).
+          example: /orders
+
+    Product:
+      type: object
+      required: [id, title, price_cents, currency, created_at]
+      properties:
+        id:
+          type: string
+          example: p_1
+        title:
+          type: string
+          example: Mechanical keyboard
+        price_cents:
+          type: integer
+          minimum: 0
+          description: Price in minor currency units (cents). An integer, never a float.
+          example: 260000
+        currency:
+          type: string
+          enum: [UAH, USD, EUR]
+          example: UAH
+        created_at:
+          type: string
+          format: date-time
+
+    CreateProductRequest:
+      type: object
+      additionalProperties: false
+      required: [title, price_cents, currency]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        price_cents:
+          type: integer
+          minimum: 0
+          description: Price in minor currency units (cents).
+        currency:
+          type: string
+          enum: [UAH, USD, EUR]
+
+    ProductPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          description: Items on the current page.
+          items:
+            $ref: '#/components/schemas/Product'
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque token for the next page. `null` means there are no more pages.
+          example: b2Zmc2V0OjIw
+
+    OrderItem:
+      type: object
+      required: [product_id, qty, unit_price_cents]
+      properties:
+        product_id:
+          type: string
+          example: p_1
+        qty:
+          type: integer
+          minimum: 1
+          example: 2
+        unit_price_cents:
+          type: integer
+          minimum: 0
+          description: Unit price captured when the order was created, in cents.
+          example: 260000
+
+    Order:
+      type: object
+      required: [id, status, currency, items, total_cents, created_at]
+      properties:
+        id:
+          type: string
+          example: o_1
+        status:
+          type: string
+          enum: [created, paid, cancelled]
+          example: created
+        currency:
+          type: string
+          enum: [UAH, USD, EUR]
+          example: UAH
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        total_cents:
+          type: integer
+          minimum: 0
+          description: Order total in cents. An integer — no "2600.00" strings.
+          example: 520000
+        created_at:
+          type: string
+          format: date-time
+
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          description: Order lines; at least one.
+          items:
+            type: object
+            additionalProperties: false
+            required: [product_id, qty]
+            properties:
+              product_id:
+                type: string
+                minLength: 1
+              qty:
+                type: integer
+                minimum: 1
+                maximum: 999
+
+    OrderPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          description: Items on the current page.
+          items:
+            $ref: '#/components/schemas/Order'
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque token for the next page. `null` means there are no more pages.
+          example: b2Zmc2V0OjIw

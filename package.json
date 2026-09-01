@@ -1,0 +1,24 @@
+{
+  "name": "marketplace-api-contract",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Homework 09: OpenAPI contract for the Marketplace API + runtime validation at the boundary (option B)",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "redocly lint openapi/openapi.yaml",
+    "bundle": "redocly bundle openapi/openapi.yaml -o spec.json",
+    "check": "node scripts/check-spec.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "express": "4.22.2",
+    "express-openapi-validator": "5.6.2"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.46.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
