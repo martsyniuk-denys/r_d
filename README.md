@@ -44,6 +44,9 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run seed` | deterministic, idempotent fixture data |
 | `npm run demo:nplus1` | the same read three ways, with the SQL query count of each |
 | `npm run report` | revenue per seller — aggregate through `createQueryBuilder()` |
+| `npm run demo:race` | 50 parallel checkouts against `stock = 10`, with invariant checks |
+| `npm run demo:workers` | worker pool draining the job queue with `FOR UPDATE SKIP LOCKED` |
+| `npm run demo:retry` | provokes `40001` and retries the whole transaction with backoff |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -307,7 +310,10 @@ export SKIP_VAULT=1    # the grader has no access to the secret store
 
 Those are the dev credentials from `docker-compose.yml` (port `55432`, because the compose
 file maps `55432:5432`), and by the rules of the configuration homework they are not a
-secret. With them exported, every command runs on a fresh clone:
+secret. A single `DATABASE_URL`-style variable works too — `export DB_URL=postgres://marketplace@127.0.0.1:55432/marketplace`
+next to `DB_PASSWORD`, since `src/data-source.ts` accepts either shape. `package.json` is
+in the repository root, so no `cd` is needed. With the exports above, every command runs on
+a fresh clone:
 
 ```bash
 npm ci && npx tsc --noEmit          # clean compile
@@ -317,7 +323,15 @@ npm run migrate:revert && npm run migrate
 npm run seed && npm run seed        # idempotent: same row counts twice
 npm run demo:nplus1                 # query counts before/after
 npm run report                      # aggregate through QueryBuilder
+
+npm run demo:race                   # 50 parallel checkouts, stock 10 → exactly 10 orders
+npm run demo:workers                # 4 workers, FOR UPDATE SKIP LOCKED, nothing processed twice
+npm run demo:retry                  # 40001 caught, whole transaction retried, arithmetic intact
 ```
+
+The three demos need the schema and the fixtures, so `npm run migrate && npm run seed`
+comes first; each of them then resets the rows it works on, which makes them repeatable in
+any order and any number of times.
 
 Without `SKIP_VAULT=1` the same commands take the normal route: each of them is wrapped in
 `bash scripts/with-secrets.sh dev …` inside `package.json`, and the wrapper refuses to run
@@ -553,6 +567,199 @@ order are visible. Two details that bite here: `SUM`/`COUNT` come back as **stri
 `bigint` would not fit a JS number), so they are converted explicitly, and money stays in
 minor units until the last moment — the division by 100 happens in the formatter, not in
 the query.
+
+# Concurrency: checkout under a parallel burst
+
+The ORM layer above answers "can the schema be expressed in code". This one answers the
+harder question: what happens when the same endpoint is called fifty times at once. Three
+scripts do the answering, and each of them verifies its own invariants and exits non-zero
+if they break — the numbers below are from actual runs, and `npm run demo:race` is a test,
+not a demonstration.
+
+## The operation
+
+`src/concurrency/checkout.ts` — one transaction, four writes, no read-modify-write in
+JavaScript:
+
+```
+BEGIN
+  UPDATE products SET stock = stock - $qty
+   WHERE id = $product AND status = 'active' AND stock >= $qty RETURNING price_minor, …   ← 0 rows ⇒ out of stock
+  UPDATE users    SET balance_minor = balance_minor - $total
+   WHERE id = $buyer AND balance_minor >= $total RETURNING balance_minor                 ← 0 rows ⇒ insufficient funds
+  INSERT INTO orders …                                                                    ← the order
+  INSERT INTO order_items …                                                               ← its line
+  INSERT INTO jobs (type, payload, order_id) VALUES ('order_receipt', …)                   ← post-processing, handled by the workers
+COMMIT
+```
+
+Either all five statements land or none of them do: the rejections are thrown as a
+`CheckoutRejected` error, which unwinds `dataSource.transaction()` and rolls the whole
+thing back, and the caller gets a typed `{ ok: false, reason }` instead of an exception.
+There is no path that inserts an order without its line, its job or its payment — and
+`demo:race` checks exactly that, including `orders LEFT JOIN order_items IS NULL` over the
+whole table.
+
+The transaction lives on one connection because `dataSource.transaction(cb)` takes a query
+runner from the pool and gives the callback an `EntityManager` bound to it. Raw SQL inside
+it goes through that same manager, so `BEGIN` and `COMMIT` cannot end up on two different
+sockets — which is what would happen with `pool.query('BEGIN')`.
+
+One TypeORM detail that costs an hour if you meet it at runtime: for `UPDATE` and `DELETE`,
+`manager.query()` returns `[rows, rowCount]`, not `rows`. `src/concurrency/sql.ts` asks the
+query runner for the structured result instead, so `RETURNING` behaves the same for every
+command.
+
+## Atomic UPDATE, not SELECT … FOR UPDATE
+
+Both shapes are correct here; I picked the atomic conditional `UPDATE … WHERE stock >= $qty
+RETURNING`. It does the check and the lock in a single statement: Postgres takes the row
+lock, re-evaluates `stock >= $qty` after waiting (`READ COMMITTED` re-checks the predicate
+when the blocking transaction commits), and answers with either the updated row or zero
+rows — and zero rows *is* the "out of stock" branch. `SELECT … FOR UPDATE` needs two
+statements and a round trip in between, and the value it hands to the application is only
+usable because the lock is still held; if anyone later moves the arithmetic outside the
+lock's lifetime, the bug is silent. The conditional `UPDATE` has no such window to get
+wrong, and the `CHECK (stock >= 0)` constraint added in the same migration is the second
+line of defence: even a wrong query cannot persist a negative stock. `FOR UPDATE` earns its
+place where several rows must be read, compared and then written — the queue below is that
+case.
+
+## Race: `npm run demo:race`
+
+50 parallel `checkout()` calls (`Promise.all`, no application-side queue), one product,
+`stock = 10`, one unit per call, four buyers whose balances are deliberately oversized so
+that stock — and only stock — is the constraint:
+
+```
+attempts                 50
+successful checkouts     10
+declined: out_of_stock   40
+unexpected errors        0
+final stock              0
+rows with negative stock 0
+wall clock               117 ms
+```
+
+Nine invariants are then checked in SQL: successes equal the initial stock, final stock is
+zero, no row has negative stock, every success wrote an order, a line and a job, no orphan
+orders exist, and every buyer's balance equals `50 000 000 − successes × price` to the
+kopiyka — the last one is the lost-update check, since thirteen concurrent transactions
+debit the same buyer row.
+
+Fifty parallel calls are fifty connections' worth of demand against a pool of 25
+(`poolSize` is raised for the demo only); the rest wait in the pool queue, which changes
+the wall clock and nothing else.
+
+## Worker pool: `npm run demo:workers`
+
+Four workers inside one process, each claiming one job per transaction and holding it for
+the duration of the work:
+
+```ts
+manager.createQueryBuilder(Job, 'job')
+  .setLock('pessimistic_write')   // FOR UPDATE
+  .setOnLocked('skip_locked')     // SKIP LOCKED
+  .where('job.status = :status', { status: 'pending' })
+  .orderBy('job.id', 'ASC')
+  .limit(1)
+  .getOne();
+```
+
+which TypeORM emits as `… WHERE "job"."status" = $1 ORDER BY "job"."id" ASC LIMIT 1 FOR
+UPDATE SKIP LOCKED`. The `UPDATE` that marks the job `done` (and bumps its `processed`
+counter) commits with the same transaction, so a worker that dies before `COMMIT` loses its
+lock and the job goes back to the pool instead of disappearing.
+
+```
+worker-1     6 jobs
+worker-2     6 jobs
+worker-3     6 jobs
+worker-4     6 jobs
+
+jobs enqueued            24
+processed exactly once   24
+processed twice          0
+still pending            0
+wall clock               377 ms
+the same work sequential 960 ms (24 x 40 ms)
+```
+
+377 ms against 960 ms is the proof that `SKIP LOCKED` is doing what it says: without it the
+four workers would queue behind the same row and the wall clock would land on the
+sequential number. An empty result from a `SKIP LOCKED` query means "nothing is free right
+now", not "the queue is empty", so a worker only stops after three empty polls in a row —
+the count of those polls is printed next to each worker.
+
+## Retry: `npm run demo:retry`
+
+Eight transactions under `REPEATABLE READ` do the thing the checkout deliberately avoids:
+`SELECT balance_minor`, arithmetic in JavaScript, `UPDATE` without a lock. A barrier makes
+all eight read before any of them writes, so the conflict is guaranteed rather than lucky.
+
+```
+  writer- 6  attempt 6 hit 40001, retrying the whole transaction in 202 ms
+            could not serialize access due to concurrent update
+
+serialization failures caught  24
+  40001  24
+balance before                 5000000
+balance after                  4920000
+expected                       4920000 (5000000 - 8 x 10000)
+wall clock                     658 ms
+```
+
+Twenty-four retries in this run (the number moves between runs — it is a race), every one
+of them `40001`, and the final balance is exactly `8 × 10 000` below the start: no update
+was lost. That last part only works because the wrapper in `src/concurrency/retry.ts`
+retries the **whole** transaction, re-reading the balance on every attempt. Retrying only
+the `UPDATE` would replay the arithmetic from a stale snapshot, which is the lost update it
+was supposed to prevent.
+
+The wrapper retries exactly two SQLSTATEs and nothing else:
+
+```ts
+export const RETRYABLE_SQL_STATES = new Set(['40001', '40P01']);
+```
+
+`40001` (`serialization_failure`) and `40P01` (`deadlock_detected`) are the two codes that
+mean *"your transaction is fine, the timing was not"* — Postgres rolled it back to protect
+a guarantee, and the same statements replayed against a fresh snapshot are expected to
+succeed. Everything else is a statement about the transaction itself: `23505` is a duplicate
+key, `23514` a violated `CHECK`, `22003` an overflow, `42P01` a typo in a table name. Those
+do not become true on the second attempt — retrying them burns the database's time and,
+worse, hides a bug behind a slow endpoint. A blanket `catch` plus retry is how a unique-key
+violation turns into a production mystery.
+
+## What the schema gained
+
+Migration `StockBalanceAndJobQueue`:
+
+| Change | Why |
+| --- | --- |
+| `products.stock integer NOT NULL DEFAULT 0` + `CHECK (stock >= 0)` | the resource the race fights over, with the database as backstop |
+| `users.balance_minor integer NOT NULL DEFAULT 0` + `CHECK (balance_minor >= 0)` | payment in the same minor units as prices |
+| table `jobs` + partial index `WHERE status = 'pending'` | the queue; the index keeps the claim query off the done rows |
+| `jobs.order_id → orders.id ON DELETE CASCADE` | a receipt job has no meaning without its order |
+
+The generated migration needed reading again: TypeORM cannot see the `USING GIN` access
+method of `idx_products_search_vector`, decided the index had drifted, and put a
+`DROP INDEX` at the top of `up()` and a B-tree `CREATE INDEX` in `down()`. Both lines are
+deleted — the index is created by the initial migration and stays untouched, which
+`pg_indexes` confirms after `migrate`:
+
+```
+CREATE INDEX idx_products_search_vector ON public.products USING gin (search_vector)
+```
+
+## Where this is wired in (and where it is not)
+
+`checkout()` is the data-layer operation, exercised by `demo:race`. The HTTP `POST /orders`
+still runs the in-memory `OrdersService` from the contract homework: its request shape
+(`items[]`, `Idempotency-Key` replay) belongs to the published OpenAPI contract, and
+rewiring it is a contract change, not a concurrency one. Integration tests over `checkout()`
+come with the testcontainers homework, and the `jobs` table is the first step towards the
+transactional outbox later in the course.
 
 # The OpenAPI contract in detail
 
@@ -801,6 +1008,13 @@ src/data-source.ts                TypeORM DataSource: synchronize false, env-onl
 src/entities/                     User, Product, Order, OrderItem — the schema in code
 src/migrations/                   the generated (and hand-corrected) initial schema
 src/seed.ts                       deterministic idempotent fixtures
+src/concurrency/checkout.ts       the transactional checkout operation
+src/concurrency/worker.ts         queue worker: claim with FOR UPDATE SKIP LOCKED
+src/concurrency/retry.ts          retry wrapper for 40001 / 40P01 with backoff
+src/concurrency/sql.ts            RETURNING rows out of UPDATE through the query runner
+src/demo-race.ts                  50 parallel checkouts + invariant checks
+src/demo-workers.ts               worker pool + distribution and timing report
+src/demo-retry.ts                 serialization failures, retries, final arithmetic
 src/demo-nplus1.ts                N+1 before/after with a query counter
 src/report.ts                     revenue per seller through createQueryBuilder()
 src/db/query-count-logger.ts      TypeORM Logger that counts and prints queries

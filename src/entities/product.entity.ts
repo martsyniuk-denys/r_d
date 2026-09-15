@@ -20,6 +20,7 @@ export type ProductStatus = (typeof PRODUCT_STATUSES)[number];
 @Entity('products')
 @Check('products_name_not_empty', 'length(name) > 0')
 @Check('products_price_non_negative', 'price_minor >= 0')
+@Check('products_stock_non_negative', 'stock >= 0')
 @Check('products_currency_known', "currency IN ('UAH', 'USD', 'EUR')")
 @Check('products_status_known', "status IN ('draft', 'active', 'archived')")
 export class Product {
@@ -41,6 +42,9 @@ export class Product {
 
   @Column('integer', { name: 'price_minor' })
   priceMinor!: number;
+
+  @Column('integer', { default: 0 })
+  stock!: number;
 
   @Column('text')
   currency!: Currency;
