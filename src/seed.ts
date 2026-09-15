@@ -9,6 +9,7 @@ interface UserFixture {
   email: string;
   displayName: string;
   country: string;
+  balanceMinor: number;
   createdAt: string;
 }
 
@@ -17,6 +18,7 @@ interface ProductFixture {
   name: string;
   description: string;
   priceMinor: number;
+  stock: number;
   currency: Currency;
   status: ProductStatus;
   createdAt: string;
@@ -30,15 +32,17 @@ interface OrderFixture {
   items: { productName: string; qty: number }[];
 }
 
+export const BUYER_BALANCE_MINOR = 50_000_000;
+
 const USERS: UserFixture[] = [
-  { email: 'leader.shoes@example.com', displayName: 'Лідер Взуття', country: 'UA', createdAt: '2025-01-10T08:00:00Z' },
-  { email: 'comfort.shoes@example.com', displayName: 'Комфорт Шуз', country: 'UA', createdAt: '2025-01-11T08:00:00Z' },
-  { email: 'style.market@example.com', displayName: 'Стиль Маркет', country: 'PL', createdAt: '2025-01-12T08:00:00Z' },
-  { email: 'practic.sport@example.com', displayName: 'Практик Спорт', country: 'DE', createdAt: '2025-01-13T08:00:00Z' },
-  { email: 'olena.kovalenko@example.com', displayName: 'Олена Коваленко', country: 'UA', createdAt: '2025-02-01T08:00:00Z' },
-  { email: 'andrii.shevchenko@example.com', displayName: 'Андрій Шевченко', country: 'UA', createdAt: '2025-02-02T08:00:00Z' },
-  { email: 'marta.bondarenko@example.com', displayName: 'Марта Бондаренко', country: 'PL', createdAt: '2025-02-03T08:00:00Z' },
-  { email: 'yurii.tkachenko@example.com', displayName: 'Юрій Ткаченко', country: 'UA', createdAt: '2025-02-04T08:00:00Z' },
+  { email: 'leader.shoes@example.com', displayName: 'Лідер Взуття', country: 'UA', balanceMinor: 0, createdAt: '2025-01-10T08:00:00Z' },
+  { email: 'comfort.shoes@example.com', displayName: 'Комфорт Шуз', country: 'UA', balanceMinor: 0, createdAt: '2025-01-11T08:00:00Z' },
+  { email: 'style.market@example.com', displayName: 'Стиль Маркет', country: 'PL', balanceMinor: 0, createdAt: '2025-01-12T08:00:00Z' },
+  { email: 'practic.sport@example.com', displayName: 'Практик Спорт', country: 'DE', balanceMinor: 0, createdAt: '2025-01-13T08:00:00Z' },
+  { email: 'olena.kovalenko@example.com', displayName: 'Олена Коваленко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-01T08:00:00Z' },
+  { email: 'andrii.shevchenko@example.com', displayName: 'Андрій Шевченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-02T08:00:00Z' },
+  { email: 'marta.bondarenko@example.com', displayName: 'Марта Бондаренко', country: 'PL', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-03T08:00:00Z' },
+  { email: 'yurii.tkachenko@example.com', displayName: 'Юрій Ткаченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-04T08:00:00Z' },
 ];
 
 const PRODUCTS: ProductFixture[] = [
@@ -47,6 +51,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Кросівки шкіряні Лідер',
     description: 'Якісні кросівки шкіряні для щоденного використання. Матеріал: натуральна шкіра.',
     priceMinor: 249900,
+    stock: 24,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-01T10:00:00Z',
@@ -56,6 +61,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Черевики зимові Лідер',
     description: 'Теплі черевики зимові на хутрі. Матеріал: нубук.',
     priceMinor: 389900,
+    stock: 12,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-02T10:00:00Z',
@@ -65,6 +71,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Кеди літні Лідер',
     description: 'Легкі кеди літні з текстилю. Матеріал: текстиль.',
     priceMinor: 149900,
+    stock: 18,
     currency: 'UAH',
     status: 'draft',
     createdAt: '2025-03-03T10:00:00Z',
@@ -74,6 +81,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Чоботи шкіряні Комфорт',
     description: 'Високі чоботи шкіряні на осінь. Матеріал: натуральна шкіра.',
     priceMinor: 429900,
+    stock: 9,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-04T10:00:00Z',
@@ -83,6 +91,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Сандалі літні Комфорт',
     description: 'Відкриті сандалі літні з регулюванням. Матеріал: замша.',
     priceMinor: 119900,
+    stock: 30,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-05T10:00:00Z',
@@ -92,6 +101,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Капці домашні Комфорт',
     description: "М'які капці домашні з закритим носком. Матеріал: текстиль.",
     priceMinor: 59900,
+    stock: 40,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-06T10:00:00Z',
@@ -101,6 +111,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Окуляри сонцезахисні Стиль',
     description: 'Окуляри сонцезахисні з поляризацією. Матеріал: метал.',
     priceMinor: 89900,
+    stock: 15,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-07T10:00:00Z',
@@ -110,6 +121,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Навушники бездротові Стиль',
     description: 'Навушники бездротові з активним шумозаглушенням.',
     priceMinor: 199900,
+    stock: 21,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-08T10:00:00Z',
@@ -119,6 +131,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Джинси класичні Стиль',
     description: 'Джинси класичні прямого крою. Матеріал: денім.',
     priceMinor: 159900,
+    stock: 6,
     currency: 'UAH',
     status: 'archived',
     createdAt: '2025-03-09T10:00:00Z',
@@ -128,6 +141,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Рукавички шкіряні Практик',
     description: 'Рукавички шкіряні з підкладкою. Матеріал: натуральна шкіра.',
     priceMinor: 79900,
+    stock: 36,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-10T10:00:00Z',
@@ -137,6 +151,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Шкарпетки спортивні Практик',
     description: 'Шкарпетки спортивні, набір з трьох пар. Матеріал: бавовна.',
     priceMinor: 19900,
+    stock: 60,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-11T10:00:00Z',
@@ -146,6 +161,7 @@ const PRODUCTS: ProductFixture[] = [
     name: 'Кросівки туристичні Практик',
     description: 'Кросівки туристичні з мембраною. Матеріал: сітка та нубук.',
     priceMinor: 299900,
+    stock: 27,
     currency: 'UAH',
     status: 'active',
     createdAt: '2025-03-12T10:00:00Z',
@@ -261,6 +277,7 @@ async function seedUsers(manager: EntityManager): Promise<Map<string, User>> {
 
     user.displayName = fixture.displayName;
     user.country = fixture.country;
+    user.balanceMinor = fixture.balanceMinor;
     user.createdAt = new Date(fixture.createdAt);
 
     byEmail.set(fixture.email, await repo.save(user));
@@ -287,6 +304,7 @@ async function seedProducts(
 
     product.description = fixture.description;
     product.priceMinor = fixture.priceMinor;
+    product.stock = fixture.stock;
     product.currency = fixture.currency;
     product.status = fixture.status;
     product.createdAt = new Date(fixture.createdAt);
@@ -366,7 +384,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(1);
+  });
+}

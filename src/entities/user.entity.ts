@@ -7,6 +7,7 @@ import { Product } from './product.entity';
 @Index('users_email_unique', ['email'], { unique: true })
 @Check('users_display_name_not_empty', 'length(display_name) > 0')
 @Check('users_country_is_iso2', "country ~ '^[A-Z]{2}$'")
+@Check('users_balance_non_negative', 'balance_minor >= 0')
 export class User {
   @PrimaryGeneratedColumn('identity', { type: 'bigint', generatedIdentity: 'ALWAYS' })
   id!: string;
@@ -19,6 +20,9 @@ export class User {
 
   @Column('text')
   country!: string;
+
+  @Column('integer', { name: 'balance_minor', default: 0 })
+  balanceMinor!: number;
 
   @Column('timestamptz', { name: 'created_at', default: () => 'now()' })
   createdAt!: Date;

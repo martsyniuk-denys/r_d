@@ -3,9 +3,10 @@ import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { DataSource, DataSourceOptions } from 'typeorm';
+import { DataSource } from 'typeorm';
+import { PostgresConnectionOptions } from 'typeorm/driver/postgres/PostgresConnectionOptions';
 
-import { Order, OrderItem, Product, User } from './entities';
+import { Job, Order, OrderItem, Product, User } from './entities';
 
 const HINT =
   'Connection values come from the environment only. Either go through the secret store ' +
@@ -55,11 +56,11 @@ function readPassword(): string {
   throw new Error(`Neither DB_PASSWORD nor DB_PASSWORD_FILE is set. ${HINT}`);
 }
 
-export const dataSourceOptions: DataSourceOptions = {
+export const dataSourceOptions: PostgresConnectionOptions = {
   type: 'postgres',
   ...target(),
   password: readPassword(),
-  entities: [User, Product, Order, OrderItem],
+  entities: [User, Product, Order, OrderItem, Job],
   migrations: [join(__dirname, 'migrations', '*.js')],
   migrationsTableName: 'migrations',
   synchronize: false,
