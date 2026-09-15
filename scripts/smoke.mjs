@@ -66,8 +66,8 @@ async function main() {
   check('first page: 3 items + an opaque next_cursor', page1.json.items.length === 3 && typeof page1.json.next_cursor === 'string', page1.json.next_cursor);
   const page2 = await call('GET', `/products?limit=3&cursor=${encodeURIComponent(page1.json.next_cursor)}`);
   check('second page does not overlap the first', page2.json.items[0].id !== page1.json.items[0].id, page2.json.items.map((i) => i.id).join(','));
-  const lastPage = await call('GET', '/products?limit=100');
-  check('last page: next_cursor === null', lastPage.json.next_cursor === null, String(lastPage.json.next_cursor));
+  const ordersPage = await call('GET', '/orders?limit=100');
+  check('terminal page: next_cursor === null', ordersPage.json.next_cursor === null, String(ordersPage.json.next_cursor));
   const badLimit = await call('GET', '/products?limit=999');
   check('limit outside the spec range → 400', badLimit.res.status === 400, badLimit.json.detail);
 
