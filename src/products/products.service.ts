@@ -27,7 +27,7 @@ interface ProductRow {
   created_at: Date;
 }
 
-const COLUMNS = `'p_' || id AS id, name AS title, (price * 100)::int AS price_cents, currency, created_at`;
+const COLUMNS = `'p_' || id AS id, name AS title, price_minor AS price_cents, currency, created_at`;
 
 const toProduct = (row: ProductRow): Product => ({
   id: row.id,
@@ -72,8 +72,8 @@ export class ProductsService {
 
   async create(input: CreateProduct): Promise<Product> {
     const { rows } = await this.pool.query<ProductRow>(
-      `INSERT INTO products (seller_id, name, price, currency, status)
-       VALUES ((SELECT id FROM users ORDER BY id LIMIT 1), $1, $2::numeric / 100, $3, 'active')
+      `INSERT INTO products (seller_id, name, price_minor, currency, status)
+       VALUES ((SELECT id FROM users ORDER BY id LIMIT 1), $1, $2, $3, 'active')
        RETURNING ${COLUMNS}`,
       [input.title, input.price_cents, input.currency],
     );
