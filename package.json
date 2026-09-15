@@ -2,12 +2,19 @@
   "name": "marketplace-api-contract",
   "version": "1.0.0",
   "private": true,
-  "description": "Homework 09: OpenAPI contract for the Marketplace API + runtime validation at the boundary (option B), on NestJS",
+  "description": "Marketplace API coursework: OpenAPI contract, typed config, SQL data layer and a TypeORM layer with migrations",
   "main": "dist/main.js",
   "scripts": {
     "build": "nest build",
     "start": "npm run build && node dist/main.js",
     "start:dev": "nest start --watch",
+    "migrate": "bash scripts/with-secrets.sh dev npx typeorm migration:run -d dist/data-source.js",
+    "migrate:show": "bash scripts/with-secrets.sh dev npx typeorm migration:show -d dist/data-source.js",
+    "migrate:revert": "bash scripts/with-secrets.sh dev npx typeorm migration:revert -d dist/data-source.js",
+    "migrate:generate": "bash scripts/with-secrets.sh dev npx typeorm migration:generate -d dist/data-source.js",
+    "seed": "bash scripts/with-secrets.sh dev node dist/seed.js",
+    "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/demo-nplus1.js",
+    "report": "bash scripts/with-secrets.sh dev node dist/report.js",
     "lint": "redocly lint openapi/openapi.yaml",
     "bundle": "redocly bundle openapi/openapi.yaml -o spec.json",
     "check": "node scripts/check-spec.js",
@@ -28,6 +35,7 @@
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
+    "typeorm": "^0.3.31",
     "zod": "^3.25.76"
   },
   "devDependencies": {
