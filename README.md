@@ -13,9 +13,11 @@ away from its schema never reaches the client (500 instead of silent drift).
 
 ```bash
 npm install
-cp .env.example .env          # real values live here; .env is git-ignored
-docker compose up -d --wait   # Postgres on localhost:55432, seeded from db/init.sql
-npm start                     # http://localhost:3000
+cp .env.example .env                 # real values live here; .env is git-ignored
+cp secrets/db_password.example secrets/db_password
+docker compose up -d --wait          # Postgres on localhost:55432
+npm run db:schema && npm run db:seed # tables + ~590k rows (~15 s)
+npm start                            # http://localhost:3000
 ```
 
 `npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode.
@@ -30,6 +32,10 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run start:dev` | watch mode (`nest start --watch`) |
 | `npm run build` | compiles TypeScript into `dist/` |
 | `npm run check:env` | verifies `.env.example` still matches the zod schema |
+| `npm run db:schema` | applies `db/schema.sql` to a clean database |
+| `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
+| `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
+| `npm run db:psql` | opens a psql shell on the running container |
 | `npm run lint` | `redocly lint openapi/openapi.yaml` |
 | `npm run bundle` | `redocly bundle openapi/openapi.yaml -o spec.json` |
 | `npm run check` | every acceptance criterion for the spec in one run |
@@ -56,15 +62,24 @@ Every variable is declared once, in `src/config/env.schema.ts`, and documented i
 `.env.example`. Types come from `z.coerce` because everything arriving from the
 environment is a string.
 
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `NODE_ENV` | no | `development` | Runtime mode: `development` \| `test` \| `production`. |
-| `PORT` | no | `3000` | HTTP port. Coerced to a number. |
-| `DB_URL` | **yes** | — | Postgres connection string **without a password**. The schema rejects a URL that contains one. |
-| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | File holding the database password. Re-read on every new connection. |
-| `DB_POOL_MAX` | no | `10` | Maximum connections in the pool. |
-| `DB_CONNECTION_TIMEOUT_MS` | no | `5000` | How long to wait for a pooled connection. |
-| `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| Variable | Required | Default | Source | Purpose |
+| --- | --- | --- | --- | --- |
+| `NODE_ENV` | no | `development` | process environment | Runtime mode: `development` \| `test` \| `production`. |
+| `PORT` | no | `3000` | process environment | HTTP port. Coerced to a number. |
+| `DB_URL` | **yes** | — | **secrets store** — the local `.env`, which is git-ignored; `.env.example` carries a fake | Postgres connection string **without a password**. The schema rejects a URL that contains one. |
+| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | process environment (a path, not a secret) | File holding the database password. Re-read on every new connection. |
+| `DB_POOL_MAX` | no | `10` | process environment | Maximum connections in the pool. |
+| `DB_CONNECTION_TIMEOUT_MS` | no | `5000` | process environment | How long to wait for a pooled connection. |
+| `LOG_LEVEL` | no | `info` | process environment | `debug` \| `info` \| `warn` \| `error`. |
+
+The database connection lives in the store this project already had, not in a new env
+file: `DB_URL` carries no password, and the password itself is a separate file
+(`DB_PASSWORD_FILE`) that can be rotated while the service runs. No tracked env file
+other than `.env.example` contains a connection string.
+
+The dev credentials of the Postgres container itself stay in `docker-compose.yml` on
+purpose — those are two different paths. The application reads its secret from the
+store; a reviewer with a fresh clone needs a local stand that comes up without one.
 
 The password is deliberately **not** an environment variable. It lives in a file so it
 can be replaced while the process is running — see the rotation section below.
@@ -177,6 +192,79 @@ docker run --rm myapp sh -c 'cat /app/.env' 2>&1       # No such file or directo
 docker inspect --format '{{.Config.Env}}' myapp        # only PATH, NODE_VERSION, YARN_VERSION
 docker history --no-trunc myapp | grep -i password     # empty
 ```
+
+# Data layer
+
+Four tables — `users`, `products`, `orders`, `order_items` — wired by four foreign keys.
+Money is `numeric(12,2)`, time is `timestamptz`, and `CHECK` constraints keep statuses and
+currencies from drifting into free text.
+
+| | Table | Rows after `db/seed.sql` |
+| --- | --- | ---: |
+| **main table** | `orders` | 150 000 |
+| **table q4 searches** | `products` | 120 000 |
+| | `order_items` | ~300 000 |
+| | `users` | 20 000 |
+
+## Bring the database up, and connect to it
+
+One line each, both working on a fresh clone with no file edits — the dev credentials
+live in `docker-compose.yml`:
+
+```bash
+docker compose up -d --wait
+```
+
+```bash
+docker compose exec -T postgres psql -U marketplace -d marketplace
+```
+
+## Run every step
+
+Exactly the order the whole thing is meant to be reproduced in — clean volume first, so
+nothing is left over from a previous run:
+
+```bash
+docker compose down -v && docker compose up -d --wait
+
+npm run db:schema                       # db/schema.sql  — tables, constraints, tsvector column
+npm run db:seed                         # db/seed.sql    — ~590k rows, ends with VACUUM (ANALYZE)
+
+# "before": every one of the four queries is a Seq Scan
+for n in 1 2 3 4; do
+  docker compose exec -T postgres psql -U marketplace -d marketplace \
+    -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q$n.sql)"
+done
+
+npm run db:indexes                      # db/indexes.sql + ANALYZE
+
+# "after": no Seq Scan, and each plan names the index from db/indexes.sql
+for n in 1 2 3 4; do
+  docker compose exec -T postgres psql -U marketplace -d marketplace \
+    -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/q$n.sql)"
+done
+```
+
+Run q4 two or three times and take the last: the first call after `CREATE INDEX` walks a
+cold GIN and reports a time an order of magnitude worse than the real one.
+
+The four queries, the indexes that cure them, and the before/after plans with buffer
+counts are in [db/OPTIMIZATIONS.md](db/OPTIMIZATIONS.md).
+
+| Query | What it answers | Index it ends up using |
+| --- | --- | --- |
+| `db/queries/q1.sql` | a buyer's orders inside a date range | `idx_orders_buyer_created_at` (composite) |
+| `db/queries/q2.sql` | recent refunds | `idx_orders_refunded_created_at` (**partial**) |
+| `db/queries/q3.sql` | user lookup by e-mail, case-insensitive | `idx_users_email_lower` (**expression**) |
+| `db/queries/q4.sql` | catalogue full-text search | `idx_products_search_vector` (**GIN over tsvector**) |
+
+## A note on the API and the schema
+
+The database uses domain names — `name`, `description`, `price numeric(12,2)` — while the
+HTTP contract from the OpenAPI spec keeps `title` and `price_cents`. `ProductsService`
+bridges the two in SQL (`name AS title`, `(price * 100)::int AS price_cents`), so money is
+`numeric` in storage and an integer number of cents on the wire, and the published contract
+did not have to change to accommodate a schema decision.
 
 ## What the spec contains
 

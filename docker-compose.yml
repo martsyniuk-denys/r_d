@@ -9,7 +9,6 @@ services:
     ports:
       - '55432:5432'
     volumes:
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U marketplace -d marketplace']

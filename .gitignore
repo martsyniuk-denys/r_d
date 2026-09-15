@@ -8,4 +8,5 @@ spec.json
 .env
 .env.*
 !.env.example
-secrets/
+secrets/*
+!secrets/*.example

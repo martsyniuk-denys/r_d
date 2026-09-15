@@ -12,7 +12,11 @@
     "bundle": "redocly bundle openapi/openapi.yaml -o spec.json",
     "check": "node scripts/check-spec.js",
     "smoke": "npm run build && node scripts/smoke.mjs",
-    "check:env": "npm run build && node scripts/check-env-example.mjs"
+    "check:env": "npm run build && node scripts/check-env-example.mjs",
+    "db:schema": "docker compose exec -T postgres psql -U marketplace -d marketplace -v ON_ERROR_STOP=1 -q -f - < db/schema.sql",
+    "db:seed": "docker compose exec -T postgres psql -U marketplace -d marketplace -v ON_ERROR_STOP=1 -q -f - < db/seed.sql",
+    "db:indexes": "docker compose exec -T postgres psql -U marketplace -d marketplace -v ON_ERROR_STOP=1 -q -f - < db/indexes.sql && docker compose exec -T postgres psql -U marketplace -d marketplace -q -c \"ANALYZE;\"",
+    "db:psql": "docker compose exec postgres psql -U marketplace -d marketplace"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.22",

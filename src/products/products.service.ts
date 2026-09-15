@@ -27,7 +27,7 @@ interface ProductRow {
   created_at: Date;
 }
 
-const COLUMNS = 'id, title, price_cents, currency, created_at';
+const COLUMNS = `'p_' || id AS id, name AS title, (price * 100)::int AS price_cents, currency, created_at`;
 
 const toProduct = (row: ProductRow): Product => ({
   id: row.id,
@@ -36,6 +36,11 @@ const toProduct = (row: ProductRow): Product => ({
   currency: row.currency,
   created_at: row.created_at.toISOString(),
 });
+
+const toInternalId = (publicId: string): string | null => {
+  const match = /^p_(\d{1,18})$/.exec(publicId);
+  return match ? match[1] : null;
+};
 
 @Injectable()
 export class ProductsService {
@@ -54,9 +59,12 @@ export class ProductsService {
   }
 
   async get(id: string): Promise<Product> {
+    const internalId = toInternalId(id);
+    if (internalId === null) throw notFound(`Product '${id}' does not exist.`);
+
     const { rows } = await this.pool.query<ProductRow>(
       `SELECT ${COLUMNS} FROM products WHERE id = $1`,
-      [id],
+      [internalId],
     );
     if (rows.length === 0) throw notFound(`Product '${id}' does not exist.`);
     return toProduct(rows[0]);
@@ -64,7 +72,9 @@ export class ProductsService {
 
   async create(input: CreateProduct): Promise<Product> {
     const { rows } = await this.pool.query<ProductRow>(
-      `INSERT INTO products (title, price_cents, currency) VALUES ($1, $2, $3) RETURNING ${COLUMNS}`,
+      `INSERT INTO products (seller_id, name, price, currency, status)
+       VALUES ((SELECT id FROM users ORDER BY id LIMIT 1), $1, $2::numeric / 100, $3, 'active')
+       RETURNING ${COLUMNS}`,
       [input.title, input.price_cents, input.currency],
     );
     return toProduct(rows[0]);
