@@ -15,7 +15,7 @@ away from its schema never reaches the client (500 instead of silent drift).
 npm install
 cp .env.example .env                 # real values live here; .env is git-ignored
 cp secrets/db_password.example secrets/db_password
-docker compose up -d --wait          # PgBouncer on localhost:56432, Postgres behind it
+docker compose up -d --wait          # PgBouncer on 56432, Postgres behind it, Pact broker on 9292
 npm run build                        # migrations and scripts run from dist/
 npm run migrate && npm run seed      # schema from src/migrations + fixture rows
 npm start                            # http://localhost:3000
@@ -54,6 +54,11 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `bash scripts/backup.sh` | `pg_dump -Fc` into a dated file under `backups/` |
 | `bash scripts/restore-drill.sh` | restores the newest dump into a throwaway container and prints `MATCH` |
 | `bash rotate.sh` | rotates the password in Postgres, PgBouncer and the password file |
+| `npm run test:integration` | repositories against a Postgres the test run starts itself |
+| `npm run test:e2e` | the whole application over HTTP, through supertest |
+| `npm run test:contract` | the consumer side of the Pact contract → `pacts/*.json` |
+| `npm run verify:provider` | the real application replayed against that contract |
+| `bash scripts/pact-gate.sh publish\|tag-prod\|can-i-deploy` | the broker side of the loop |
 | `npm run lint` | `redocly lint openapi/openapi.yaml` |
 | `npm run bundle` | `redocly bundle openapi/openapi.yaml -o spec.json` |
 | `npm run check` | every acceptance criterion for the spec in one run |
@@ -349,6 +354,31 @@ npm run demo:race                   # 50 parallel checkouts, stock 10 → exactl
 npm run demo:workers                # 4 workers, FOR UPDATE SKIP LOCKED, nothing processed twice
 npm run demo:retry                  # 40001 caught, whole transaction retried, arithmetic intact
 ```
+
+The testing homework needs only Docker running — no database setup, no `.env`, and the
+compose stack does not have to be up, because `@testcontainers/postgresql` starts the
+database from inside the run:
+
+```bash
+npm run test:integration            # 8 tests, two repositories, real Postgres
+npm run test:integration            # again: still green, nothing cleaned by hand
+npm run test:e2e                    # 4 tests: create → read, 404 and 400
+npm run test:contract               # writes pacts/marketplace-web-marketplace-api.json
+npm run verify:provider             # the real app answers every interaction
+```
+
+For the contract gate the broker has to be up (`docker compose up -d --wait`) and the
+address exported, which is not a secret when it is your own compose:
+
+```bash
+export PACT_BROKER_URL=http://127.0.0.1:9292
+bash scripts/pact-gate.sh publish && npm run verify:provider
+bash scripts/pact-gate.sh can-i-deploy      # deployable: null  → exit 1
+bash scripts/pact-gate.sh tag-prod
+bash scripts/pact-gate.sh can-i-deploy      # deployable: true  → exit 0
+```
+
+Both outputs, and why the order matters, are in [Testing](#testing-integration-end-to-end-contract).
 
 The pooling homework adds three checks that need no npm script:
 
@@ -984,6 +1014,220 @@ What makes it a drill rather than a demo:
 The numbers from the run above, plus the RTO and RPO they add up to, are written down
 in [RESTORE-DRILL.md](RESTORE-DRILL.md).
 
+# Testing: integration, end to end, contract
+
+Three suites, each buying a different kind of confidence, and none of them mocking the
+thing it is supposed to be testing.
+
+| Command | What runs | Against what |
+| --- | --- | --- |
+| `npm run test:integration` | repositories, 8 tests | a real Postgres started by the test run |
+| `npm run test:e2e` | the whole HTTP application, 4 tests | the real module graph, the real database |
+| `npm run test:contract` | the consumer side of the contract | Pact's mock provider → `pacts/*.json` |
+| `npm run verify:provider` | the real application answering the contract | the local pact file, or the broker |
+
+```bash
+npm ci
+npm run test:integration && npm run test:e2e
+npm run test:contract && npm run verify:provider
+```
+
+Docker has to be running — nothing else has to be. No database is set up by hand, no
+`.env` is needed, and the compose stack does not have to be up: `@testcontainers/postgresql`
+starts `postgres:16-alpine` from `test/testkit/global-setup.ts`, runs the project's own
+migrations into it, and hands the connection string to the workers. The container is
+stopped in `global-teardown.ts`. `DATABASE_URL` in the tests is therefore not a secret and
+not a store value — it does not exist until the run creates it, which is the whole point of
+this layer.
+
+`maxWorkers: 1` is deliberate: every jest worker would otherwise multiply containers.
+
+## `reporters: ['default']`
+
+One line in `jest.config.js`, and not decoration. With `reporters` unset, Jest 30 picks a
+reporter from the environment, and the compact one it selects in some runners prints no
+`PASS <file>`, no `describe`/`it` names and no `✓` — only the final `Tests: N passed`. In a
+plain terminal the full output is there either way, but the suite has to read the same
+wherever it is run from.
+
+## Isolation: transaction, then ROLLBACK
+
+Every integration test runs inside a transaction that is rolled back when it ends
+(`test/testkit/rollback.ts`). It is the cheapest of the three strategies — no `TRUNCATE`
+between tests, one container for the whole run instead of one per file — and it is the only
+one that makes the suite green on a second run with no cleanup step in between, because
+nothing is ever committed. The cost is that a test cannot exercise code that commits by
+itself, and that a statement which violates a constraint poisons the transaction it runs in;
+the constraint tests therefore take a `SAVEPOINT` first and roll back to it, which is what
+`ctx.attempt()` does. That is also why the repositories take *anything with `query()`*
+rather than a `Pool` of their own: in production they are handed the pool, in tests the one
+client the transaction is open on, and inside `checkout()` the connection the TypeORM
+transaction already owns.
+
+```bash
+npm run test:integration && npm run test:integration   # both green, nothing cleaned by hand
+```
+
+## Test data builders
+
+`test/testkit/builders.ts` gives `aUser()`, `aProduct()` and `anOrder()`, each with valid,
+unique defaults, so a test names only what it is actually about:
+
+```ts
+const seller = await aUser().create(ctx.db());
+const product = await aProduct().soldBy(seller).named('Ноутбук Vela 14').create(ctx.db());
+await anOrder().placedBy(buyer).withStatus('paid').withLine(product, 3).create(ctx.db());
+```
+
+Emails and names carry a unique suffix, so the `users_email_unique` index never fires by
+accident — only where a test means it to.
+
+## What the integration suite tests that a mock cannot
+
+`ProductsRepository` and `OrdersRepository` are the data access the application actually
+uses: `ProductsService` is built on the first, and `checkout()` from the concurrency
+homework writes its order and its line through the second.
+
+| Test | Why a mock would have missed it |
+| --- | --- |
+| product round-trip | `price_minor` comes back an integer, `created_at` a real `Date` |
+| unknown seller → `23503` | the foreign key is in the database, not in the code |
+| search by a word | `search_vector` is a **generated** tsvector column: `'ноут'` finds nothing, `'ноутбук'` does — a `LIKE '%…%'` mock would have matched both |
+| paging | ordering and `OFFSET` are the database's behaviour |
+| order read back with its lines | the product name lives only in `products`; only the JOIN knows it |
+| same product twice in one order → `23505` | `order_items_order_product_unique` |
+| revenue per seller | three-table `JOIN`, two aggregates, a `GROUP BY` and a status filter |
+| deleting an order | `ON DELETE CASCADE` takes the lines with it |
+
+## End to end
+
+`test/e2e/products.e2e.test.ts` builds the application from `AppModule` with
+`Test.createTestingModule({ imports: [AppModule] })` — **no `overrideProvider` anywhere** —
+and then runs it through `configureApp()`, the same function `main.ts` calls. That matters:
+request and response validation against `openapi/openapi.yaml` lives in there, so the suite
+is testing the application that ships and not a leaner one.
+
+- happy path: `POST /products` → `201`, then `GET /products/{id}` returns the same resource,
+  and it is in `GET /products` too;
+- the same `Idempotency-Key` replays instead of creating a second product;
+- `GET /products/p_999999999` → `404 application/problem+json`;
+- `POST /products` without the required header, and with an invalid body → `400`.
+
+## Contract
+
+The consumer test (`test/contract/consumer.pact.test.ts`) plays an imagined storefront
+against Pact's mock provider and writes `pacts/marketplace-web-marketplace-api.json`. Two
+interactions, each with a provider state, each on a path that exists in the spec from the
+contract homework — `/products/p_1` and `/products/p_999999999` both answer to
+`/products/{productId}`:
+
+```bash
+node -e 'const p=require("./pacts/marketplace-web-marketplace-api.json");const spec=require("fs").readFileSync("openapi/openapi.yaml","utf8");const sp=[...spec.matchAll(/^\s+(\/\S*):\s*$/gm)].map(m=>m[1]);const seg=s=>s.split("?")[0].replace(/\/+$/,"").split("/");const fit=(a,b)=>{a=seg(a);b=seg(b);return a.length===b.length&&a.every((x,i)=>/^\{[^}]+\}$/.test(x)?b[i]!=="":x===b[i])};const bad=p.interactions.filter(i=>!sp.some(x=>fit(x,i.request.path)));console.log(bad.length?"NOT IN THE SPEC: "+bad.map(i=>i.request.path).join(", "):"OK");process.exit(bad.length?1:0)'
+# OK
+```
+
+Bodies are matched by type (`MatchersV3.like`, `integer`, `regex`), not by value, so a new
+price in the catalogue does not break the contract.
+
+`npm run verify:provider` then starts the **real** application against a testcontainer and
+replays both interactions at it. The provider states seed the database with
+`INSERT … ON CONFLICT DO NOTHING`, so the verification is repeatable:
+
+```
+  a request for the product page of p_1 (4ms loading, 15ms verification)
+     Given a product with id p_1 exists
+    returns a response which
+      has status code 200 (OK)
+      includes headers
+        "Content-Type" with value "application/json; charset=utf-8" (OK)
+      has a matching body (OK)
+```
+
+`pacts/*.json` is committed: `verify:provider` then works on a bare clone in whatever order
+the commands are run, and the file is regenerated by `npm run test:contract` anyway.
+
+## The broker, and the gate
+
+`docker compose up -d --wait` brings up `pact-broker` on **9292** (with its own Postgres)
+next to the application's database. It is deliberately open — it holds nothing but the
+contract this repository generates, and a token in `docker-compose.yml` would be a constant
+in git, not a secret. A real broker is reached with `PACT_BROKER_URL` and
+`PACT_BROKER_TOKEN`, which the code only ever reads from `process.env`: locally they come
+from the store of the configuration homework through the usual wrapper, in CI from GitHub
+secrets.
+
+```bash
+bash scripts/with-secrets.sh dev npm run verify:provider    # the normal route
+PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider  # no store at hand (grading, CI)
+```
+
+Both are legitimate. The first reads `PACT_BROKER_URL` out of `.env`; the second is the
+emergency entrance — under `SKIP_VAULT=1` the wrapper simply executes the second form. With
+no broker configured at all, the verification runs against the local pact file.
+
+The gate itself, end to end. `scripts/pact-gate.sh` is a thin wrapper over the broker's HTTP
+API so that CI and this README run the same four commands:
+
+```bash
+docker compose up -d --wait                       # broker healthy on 9292
+export PACT_BROKER_URL=http://127.0.0.1:9292
+
+bash scripts/pact-gate.sh publish                 # → HTTP 201
+npm run verify:provider                           # → exit 0, result published to the broker
+bash scripts/pact-gate.sh can-i-deploy            # → deployable: null, exit 1  ← the gate is shut
+bash scripts/pact-gate.sh tag-prod                # → HTTP 201
+bash scripts/pact-gate.sh can-i-deploy            # → deployable: true, exit 0  ← and now it is open
+```
+
+**Before the `prod` tag** — the provider version running in prod is not known, so the only
+honest answer is "unknown":
+
+```json
+{
+    "deployable": null,
+    "reason": "There is no verified pact between version af9e79c of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)",
+    "success": 0,
+    "failed": 0,
+    "unknown": 1
+}
+```
+
+**After the `prod` tag** on the *same provider version* the verification was published
+under:
+
+```json
+{
+    "deployable": true,
+    "reason": "All required verification results are published and successful",
+    "success": 1,
+    "failed": 0,
+    "unknown": 0
+}
+```
+
+That pair is the proof the gate is real rather than always-green. `can-i-deploy` exits `1`
+whenever `deployable` is anything but `true` — asking about an environment nothing is tagged
+for shows it without having to break the contract first:
+
+```bash
+PACT_ENVIRONMENT=staging bash scripts/pact-gate.sh can-i-deploy
+# can-i-deploy says no: There is no verified pact … with tag staging (no such version exists)
+# exit=1
+```
+
+The tag has to go on the **provider** version, and on the same `providerVersion` the
+verifier published under — `test/contract/provider-version.ts` and `scripts/pact-gate.sh`
+both derive it from `git rev-parse --short HEAD`, or from `PACT_PROVIDER_VERSION` when it is
+set, which is what CI does with `github.sha`.
+
+## CI
+
+`.github/workflows/contract.yml` runs one job, `contract`: compile → integration → e2e →
+consumer contract → **publish** → **provider verification** (with
+`publishVerificationResult: true`) → record the provider version as what is in prod →
+**can-i-deploy**, which fails the job when the answer is not `true`. The broker comes from
+compose unless `secrets.PACT_BROKER_URL` names a hosted one.
+
 # The OpenAPI contract in detail
 
 ## What the spec contains
@@ -1240,6 +1484,7 @@ src/demo-workers.ts               worker pool + distribution and timing report
 src/demo-retry.ts                 serialization failures, retries, final arithmetic
 src/demo-nplus1.ts                N+1 before/after with a query counter
 src/report.ts                     revenue per seller through createQueryBuilder()
+src/repositories/                 data access taking anything with query(): pool, client or transaction
 src/db/query-count-logger.ts      TypeORM Logger that counts and prints queries
 src/db/database.module.ts         pg.Pool with password: () => readFile()
 src/health/health.controller.ts   /health, reports uptime and pid
@@ -1250,6 +1495,14 @@ src/common/idempotency.service.ts replay semantics for Idempotency-Key
 src/products/                     ProductsController + ProductsService (Postgres)
 src/orders/                       OrdersController + OrdersService (in-memory)
 db/init.sql                       products table + seed, run by compose on first start
+test/testkit/                     the container, the rollback isolation and the builders
+test/integration/                 repository tests against a real Postgres
+test/e2e/                         the whole application over HTTP through supertest
+test/contract/                    Pact consumer test and provider verification
+pacts/                            the generated contract, committed on purpose
+jest.config.js                    integration suite; the other three configs extend it
+.github/workflows/contract.yml    publish → verify → can-i-deploy
+scripts/pact-gate.sh              the broker side: publish, tag, gate
 scripts/with-secrets.sh           runs a command with credentials from the store
 scripts/lib/pg-env.sh             environment → PG* variables, shared by the two scripts below
 scripts/backup.sh                 pg_dump -Fc into a dated file + a control-value sidecar
@@ -1288,6 +1541,11 @@ Nest 11 would pull Express 5 instead.
 | `typeorm` | 0.3.31 |
 | `postgres` (image) | 16-alpine |
 | `edoburu/pgbouncer` (image) | v1.25.2-p0 (PgBouncer 1.25) |
+| `pactfoundation/pact-broker` (image) | 2.143.0-pactbroker2.121.0 |
+| `jest` / `ts-jest` | 30 / 29 |
+| `@testcontainers/postgresql` | 12.x |
+| `@pact-foundation/pact` | 17.x |
+| `supertest` | 7.x |
 | `pg` | 8.x |
 | `typescript` | 5.x |
 

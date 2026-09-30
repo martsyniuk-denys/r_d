@@ -11,11 +11,10 @@ import { toProblem } from './common/problem';
 
 export const API_SPEC = join(__dirname, '..', 'openapi', 'openapi.yaml');
 
-export async function createApp(): Promise<NestExpressApplication> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
-    bodyParser: false,
-    abortOnError: false,
-  });
+// Everything that turns a bare Nest application into this application. Both
+// main.ts and the end-to-end suite go through here, so the tests cannot end up
+// exercising a differently wired app than production.
+export async function configureApp(app: NestExpressApplication): Promise<NestExpressApplication> {
   app.disable('x-powered-by');
 
   app.use(express.json());
@@ -41,4 +40,13 @@ export async function createApp(): Promise<NestExpressApplication> {
   });
 
   return app;
+}
+
+export async function createApp(): Promise<NestExpressApplication> {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bodyParser: false,
+    abortOnError: false,
+  });
+
+  return configureApp(app);
 }
