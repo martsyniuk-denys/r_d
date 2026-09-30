@@ -10,3 +10,4 @@ spec.json
 !.env.example
 secrets/*
 !secrets/*.example
+backups/

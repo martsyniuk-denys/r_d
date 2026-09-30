@@ -11,7 +11,8 @@ import { Job, Order, OrderItem, Product, User } from './entities';
 const HINT =
   'Connection values come from the environment only. Either go through the secret store ' +
   '(bash scripts/with-secrets.sh dev <command> — every npm script that touches the database ' +
-  'already does), or export DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME yourself and set SKIP_VAULT=1.';
+  'already does), or export DATABASE_URL (or DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME) ' +
+  'yourself and set SKIP_VAULT=1.';
 
 function required(name: string, value: string | undefined): string {
   if (value === undefined || value === '') throw new Error(`${name} is not set. ${HINT}`);
@@ -25,16 +26,21 @@ interface Target {
   database: string;
 }
 
-function target(): Target {
-  const url = process.env.DB_URL;
+function connectionUrl(): URL | undefined {
+  const raw = process.env.DB_URL ?? process.env.DATABASE_URL;
+  if (raw === undefined || raw === '') return undefined;
+  return new URL(raw);
+}
 
-  if (url !== undefined && url !== '') {
-    const parsed = new URL(url);
+const url = connectionUrl();
+
+function target(): Target {
+  if (url !== undefined) {
     return {
-      host: required('DB_URL host', parsed.hostname),
-      port: Number(parsed.port || 5432),
-      username: required('DB_URL user', decodeURIComponent(parsed.username)),
-      database: required('DB_URL database', parsed.pathname.replace(/^\//, '')),
+      host: required('connection URL host', url.hostname),
+      port: Number(url.port || 5432),
+      username: required('connection URL user', decodeURIComponent(url.username)),
+      database: required('connection URL database', url.pathname.replace(/^\//, '')),
     };
   }
 
@@ -49,6 +55,8 @@ function target(): Target {
 function readPassword(): string {
   const inline = process.env.DB_PASSWORD;
   if (inline !== undefined && inline !== '') return inline;
+
+  if (url !== undefined && url.password !== '') return decodeURIComponent(url.password);
 
   const file = process.env.DB_PASSWORD_FILE;
   if (file !== undefined && file !== '') return readFileSync(file, 'utf8').trim();
