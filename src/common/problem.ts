@@ -32,6 +32,9 @@ export const notFound = (detail: string): ProblemError =>
 export const badRequest = (detail: string): ProblemError =>
   new ProblemError({ status: 400, title: 'Bad Request', detail, type: `${TYPE_BASE}/validation-error` });
 
+export const forbidden = (detail: string): ProblemError =>
+  new ProblemError({ status: 403, title: 'Forbidden', detail, type: `${TYPE_BASE}/forbidden` });
+
 export const idempotencyKeyReuse = (detail: string): ProblemError =>
   new ProblemError({
     status: 422,
@@ -42,6 +45,7 @@ export const idempotencyKeyReuse = (detail: string): ProblemError =>
 
 const TITLES: Record<number, string> = {
   400: 'Bad Request',
+  403: 'Forbidden',
   404: 'Not Found',
   405: 'Method Not Allowed',
   415: 'Unsupported Media Type',
@@ -51,6 +55,7 @@ const TITLES: Record<number, string> = {
 
 const SLUGS: Record<number, string> = {
   400: 'validation-error',
+  403: 'forbidden',
   404: 'not-found',
   405: 'method-not-allowed',
   415: 'unsupported-media-type',

@@ -292,6 +292,133 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/status:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        description: Order identifier.
+        schema:
+          type: string
+          minLength: 1
+        example: o_1
+      - name: X-User-Id
+        in: header
+        required: false
+        description: |
+          Identity of the caller. Required only for an order that has a `buyer_id`;
+          an order created without this header has none and is public.
+        schema:
+          type: string
+          minLength: 1
+        example: u_demo
+    patch:
+      operationId: updateOrderStatus
+      summary: Change the status of an order
+      description: |
+        Writes the new status and publishes an `order.status` event for this order
+        on the realtime bus. Every connected client in the `orders:<id>` room gets
+        it over WebSocket, and every open `GET /orders/{orderId}/events` stream
+        gets it as an SSE frame — one write, two transports.
+
+        Transitions are not restricted: any status in the enum may be written, and
+        each accepted write is one event with the next sequence number.
+      tags: [orders]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderStatusRequest'
+      responses:
+        '200':
+          description: The order after the change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/events:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        description: Order identifier.
+        schema:
+          type: string
+          minLength: 1
+        example: o_1
+      - name: userId
+        in: query
+        required: false
+        description: |
+          Identity of the caller, for clients that cannot set headers — the browser
+          `EventSource` constructor takes a URL and nothing else. `X-User-Id` wins
+          when both are present.
+        schema:
+          type: string
+          minLength: 1
+        example: u_demo
+      - name: X-User-Id
+        in: header
+        required: false
+        description: Identity of the caller. Only an order with a `buyer_id` requires one.
+        schema:
+          type: string
+          minLength: 1
+        example: u_demo
+      - name: Last-Event-ID
+        in: header
+        required: false
+        description: |
+          Sequence number of the last event the client already has. The server
+          replays every buffered event with a higher number before switching the
+          stream to live, which is how a reconnect loses nothing. Sent
+          automatically by `EventSource` on reconnect.
+        schema:
+          type: integer
+          minimum: 0
+        example: 3
+    get:
+      operationId: streamOrderEvents
+      summary: Server-sent stream of status changes for one order
+      description: |
+        Long-lived `text/event-stream` response. Each status change arrives as one
+        SSE frame with `id:` (the per-order sequence number), `event: order.status`
+        and a JSON `data:` payload. The first line of the stream is `retry: 1000`,
+        which sets the client's reconnect delay.
+      tags: [orders]
+      responses:
+        '200':
+          description: The event stream. Stays open until the client disconnects.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE frames, separated by a blank line.
+                example: |
+                  retry: 1000
+
+                  id: 4
+                  event: order.status
+                  data: {"id":4,"order_id":"o_1","status":"paid","previous_status":"created","changed_at":"2026-09-30T20:15:04.000Z"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   headers:
     IdempotencyReplay:
@@ -339,6 +466,19 @@ components:
             status: 422
             detail: Idempotency-Key '6f1f8f4e...' was already used with a different request body.
             instance: /orders
+
+    Forbidden:
+      description: The order belongs to another user, or the request carries no identity at all.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: Order 'o_1' does not belong to 'u_intruder'.
+            instance: /orders/o_1/events
 
     InternalServerError:
       description: Internal server error.
@@ -475,7 +615,7 @@ components:
 
     Order:
       type: object
-      required: [id, status, currency, items, total_cents, created_at]
+      required: [id, status, buyer_id, currency, items, total_cents, created_at]
       properties:
         id:
           type: string
@@ -484,6 +624,15 @@ components:
           type: string
           enum: [created, paid, cancelled]
           example: created
+        buyer_id:
+          type: string
+          nullable: true
+          description: |
+            Who the order belongs to, taken from the `X-User-Id` header at creation.
+            `null` means the order was created anonymously: it has no owner, so its
+            realtime stream is public. An order with a `buyer_id` is private — the
+            WebSocket room and the SSE stream both require a matching identity.
+          example: u_demo
         currency:
           type: string
           enum: [UAH, USD, EUR]
@@ -501,6 +650,17 @@ components:
         created_at:
           type: string
           format: date-time
+
+    UpdateOrderStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [created, paid, cancelled]
+          description: The status to write. Publishes one realtime event per accepted write.
+          example: paid
 
     CreateOrderRequest:
       type: object

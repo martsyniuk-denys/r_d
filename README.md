@@ -47,6 +47,8 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:race` | 50 parallel checkouts against `stock = 10`, with invariant checks |
 | `npm run demo:workers` | worker pool draining the job queue with `FOR UPDATE SKIP LOCKED` |
 | `npm run demo:retry` | provokes `40001` and retries the whole transaction with backoff |
+| `npm run demo:realtime` | two WebSocket clients in different rooms; only the addressed one hears the event |
+| `npm run demo:realtime:same-room` | the control run: both clients in one room, so both must hear it |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -1229,6 +1231,180 @@ consumer contract → **publish** → **provider verification** (with
 **can-i-deploy**, which fails the job when the answer is not `true`. The broker comes from
 compose unless `secrets.PACT_BROKER_URL` names a hosted one.
 
+# Realtime: WebSocket rooms and SSE
+
+The order status already changed transactionally — the buyer just did not know
+until they reloaded. This section pushes that change to a connected client the
+moment it happens, over two transports, off **one** bus.
+
+```
+PATCH /orders/:id/status
+        │
+        ▼
+OrdersService.setStatus()            ← the business operation, not the controller
+        │
+        ▼
+OrderEventsService.publish()         ← Subject + a 100-event buffer per order
+        │
+        ├──────────────► OrdersGateway      server.to('orders:<id>').emit('order.status')
+        └──────────────► GET /orders/:id/events   id: / event: / data: frames
+```
+
+`src/realtime/order-events.service.ts` is deliberately the only thing that knows
+event numbers exist. The gateway is one subscriber, the SSE controller is another,
+and neither imports the other. When lecture 19 puts *order placed* on RabbitMQ, the
+queue consumer calls `publish()` and both transports light up with no further change.
+
+## Bringing it up, and the two demo runs
+
+```bash
+docker compose up -d --wait
+npm run build
+npm run migrate && npm run seed
+npm start                            # http://localhost:3000, WebSocket on the same port
+```
+
+Then, in a second shell:
+
+```bash
+npm run demo:realtime                # or: node scripts/realtime-demo.mjs
+npm run demo:realtime:same-room      # or: node scripts/realtime-demo.mjs --same-room
+```
+
+The main run puts one client in `orders:A` and the other in `orders:B`, changes the
+status of A over HTTP, and expects `A_RECEIVED=1 B_RECEIVED=0`. The control run puts
+**both** clients in `orders:A` and expects `A_RECEIVED=1 B_RECEIVED=1`. The difference
+between them is the proof: one code path, two outcomes.
+
+```
+node scripts/realtime-demo.mjs;             echo "exit=$?"
+MODE=different-rooms
+A_RECEIVED=1
+B_RECEIVED=0
+exit=0
+
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+MODE=same-room
+A_RECEIVED=1
+B_RECEIVED=1
+exit=0
+```
+
+Exactly one line of the script decides both the room and the expectation, so a
+script that printed a constant would fail one of the two runs:
+
+```js
+const roomB = SAME_ROOM ? orderA : orderB;
+const expectedB = SAME_ROOM ? 1 : 0;
+```
+
+The script also asserts the room guard on the way through and prints
+`GUARD_ANONYMOUS_REFUSED=1` / `GUARD_FOREIGN_REFUSED=1`: an anonymous socket and a
+socket claiming a different user are both refused the room, with a reason in the
+ack. It joins only after the `join` ack has arrived — emit into a room the client
+has not entered yet and the event is lost with no error anywhere.
+
+## Who may listen
+
+`POST /orders` records the `X-User-Id` header as the order's `buyer_id`. From then on
+`src/realtime/order-access.ts` is the one rule both transports apply:
+
+| Order | Listener | Result |
+| --- | --- | --- |
+| `buyer_id: "u_demo"` | `u_demo` | joins `orders:<id>` / streams |
+| `buyer_id: "u_demo"` | `u_other` | refused — `forbidden` |
+| `buyer_id: "u_demo"` | no identity | refused — `anonymous` |
+| `buyer_id: null` | anyone | public stream |
+
+An order created **without** `X-User-Id` has no buyer, and its stream is public —
+that is what makes `curl http://localhost:3000/orders/o_1/events` work with no
+credentials. Anything with a buyer is private on both transports. WebSocket identity
+comes from the handshake (`io(url, { auth: { userId } })`); SSE takes `X-User-Id`, or
+`?userId=` for a browser `EventSource`, which cannot set headers.
+
+## The SSE side by hand
+
+```bash
+ORDER=$(curl -s -X POST http://localhost:3000/orders \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: readme-$(date +%s)" \
+  -d '{"items":[{"product_id":"p_1","qty":2}]}' | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+
+curl -sN --max-time 2 -D - -o /dev/null http://localhost:3000/orders/$ORDER/events | grep -i '^content-type'
+# Content-Type: text/event-stream
+
+curl -sN --max-time 5 http://localhost:3000/orders/$ORDER/events &
+curl -s -X PATCH http://localhost:3000/orders/$ORDER/status \
+  -H 'Content-Type: application/json' -d '{"status":"paid"}'
+```
+
+```
+retry: 1000
+
+id: 1
+event: order.status
+data: {"id":1,"order_id":"o_1","status":"paid","previous_status":"created","changed_at":"2026-09-30T19:32:00.318Z"}
+```
+
+`retry: 1000` is the first thing written after the headers: it sets the client's
+reconnect delay to a second instead of the multi-second default, which is the
+difference between a demo that reconnects visibly and one that looks hung.
+
+### Last-Event-ID: a reconnect that loses nothing
+
+Every event carries the next number in that order's sequence, and the last 100 stay
+in memory. A client that reconnects with `Last-Event-ID: N` is sent everything
+numbered above `N` before the stream goes live:
+
+```bash
+for s in paid cancelled paid created; do
+  curl -s -o /dev/null -X PATCH http://localhost:3000/orders/$ORDER/status \
+    -H 'Content-Type: application/json' -d "{\"status\":\"$s\"}"
+done
+
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/$ORDER/events | grep '^id:' | head -1
+# id: 4
+```
+
+The buffer is read and the live subscription filtered in the same synchronous step
+(`concat(from(replay), live.pipe(filter(id > delivered)))`), so the seam produces
+neither a gap nor a duplicate.
+
+No header at all is treated as `Last-Event-ID: 0` — *I hold nothing, send everything
+you still have* — so a client that connects after the interesting change already
+happened is caught up on the current status instead of waiting for the next one. It is
+the same code path with `N = 0`, not a second one.
+
+## Trade-offs: WebSocket vs SSE
+
+Both transports carry the identical event here, which is what makes comparing them
+honest — the difference is in the plumbing, not the payload.
+
+| Criterion | WebSocket (socket.io) | SSE (`text/event-stream`) |
+| --- | --- | --- |
+| Channel direction | full duplex — the client's `join` is a message on the same socket | server → client only; anything upstream needs a separate HTTP request |
+| Reconnect / recovery | socket.io reconnects with backoff, but rejoining rooms and replaying misses is application code | reconnect is in the browser, `Last-Event-ID` is in the protocol, and the server replays from its buffer |
+| Infrastructure | needs an upgrade hop through every proxy, sticky sessions or a Redis adapter for more than one instance, and a socket.io client on the page | ordinary HTTP/2 GET, no upgrade, no client library at all; needs response buffering off (`X-Accel-Buffering: no`) |
+| Cost per event | one small frame, no headers, negligible; the connection itself is the fixed cost | same frame plus SSE's text framing, but one long-lived response instead of a protocol upgrade |
+| Fan-out shape | rooms and namespaces come for free — `server.to(room).emit()` | one subscription per open request; grouping is the application's own bookkeeping |
+| Browser ceiling | one connection, multiplexed | ~6 per origin on HTTP/1.1 (fine on HTTP/2) |
+
+For notifications in production I would keep **SSE**. The traffic here is one-way —
+the server tells the buyer their order changed — and paying for a duplex upgrade to
+use half of it buys nothing, while `Last-Event-ID` gives the one property that
+actually matters for a notification (a reconnect that does not silently lose events)
+in the protocol rather than in code I have to get right. The WebSocket gateway earns
+its place the moment the client starts talking back on the same channel — live chat
+with a seller, or presence — and that is exactly what this homework built both for:
+the bus does not care which one is attached.
+
+## Two instances, and what breaks
+
+A `Subject` and a room registry live in one process, so with two instances behind a
+load balancer a client connected to instance 1 hears nothing about a status change
+handled by instance 2 — the cure is `@socket.io/redis-adapter` (plus `app.useWebSocketAdapter`),
+which turns `to(room).emit()` into a Redis publish every instance replays, and for SSE
+the same Redis (or the RabbitMQ fan-out of lecture 19) feeding each instance's bus.
+
 # The OpenAPI contract in detail
 
 ## What the spec contains
@@ -1467,7 +1643,7 @@ This is the runtime counterpart of the lecture's `contract/check.mjs` that caugh
 ## Layout
 
 ```
-openapi/openapi.yaml              the spec: 3 resources, 7 operations
+openapi/openapi.yaml              the spec: 3 resources, 9 operations
 src/main.ts                       entry point
 src/bootstrap.ts                  Nest app + validator boundary + error wiring
 src/app.module.ts                 root module: ConfigModule.forRoot({ validate })
@@ -1494,7 +1670,10 @@ src/common/problem.filter.ts      Nest exception filter → application/problem+
 src/common/cursor.ts              opaque cursor encode/decode + paginate
 src/common/idempotency.service.ts replay semantics for Idempotency-Key
 src/products/                     ProductsController + ProductsService (Postgres)
-src/orders/                       OrdersController + OrdersService (in-memory)
+src/orders/                       OrdersController + OrdersService: status change, SSE stream
+src/realtime/order-events.service.ts  the bus: Subject + per-order sequence and replay buffer
+src/realtime/orders.gateway.ts    WebSocket gateway: join, room orders:<id>, owner check
+src/realtime/order-access.ts      the one ownership rule both transports apply
 db/init.sql                       products table + seed, run by compose on first start
 test/testkit/                     the container, the rollback isolation and the builders
 test/integration/                 repository tests against a real Postgres
@@ -1508,6 +1687,7 @@ scripts/with-secrets.sh           runs a command with credentials from the store
 scripts/lib/pg-env.sh             environment → PG* variables, shared by the two scripts below
 scripts/backup.sh                 pg_dump -Fc into a dated file + a control-value sidecar
 scripts/restore-drill.sh          restores the newest dump into a throwaway container, prints MATCH
+scripts/realtime-demo.mjs         room isolation, headless, with a --same-room control run
 scripts/check-spec.js             acceptance criteria for the spec (npm run check)
 scripts/check-env-example.mjs     .env.example vs schema (npm run check:env)
 scripts/smoke.mjs                 acceptance criteria for the app (npm run smoke)
@@ -1536,6 +1716,8 @@ Nest 11 would pull Express 5 instead.
 | Package | Version |
 | --- | --- |
 | `@nestjs/common` / `core` / `platform-express` | 10.4.22 |
+| `@nestjs/websockets` / `platform-socket.io` | 10.4.22 |
+| `socket.io` / `socket.io-client` | 4.8.1 / 4.8.4 |
 | `express` | 4.22.2 |
 | `express-openapi-validator` | 5.6.2 |
 | `@redocly/cli` | 2.46.0 |
