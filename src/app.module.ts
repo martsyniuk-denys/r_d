@@ -8,6 +8,8 @@ import { OrdersController } from './orders/orders.controller';
 import { OrdersService } from './orders/orders.service';
 import { ProductsController } from './products/products.controller';
 import { ProductsService } from './products/products.service';
+import { OrderEventsService } from './realtime/order-events.service';
+import { OrdersGateway } from './realtime/orders.gateway';
 import { validate } from './config/env.schema';
 
 @Module({
@@ -20,6 +22,6 @@ import { validate } from './config/env.schema';
     DatabaseModule,
   ],
   controllers: [HealthController, ProductsController, OrdersController],
-  providers: [ProductsService, OrdersService, IdempotencyService],
+  providers: [ProductsService, OrdersService, IdempotencyService, OrderEventsService, OrdersGateway],
 })
 export class AppModule {}
