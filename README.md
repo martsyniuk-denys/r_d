@@ -1179,13 +1179,14 @@ bash scripts/pact-gate.sh tag-prod                # → HTTP 201
 bash scripts/pact-gate.sh can-i-deploy            # → deployable: true, exit 0  ← and now it is open
 ```
 
-**Before the `prod` tag** — the provider version running in prod is not known, so the only
-honest answer is "unknown":
+**Before the `prod` tag** — captured at commit `a6aaa08`, whose short sha is the version
+both participants are published under. The provider version running in prod is not known,
+so the only honest answer is "unknown":
 
 ```json
 {
     "deployable": null,
-    "reason": "There is no verified pact between version af9e79c of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)",
+    "reason": "There is no verified pact between version a6aaa08 of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)",
     "success": 0,
     "failed": 0,
     "unknown": 1
