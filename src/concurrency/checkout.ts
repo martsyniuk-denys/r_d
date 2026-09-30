@@ -1,6 +1,7 @@
 import { DataSource, EntityManager } from 'typeorm';
 
-import { Currency, Order, OrderItem } from '../entities';
+import { Currency } from '../entities';
+import { OrdersRepository, fromEntityManager } from '../repositories';
 import { returning } from './sql';
 
 export type CheckoutRejection = 'out_of_stock' | 'insufficient_funds';
@@ -85,15 +86,11 @@ export async function placeOrder(
 
   if (debited.length === 0) throw new CheckoutRejected('insufficient_funds');
 
-  const orders = manager.getRepository(Order);
-  const order = await orders.save(
-    orders.create({ buyerId, status: 'pending', currency, totalMinor }),
-  );
-
-  const items = manager.getRepository(OrderItem);
-  await items.save(
-    items.create({ orderId: order.id, productId, qty, unitPriceMinor: priceMinor }),
-  );
+  // The same repository the integration suite exercises, handed the transaction's
+  // own connection instead of the pool.
+  const orders = new OrdersRepository(fromEntityManager(manager));
+  const order = await orders.insert({ buyerId, status: 'pending', currency, totalMinor });
+  await orders.addLine({ orderId: order.id, productId, qty, unitPriceMinor: priceMinor });
 
   const enqueued = await returning<{ id: string }>(
     manager,

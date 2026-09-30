@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 import { Page, decodeCursor, encodeCursor } from '../common/cursor';
 import { notFound } from '../common/problem';
 import { PG_POOL } from '../db/database.module';
+import { ProductRecord, ProductsRepository, UsersRepository } from '../repositories';
 
 export interface Product {
   id: string;
@@ -19,22 +20,12 @@ export interface CreateProduct {
   currency: 'UAH' | 'USD' | 'EUR';
 }
 
-interface ProductRow {
-  id: string;
-  title: string;
-  price_cents: number;
-  currency: 'UAH' | 'USD' | 'EUR';
-  created_at: Date;
-}
-
-const COLUMNS = `'p_' || id AS id, name AS title, price_minor AS price_cents, currency, created_at`;
-
-const toProduct = (row: ProductRow): Product => ({
-  id: row.id,
-  title: row.title,
-  price_cents: row.price_cents,
-  currency: row.currency,
-  created_at: row.created_at.toISOString(),
+const toProduct = (record: ProductRecord): Product => ({
+  id: `p_${record.id}`,
+  title: record.name,
+  price_cents: record.priceMinor,
+  currency: record.currency,
+  created_at: record.createdAt.toISOString(),
 });
 
 const toInternalId = (publicId: string): string | null => {
@@ -44,17 +35,20 @@ const toInternalId = (publicId: string): string | null => {
 
 @Injectable()
 export class ProductsService {
-  constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+  private readonly products: ProductsRepository;
+  private readonly users: UsersRepository;
+
+  constructor(@Inject(PG_POOL) pool: Pool) {
+    this.products = new ProductsRepository(pool);
+    this.users = new UsersRepository(pool);
+  }
 
   async list(limit: number, cursor?: string): Promise<Page<Product>> {
     const offset = decodeCursor(cursor);
-    const { rows } = await this.pool.query<ProductRow>(
-      `SELECT ${COLUMNS} FROM products ORDER BY created_at, id LIMIT $1 OFFSET $2`,
-      [limit + 1, offset],
-    );
+    const records = await this.products.page(limit + 1, offset);
 
-    const hasMore = rows.length > limit;
-    const items = rows.slice(0, limit).map(toProduct);
+    const hasMore = records.length > limit;
+    const items = records.slice(0, limit).map(toProduct);
     return { items, next_cursor: hasMore ? encodeCursor(offset + items.length) : null };
   }
 
@@ -62,21 +56,22 @@ export class ProductsService {
     const internalId = toInternalId(id);
     if (internalId === null) throw notFound(`Product '${id}' does not exist.`);
 
-    const { rows } = await this.pool.query<ProductRow>(
-      `SELECT ${COLUMNS} FROM products WHERE id = $1`,
-      [internalId],
-    );
-    if (rows.length === 0) throw notFound(`Product '${id}' does not exist.`);
-    return toProduct(rows[0]);
+    const record = await this.products.findById(internalId);
+    if (record === null) throw notFound(`Product '${id}' does not exist.`);
+    return toProduct(record);
   }
 
   async create(input: CreateProduct): Promise<Product> {
-    const { rows } = await this.pool.query<ProductRow>(
-      `INSERT INTO products (seller_id, name, price_minor, currency, status)
-       VALUES ((SELECT id FROM users ORDER BY id LIMIT 1), $1, $2, $3, 'active')
-       RETURNING ${COLUMNS}`,
-      [input.title, input.price_cents, input.currency],
-    );
-    return toProduct(rows[0]);
+    const sellerId = await this.users.firstId();
+    if (sellerId === null) throw new Error('No seller in the database — run npm run seed first.');
+
+    const record = await this.products.insert({
+      sellerId,
+      name: input.title,
+      priceMinor: input.price_cents,
+      currency: input.currency,
+      status: 'active',
+    });
+    return toProduct(record);
   }
 }

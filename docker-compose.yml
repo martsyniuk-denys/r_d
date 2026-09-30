@@ -33,5 +33,51 @@ services:
       timeout: 3s
       retries: 20
 
+  pact-broker-db:
+    image: postgres:16-alpine
+    container_name: marketplace-pact-broker-db
+    environment:
+      POSTGRES_USER: pactbroker
+      POSTGRES_DB: pactbroker
+      POSTGRES_PASSWORD: pactbroker_dev_password
+    volumes:
+      - pactbrokerdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U pactbroker -d pactbroker']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  pact-broker:
+    image: pactfoundation/pact-broker:2.143.0-pactbroker2.121.0
+    container_name: marketplace-pact-broker
+    depends_on:
+      pact-broker-db:
+        condition: service_healthy
+    ports:
+      - '9292:9292'
+    environment:
+      PACT_BROKER_DATABASE_ADAPTER: postgres
+      PACT_BROKER_DATABASE_HOST: pact-broker-db
+      PACT_BROKER_DATABASE_NAME: pactbroker
+      PACT_BROKER_DATABASE_USERNAME: pactbroker
+      PACT_BROKER_DATABASE_PASSWORD: pactbroker_dev_password
+      PACT_BROKER_PORT: '9292'
+      PACT_BROKER_LOG_LEVEL: WARN
+      # The local broker is deliberately open: it holds nothing but the contract
+      # this repository generates, and a token here would only be a constant in
+      # git. A real broker is reached with PACT_BROKER_TOKEN, which comes from the
+      # store locally and from GitHub secrets in CI.
+      PACT_BROKER_PUBLIC_HEARTBEAT: 'true'
+    healthcheck:
+      # 127.0.0.1 and not localhost: inside the container localhost resolves to
+      # ::1 first, and puma is only listening on IPv4.
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:9292/diagnostic/status/heartbeat || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
 volumes:
   pgdata:
+  pactbrokerdata:

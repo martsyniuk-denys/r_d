@@ -1,0 +1,70 @@
+name: contract
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  contract:
+    name: consumer contract, provider verification and the deploy gate
+    runs-on: ubuntu-latest
+
+    env:
+      # The address and the token are secrets, never constants in the repository.
+      # The fallback is the broker this repository's docker-compose.yml starts,
+      # which is an address on the runner itself and not a secret.
+      PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL || 'http://127.0.0.1:9292' }}
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+      PACT_PROVIDER_VERSION: ${{ github.sha }}
+      # secrets are not readable from a step-level `if`, so the decision is made
+      # here once and the steps below read it from the env context.
+      USE_LOCAL_BROKER: ${{ secrets.PACT_BROKER_URL == '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Compile
+        run: npx tsc --noEmit
+
+      - name: Start the broker
+        # Only when no hosted broker is configured; the integration and e2e suites
+        # need no service here because testcontainers starts their database.
+        if: env.USE_LOCAL_BROKER == 'true'
+        run: docker compose up -d --wait pact-broker
+
+      - name: Integration suite (testcontainers)
+        run: npm run test:integration
+
+      - name: End to end (supertest)
+        run: npm run test:e2e
+
+      - name: Consumer contract
+        run: npm run test:contract
+
+      - name: Publish the contract to the broker
+        run: bash scripts/pact-gate.sh publish
+
+      - name: Provider verification (result published to the broker)
+        run: npm run verify:provider
+
+      - name: Record this provider version as what runs in prod
+        # Stands in for the deploy job: can-i-deploy asks what is in prod, so
+        # something has to have been put there. Without this step the honest
+        # answer from the broker is "unknown" and the gate below never opens.
+        run: bash scripts/pact-gate.sh tag-prod
+
+      - name: can-i-deploy
+        # Fails the job when deployable is anything but true.
+        run: bash scripts/pact-gate.sh can-i-deploy
+
+      - name: Broker logs on failure
+        if: failure() && env.USE_LOCAL_BROKER == 'true'
+        run: docker compose logs pact-broker || true
