@@ -1,0 +1,17 @@
+# Nightly backup of the marketplace database.
+#
+#   crontab pointing at the checkout:
+#     crontab -l | cat - backup.cron | crontab -
+#
+# The schedule is the whole RPO story: one dump a night means up to 24 hours of
+# writes can be lost, which is what RESTORE-DRILL.md states in numbers.
+#
+SHELL=/bin/bash
+MARKETPLACE_HOME=/srv/marketplace
+
+# min hour dom mon dow
+15 3 * * * cd $MARKETPLACE_HOME && bash scripts/with-secrets.sh prod bash scripts/backup.sh >> /var/log/marketplace/backup.log 2>&1
+
+# Once a week the backup is only as good as the last restore that was proven to
+# work, so the drill runs on a schedule too.
+45 4 * * 0 cd $MARKETPLACE_HOME && bash scripts/with-secrets.sh prod bash scripts/restore-drill.sh >> /var/log/marketplace/restore-drill.log 2>&1

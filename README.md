@@ -15,7 +15,7 @@ away from its schema never reaches the client (500 instead of silent drift).
 npm install
 cp .env.example .env                 # real values live here; .env is git-ignored
 cp secrets/db_password.example secrets/db_password
-docker compose up -d --wait          # Postgres on localhost:55432
+docker compose up -d --wait          # PgBouncer on localhost:56432, Postgres behind it
 npm run build                        # migrations and scripts run from dist/
 npm run migrate && npm run seed      # schema from src/migrations + fixture rows
 npm start                            # http://localhost:3000
@@ -51,6 +51,9 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
 | `npm run db:psql` | opens a psql shell on the running container |
+| `bash scripts/backup.sh` | `pg_dump -Fc` into a dated file under `backups/` |
+| `bash scripts/restore-drill.sh` | restores the newest dump into a throwaway container and prints `MATCH` |
+| `bash rotate.sh` | rotates the password in Postgres, PgBouncer and the password file |
 | `npm run lint` | `redocly lint openapi/openapi.yaml` |
 | `npm run bundle` | `redocly bundle openapi/openapi.yaml -o spec.json` |
 | `npm run check` | every acceptance criterion for the spec in one run |
@@ -162,15 +165,21 @@ curl -s localhost:3000/health
 # {"status":"ok","uptime_seconds":20.87,"pid":84709}
 ```
 
-`rotate.sh` does three things, and the order is the whole point:
+`rotate.sh` does four things, and the order is the whole point:
 
 1. `ALTER ROLE` — the database learns the new password first.
-2. Write `secrets/db_password` — new connections start using it.
-3. `pg_terminate_backend` — connections opened with the old password are dropped, and
+2. Rewrite `pgbouncer/userlist.txt` and `SIGHUP` the pooler — PgBouncer authenticates its
+   own clients against that file *and* uses it to log in to Postgres.
+3. Write `secrets/db_password` — new connections start using it.
+4. `pg_terminate_backend` — connections opened with the old password are dropped, and
    the pool transparently reopens them.
 
 Writing the file first would leave a window where every new connection authenticates
-with a password the database does not know yet.
+with a password the database does not know yet. Skipping step 2 would be worse: since
+the pooling homework the application never talks to Postgres directly, so a stale
+userlist locks out everything at once. The file is truncated in place rather than
+replaced — Docker bind-mounts a single file by inode, and `mv` would leave the
+container reading the old one.
 
 `src/db/database.module.ts` registers `pool.on('error', …)`. Without it, the idle
 clients killed by `pg_terminate_backend` would emit an unhandled `'error'` event and
@@ -304,16 +313,28 @@ of record from here on.
 
 ```bash
 docker compose up -d --wait
-export DB_HOST=127.0.0.1 DB_PORT=55432 DB_USER=marketplace DB_PASSWORD=marketplace_dev_password DB_NAME=marketplace
+export DATABASE_URL=postgres://marketplace:marketplace_dev_password@127.0.0.1:56432/marketplace
 export SKIP_VAULT=1    # the grader has no access to the secret store
+
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 ```
 
-Those are the dev credentials from `docker-compose.yml` (port `55432`, because the compose
-file maps `55432:5432`), and by the rules of the configuration homework they are not a
-secret. A single `DATABASE_URL`-style variable works too — `export DB_URL=postgres://marketplace@127.0.0.1:55432/marketplace`
-next to `DB_PASSWORD`, since `src/data-source.ts` accepts either shape. `package.json` is
-in the repository root, so no `cd` is needed. With the exports above, every command runs on
-a fresh clone:
+Port `56432` is **PgBouncer**, which is where every client belongs from the pooling
+homework on; compose publishes it with `56432:6432`, and Postgres itself stays on `55432`.
+Those are the dev credentials from `docker-compose.yml`, and by the rules of the
+configuration homework they are not a secret.
+
+`SKIP_VAULT=1` makes `scripts/with-secrets.sh` hand the command straight through, so
+`bash scripts/with-secrets.sh dev bash scripts/backup.sh` and a bare `bash scripts/backup.sh`
+do exactly the same thing — both scripts read the connection from the environment. Without
+those two exports a fresh clone fails loudly instead of connecting to something unexpected:
+the bare form with `DATABASE_URL: unbound variable`, the wrapped form with a message naming
+the missing store. Both exit `1`.
+
+The same two exports cover everything from the earlier homeworks — `src/data-source.ts`
+accepts `DATABASE_URL`, `DB_URL` + `DB_PASSWORD`, or the discrete `DB_HOST`/`DB_PORT`/
+`DB_USER`/`DB_NAME` set. `package.json` is in the repository root, so no `cd` is needed:
 
 ```bash
 npm ci && npx tsc --noEmit          # clean compile
@@ -328,6 +349,18 @@ npm run demo:race                   # 50 parallel checkouts, stock 10 → exactl
 npm run demo:workers                # 4 workers, FOR UPDATE SKIP LOCKED, nothing processed twice
 npm run demo:retry                  # 40001 caught, whole transaction retried, arithmetic intact
 ```
+
+The pooling homework adds three checks that need no npm script:
+
+```bash
+psql -h 127.0.0.1 -p 56432 -U marketplace -d marketplace -c "SELECT 1"
+psql -h 127.0.0.1 -p 56432 -U marketplace -d pgbouncer   -c "SHOW POOLS"
+pg_restore --list "$(ls -t backups/*.dump | head -1)" | head
+```
+
+`psql` prompts for the password, or takes it from `PGPASSWORD=marketplace_dev_password`.
+`SHOW POOLS` lists `marketplace` with `pool_mode = transaction`; a pool appears only once
+something has connected to it, so run the `SELECT 1` first.
 
 The three demos need the schema and the fixtures, so `npm run migrate && npm run seed`
 comes first; each of them then resets the rows it works on, which makes them repeatable in
@@ -761,6 +794,196 @@ rewiring it is a contract change, not a concurrency one. Integration tests over 
 come with the testcontainers homework, and the `jobs` table is the first step towards the
 transactional outbox later in the course.
 
+# Data layer ops: pooling, backup, restore
+
+Three things a database grows once it stops being a development toy: something in
+front of it that survives many application instances, a dump taken on a schedule,
+and proof that the dump is a database and not a file.
+
+```
+API / migrations / psql / pg_dump
+        │
+        ▼  127.0.0.1:56432          ← everything connects here
+   PgBouncer  (transaction pooling, pool of 8)
+        │
+        ▼  postgres:5432            ← 55432 on the host, for admin work only
+   Postgres 16
+        │
+        ▼  scripts/backup.sh (nightly, backup.cron)
+   backups/marketplace-<date>.dump  +  .checksum sidecar
+        │
+        ▼  scripts/restore-drill.sh
+   throwaway container on an empty volume → MATCH
+```
+
+## Bringing it up
+
+```bash
+docker compose up -d --wait
+PGPASSWORD=marketplace_dev_password psql -h 127.0.0.1 -p 56432 -U marketplace -d marketplace -c "SELECT 1"
+```
+
+Compose publishes PgBouncer on `56432:6432` and waits for both health checks, so a
+single command leaves a stack that is actually ready. `.env.example` and `.env` point
+`DB_URL` at `56432`: the application has no route to Postgres that does not go through
+the pooler, which is the only way the arrangement stays honest.
+
+Admin console, the same way the lecture uses it:
+
+```bash
+PGPASSWORD=marketplace_dev_password psql -h 127.0.0.1 -p 56432 -U marketplace -d pgbouncer -c "SHOW POOLS"
+```
+
+```
+  database   |    user     | cl_active | sv_idle | ... |  pool_mode
+-------------+-------------+-----------+---------+-----+-------------
+ marketplace | marketplace |         0 |       1 | ... | transaction
+ marketplace_session | marketplace |   0 |       1 | ... | session
+ pgbouncer   | pgbouncer   |         1 |       0 | ... | statement
+```
+
+A pool shows up only after something has connected to it, so `SHOW POOLS` on a
+freshly started stack is emptier than expected — run the `SELECT 1` first.
+
+## Why transaction mode, and what it breaks
+
+`pool_mode = transaction` means a server connection is lent to a client for the
+length of one transaction and taken back at `COMMIT`. That is what makes the
+arithmetic work: `default_pool_size = 8` server connections serve
+`max_client_conn = 200` clients, because at any instant only the clients inside a
+transaction need one. Session pooling would pin a backend per connected client and
+buy nothing over `pg.Pool`; statement pooling would break multi-statement
+transactions, which is the entire concurrency homework. Transaction mode is the
+setting that lets instance count grow in Kubernetes without Postgres growing
+`max_connections` to match.
+
+The price is that **nothing may outlive a transaction**, because the next statement
+can land on a different backend and `server_reset_query = DISCARD ALL` wipes what
+the last one left:
+
+1. **Session-level `SET` is gone.** `SET statement_timeout`, `SET search_path`,
+   `SET TIME ZONE` issued outside a transaction apply to whichever backend happened
+   to serve them, and then to nobody. Only `SET LOCAL` inside the transaction is
+   safe. This is also why `ignore_startup_parameters` has to list the options the
+   client sends at connection time — PgBouncer cannot promise them.
+2. **Named prepared statements break.** `PREPARE` on one backend, `EXECUTE` on
+   another, and Postgres answers `prepared statement "s1" does not exist`. PgBouncer
+   1.21+ tracks and replays them itself, which is why `max_prepared_statements = 200`
+   is set here — without it the TypeORM/`pg` driver would have to be told to stop
+   using them.
+3. **Session-scoped locks and `LISTEN`/`NOTIFY` stop working.** `pg_advisory_lock()`
+   without a transaction never sees the same backend again, so the lock is taken on
+   a connection nobody holds and released by `DISCARD ALL` at an arbitrary moment.
+   A listener registers on a backend it will not get back. The transaction-scoped
+   variant `pg_advisory_xact_lock()` is fine — it dies with the transaction, which
+   is exactly the lifetime the pooler guarantees.
+4. **Temporary tables and `WITH HOLD` cursors do not survive.** A temp table created
+   in one transaction is on a backend the next transaction may not get, and
+   `DISCARD ALL` drops it regardless.
+
+This project survives all four because everything it does to the database is already
+transaction-shaped: `checkout()` is one explicit transaction, the worker pool takes
+`FOR UPDATE SKIP LOCKED` row locks inside a transaction rather than advisory locks,
+and the retry wrapper re-runs whole transactions. `npm run demo:race`,
+`demo:workers` and `demo:retry` pass unchanged through the pooler — which is the
+real test, not a `SELECT 1`.
+
+The one tool that genuinely needs a session is `pg_dump`: it sets session options,
+then holds a repeatable-read snapshot across the whole dump. Rather than lowering
+`pool_mode` for everyone, `pgbouncer.ini` publishes the same database twice:
+
+```ini
+marketplace         = host=postgres port=5432 dbname=marketplace
+marketplace_session = host=postgres port=5432 dbname=marketplace pool_mode=session
+```
+
+`scripts/backup.sh` probes for the `_session` alias and uses it when it is there,
+falling back to the configured database when it is not — so the same script works
+against a direct Postgres URL with no flags to remember.
+
+## Backup
+
+```bash
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+```
+
+```
+backup: /…/backups/marketplace-2026-09-30_214417.dump
+size:   20K
+order_items checksum (count|sum of qty * unit_price_minor): 22|4556700
+```
+
+`pg_dump --format=custom --compress=9` into `backups/marketplace-<YYYY-MM-DD_HHMMSS>.dump`
+— custom format because it is the one `pg_restore` can be selective about and the one
+that carries a TOC:
+
+```bash
+pg_restore --list backups/marketplace-2026-09-30_214417.dump | head
+```
+
+Next to each dump the script writes a `.checksum` sidecar holding the control value of
+the data **at dump time**. That is what makes the drill meaningful: the live database
+keeps moving, so comparing a restore against it would fail for the most ordinary
+reason there is. Dumps older than `RETAIN_DAYS` (14) are deleted at the end of each
+run, so the destination does not quietly fill the disk.
+
+The destination is a local directory outside the container — `backups/`, git-ignored,
+overridable with `BACKUP_DIR`. S3 is lecture #26; the script's only assumption about
+the destination is that it is a path, which is what keeps that migration small.
+
+### Schedule
+
+`backup.cron` holds the line, and the line is the RPO:
+
+```cron
+15 3 * * * cd $MARKETPLACE_HOME && bash scripts/with-secrets.sh prod bash scripts/backup.sh >> /var/log/marketplace/backup.log 2>&1
+45 4 * * 0 cd $MARKETPLACE_HOME && bash scripts/with-secrets.sh prod bash scripts/restore-drill.sh >> /var/log/marketplace/restore-drill.log 2>&1
+```
+
+One dump a night at 03:15 means up to 24 hours of writes are at risk, and the weekly
+drill is there because a backup is only as good as the last restore somebody proved.
+
+## Restore drill
+
+```bash
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
+```
+
+```
+dump:     /…/backups/marketplace-2026-09-30_214417.dump (20K)
+expected: 22|4556700  (recorded when the dump was taken)
+1/4  empty volume marketplace-restore-drill-1790793857-83477 and a fresh postgres:18-alpine container
+2/4  waiting for it to accept connections on 127.0.0.1:64193
+3/4  pg_restore --no-owner into the empty database
+4/4  reading the same control value back out of the restored database
+
+order_items before: 22|4556700
+order_items after:  22|4556700
+pg_restore: 0.1s    drill end to end (measured RTO): 1.7s
+
+MATCH
+```
+
+What makes it a drill rather than a demo:
+
+- **The volume did not exist a second ago.** `docker volume create
+  marketplace-restore-drill-<timestamp>-<pid>`, removed by an `EXIT` trap together
+  with the container. Restoring into a volume that already holds data is where the
+  fake `duplicate key` failures come from, and a `MATCH` there would mean nothing.
+- **It cleans up after itself**, so a second run gives the same answer as the first.
+- **`--no-owner --no-acl`** because the throwaway instance has never heard of the
+  `marketplace` role, and `--exit-on-error` so a partial restore is a failure rather
+  than a warning scrolling past.
+- **It can fail.** Corrupt the sidecar and it prints `MISMATCH` and exits `1`.
+- **The container's Postgres major version follows the client tools** that made the
+  dump. A custom archive is only readable by its own `pg_restore` or a newer one, and
+  a newer `pg_restore` emits `SET` options an older server rejects — a PG 18 client
+  dumping a PG 16 server and restoring into PG 16 dies on `unrecognized configuration
+  parameter "transaction_timeout"`. `DRILL_IMAGE` overrides it.
+
+The numbers from the run above, plus the RTO and RPO they add up to, are written down
+in [RESTORE-DRILL.md](RESTORE-DRILL.md).
+
 # The OpenAPI contract in detail
 
 ## What the spec contains
@@ -1028,11 +1251,18 @@ src/products/                     ProductsController + ProductsService (Postgres
 src/orders/                       OrdersController + OrdersService (in-memory)
 db/init.sql                       products table + seed, run by compose on first start
 scripts/with-secrets.sh           runs a command with credentials from the store
+scripts/lib/pg-env.sh             environment → PG* variables, shared by the two scripts below
+scripts/backup.sh                 pg_dump -Fc into a dated file + a control-value sidecar
+scripts/restore-drill.sh          restores the newest dump into a throwaway container, prints MATCH
 scripts/check-spec.js             acceptance criteria for the spec (npm run check)
 scripts/check-env-example.mjs     .env.example vs schema (npm run check:env)
 scripts/smoke.mjs                 acceptance criteria for the app (npm run smoke)
-rotate.sh                         database password rotation without a restart
-docker-compose.yml                Postgres for local development
+rotate.sh                         password rotation across Postgres, PgBouncer and the file
+backup.cron                       the nightly schedule, and the weekly drill
+RESTORE-DRILL.md                  the drill protocol: date, size, time, RTO, RPO
+pgbouncer/pgbouncer.ini           transaction pooling + a session-mode alias for pg_dump
+pgbouncer/userlist.txt            SCRAM credentials for the pooler (development values)
+docker-compose.yml                PgBouncer on 56432, Postgres behind it on 55432
 Dockerfile / .dockerignore        image built without secrets in any layer
 .env.example                      the variable contract; .env and secrets/ are ignored
 ```
@@ -1056,6 +1286,8 @@ Nest 11 would pull Express 5 instead.
 | `express-openapi-validator` | 5.6.2 |
 | `@redocly/cli` | 2.46.0 |
 | `typeorm` | 0.3.31 |
+| `postgres` (image) | 16-alpine |
+| `edoburu/pgbouncer` (image) | v1.25.2-p0 (PgBouncer 1.25) |
 | `pg` | 8.x |
 | `typescript` | 5.x |
 

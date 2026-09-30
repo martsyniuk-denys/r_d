@@ -1,0 +1,6 @@
+; Plain-text form: PgBouncer derives the SCRAM exchange from it, so this file has
+; to carry the same password as the Postgres role — rotate.sh rewrites both, then
+; reloads the pooler. Development credentials only: they are the ones already
+; written in docker-compose.yml. Production keeps this file out of git and fills
+; it from the secret store (README → Data layer ops).
+"marketplace" "marketplace_dev_password"
