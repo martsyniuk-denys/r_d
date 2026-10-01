@@ -1,6 +1,7 @@
 import { DataSource, EntityManager } from 'typeorm';
 
 import { Currency } from '../entities';
+import { OrderPlacedEvent, orderPlacedEvent } from '../messaging/events';
 import { OrdersRepository, fromEntityManager } from '../repositories';
 import { returning } from './sql';
 
@@ -25,6 +26,7 @@ export interface CheckoutAccepted {
   jobId: string;
   totalMinor: number;
   stockLeft: number;
+  event: OrderPlacedEvent;
 }
 
 export interface CheckoutDeclined {
@@ -40,16 +42,31 @@ interface ReservedRow {
   stock: number;
 }
 
+export interface OrderPlacedPublisher {
+  publish(event: OrderPlacedEvent): Promise<void>;
+}
+
 export async function checkout(
   dataSource: DataSource,
   command: CheckoutCommand,
+  events?: OrderPlacedPublisher,
 ): Promise<CheckoutResult> {
+  let accepted: CheckoutAccepted;
   try {
-    return await dataSource.transaction((manager) => placeOrder(manager, command));
+    accepted = await dataSource.transaction((manager) => placeOrder(manager, command));
   } catch (error) {
     if (error instanceof CheckoutRejected) return { ok: false, reason: error.reason };
     throw error;
   }
+
+  // After COMMIT, never inside the transaction: an event published from inside
+  // could announce an order that a later statement rolls back. What is left open
+  // is the other side — COMMIT done, process gone before the confirm — and there
+  // is no shared COMMIT between Postgres and RabbitMQ to close it. That is the
+  // transactional outbox, and a later homework; a failure here propagates.
+  if (events !== undefined) await events.publish(accepted.event);
+
+  return accepted;
 }
 
 export async function placeOrder(
@@ -100,5 +117,20 @@ export async function placeOrder(
     [JSON.stringify({ orderId: order.id, buyerId, totalMinor }), order.id],
   );
 
-  return { ok: true, orderId: order.id, jobId: enqueued[0].id, totalMinor, stockLeft: stock };
+  const event = orderPlacedEvent({
+    orderId: order.id,
+    buyerId,
+    totalMinor,
+    currency,
+    lines: [{ productId, qty, unitPriceMinor: priceMinor }],
+  });
+
+  return {
+    ok: true,
+    orderId: order.id,
+    jobId: enqueued[0].id,
+    totalMinor,
+    stockLeft: stock,
+    event,
+  };
 }
