@@ -33,6 +33,29 @@ services:
       timeout: 3s
       retries: 20
 
+  rabbitmq:
+    image: rabbitmq:4.2-management-alpine
+    container_name: marketplace-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: marketplace
+      RABBITMQ_DEFAULT_PASS: marketplace_dev_password
+    ports:
+      # 5672 is AMQP — the protocol the client speaks. 15672 is the management UI,
+      # which is the only way to look at x-death with your own eyes.
+      - '5672:5672'
+      - '15672:15672'
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      # Not "the port is open": between the TCP listener and the Erlang node
+      # accepting basic.publish there is a window that hands the client an
+      # ECONNRESET. check_running is on the far side of it.
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'check_running']
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
   pact-broker-db:
     image: postgres:16-alpine
     container_name: marketplace-pact-broker-db
@@ -81,3 +104,4 @@ services:
 volumes:
   pgdata:
   pactbrokerdata:
+  rabbitmqdata:

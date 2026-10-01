@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DataSource } from 'typeorm';
 import { PostgresConnectionOptions } from 'typeorm/driver/postgres/PostgresConnectionOptions';
 
-import { Job, Order, OrderItem, Product, User } from './entities';
+import { Job, Order, OrderFulfilment, OrderItem, Product, User } from './entities';
 
 const HINT =
   'Connection values come from the environment only. Either go through the secret store ' +
@@ -68,7 +68,7 @@ export const dataSourceOptions: PostgresConnectionOptions = {
   type: 'postgres',
   ...target(),
   password: readPassword(),
-  entities: [User, Product, Order, OrderItem, Job],
+  entities: [User, Product, Order, OrderItem, Job, OrderFulfilment],
   migrations: [join(__dirname, 'migrations', '*.js')],
   migrationsTableName: 'migrations',
   synchronize: false,

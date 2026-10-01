@@ -28,7 +28,8 @@ esac
 if [ ! -f "$CREDS" ]; then
   echo "with-secrets: no store for '$ENV_SLUG' — $CREDS is missing." >&2
   echo "  local setup: cp .env.example .env && cp secrets/db_password.example secrets/db_password" >&2
-  echo "  no store at hand (CI, grading): export DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME SKIP_VAULT=1" >&2
+  echo "               (broker: uncomment BROKER_URL in .env, cp secrets/broker_password.example secrets/broker_password)" >&2
+  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL SKIP_VAULT=1" >&2
   exit 1
 fi
 

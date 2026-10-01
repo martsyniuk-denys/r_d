@@ -49,6 +49,10 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:retry` | provokes `40001` and retries the whole transaction with backoff |
 | `npm run demo:realtime` | two WebSocket clients in different rooms; only the addressed one hears the event |
 | `npm run demo:realtime:same-room` | the control run: both clients in one room, so both must hear it |
+| `npm run consumer` | the `order.placed` consumer: manual ack, prefetch 32, idempotent effect |
+| `npm run demo:publish` | 5 checkouts → 5 `order.placed` → 5 effects, 5 acks, empty DLQ |
+| `npm run demo:dlq` | a poisoned message is rejected into the DLQ; the reason is read from `x-death` |
+| `npm run demo:duplicate` | the consumer is `kill -9`-ed after the effect, before the ack: 2 deliveries, 1 effect |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -321,11 +325,25 @@ of record from here on.
 ```bash
 docker compose up -d --wait
 export DATABASE_URL=postgres://marketplace:marketplace_dev_password@127.0.0.1:56432/marketplace
+export BROKER_URL=amqp://marketplace:marketplace_dev_password@127.0.0.1:5672
 export SKIP_VAULT=1    # the grader has no access to the secret store
+npm ci
+npm run build          # the demos run from dist/
+
+npm run demo:publish   # published=5 delivered=5 effect=5 acked=5 dlq=0 prefetch=32
+npm run demo:dlq       # rejected=1 work=0 dlq=1 dlq-reason=rejected effect=0
+npm run demo:duplicate # deliveries=2 effect=1 skipped=1
 
 bash scripts/with-secrets.sh dev bash scripts/backup.sh
 bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 ```
+
+`BROKER_URL` is AMQP on `5672` — compose publishes `5672:5672`; `15672` is the management UI
+and does not speak the protocol (the code refuses that port with a message saying so). The
+broker demos also need `DATABASE_URL`, because the effect they count lives in Postgres. They
+bring the schema up to date and create their own buyer and product, so neither `migrate` nor
+`seed` has to run first; details in
+[Async events through RabbitMQ](#async-events-through-rabbitmq-async-події-через-rabbitmq).
 
 Port `56432` is **PgBouncer**, which is where every client belongs from the pooling
 homework on; compose publishes it with `56432:6432`, and Postgres itself stays on `55432`.
@@ -1405,6 +1423,249 @@ handled by instance 2 — the cure is `@socket.io/redis-adapter` (plus `app.useW
 which turns `to(room).emit()` into a Redis publish every instance replays, and for SSE
 the same Redis (or the RabbitMQ fan-out of lecture 19) feeding each instance's bus.
 
+# Async events through RabbitMQ (Async-події через RabbitMQ)
+
+The realtime feature delivers to whoever is connected *now*; nobody connected, nothing
+delivered. This section puts a broker between checkout and its readers, which keeps the
+message until a reader shows up — and pays for that with three separate bills: work can
+vanish (ack too early), work can run twice (ack too late), work can get stuck for ever
+(a message that will never process). Manual ack after the effect, an idempotent effect
+and a DLQ are the three payments.
+
+```
+checkout()  ── COMMIT ──►  EventPublisher (confirm channel, mandatory)
+                                │  order.placed
+                                ▼
+                    shop.events  (topic exchange)
+                                │  binding: order.placed
+                                ▼
+            fulfilment.order-placed  (quorum, x-delivery-limit 5)
+                │                                   │ nack(requeue=false) / delivery_limit
+                ▼                                   ▼
+   consumer: prefetch 32, noAck: false     shop.dlx (direct) ──► fulfilment.order-placed.dlq
+   INSERT … ON CONFLICT DO NOTHING                              (no consumer; x-death says why)
+   ack after the INSERT
+```
+
+| Piece | Where |
+|---|---|
+| event contract (`eventId`, `type`, `version`, `occurredAt`, `data`) | `src/messaging/events.ts` |
+| topology: exchange, queue, binding, DLX, DLQ | `src/messaging/topology.ts` |
+| publishing with confirms + `mandatory` | `src/messaging/publisher.ts` |
+| the business operation that publishes | `checkout()` in `src/concurrency/checkout.ts` |
+| consumer: manual ack, prefetch, idempotent effect | `src/messaging/order-placed.consumer.ts` |
+| consumer as a process (`npm run consumer`) | `src/consumer.ts` |
+| the effect table | `order_fulfilments`, migration `1790875996469-OrderFulfilments` |
+| the three demos | `src/demo-publish.ts`, `src/demo-dlq.ts`, `src/demo-duplicate.ts` |
+
+The broker is **RabbitMQ 4.2** (`rabbitmq:4.2-management-alpine`, 4.2.9 at the time of
+these runs): the LTS series, supported until 30.06.2030, against 30.04.2028 for 4.3. The
+`-management` image is what lets you open `http://127.0.0.1:15672` and look at `x-death`
+with your own eyes. Compose's healthcheck is `rabbitmq-diagnostics -q check_running`, not
+"the port is open": between the listener opening and the Erlang node accepting
+`basic.publish` there is a window that answers with `ECONNRESET`, and `--wait` waits it out.
+
+## Topology: declared by the consumer, not by the producer
+
+`declareTopology()` is called by the consumer on start and by each demo as a bootstrap step
+before it purges the queues. The producer imports only `EVENTS_EXCHANGE` — where to publish —
+and never asserts a queue: if it did, it would have to know who listens to it.
+
+The binding is what makes a routing key mean anything. Publish `order.placed` with no
+binding and the broker confirms it, then drops it: its job was to route correctly, and
+routing to nobody is correct. That is why the publisher also sets `mandatory: true` — see
+below.
+
+The work queue is a **quorum** queue with `x-dead-letter-exchange`, `x-dead-letter-routing-key`
+and `x-delivery-limit: 5` set as queue arguments. Arguments are immutable: add or change one
+on an existing queue and every `assertQueue` gets
+`406 PRECONDITION_FAILED - inequivalent arg 'x-dead-letter-exchange'` until the queue is
+deleted (`docker compose exec rabbitmq rabbitmqctl delete_queue fulfilment.order-placed`).
+A policy (`rabbitmqctl set_policy … '{"dead-letter-exchange":"shop.dlx"}'`) can be
+overwritten in place and is the better choice for a queue that already carries traffic;
+here the queue is new and the arguments keep the whole topology in one file.
+
+The DLX is `direct`, keyed by the work queue's name, so the same `shop.dlx` can later serve
+other work queues without their dead letters mixing in one DLQ. Dead-lettering runs with the
+default `dead-letter-strategy: at-most-once`. Switching to `at-least-once` silently does
+nothing unless the queue also has `overflow: reject-publish`: the policy is accepted, shows up
+in `effective_policy_definition`, and the broker falls back to at-most-once with a line in its
+log as the only trace.
+
+## Publishing: after COMMIT, with a confirm
+
+`checkout()` commits the order, *then* publishes `order.placed` — never from inside the
+transaction, where it could announce an order that a later statement rolls back. The body is
+a contract built on purpose, not an entity spread; the `eventId` is derived from the order id
+(`sha256('order.placed:' + orderId)`), so one fact has one identity no matter how many times
+it is published — which is exactly what the consumer deduplicates on.
+
+`EventPublisher` publishes on a **confirm channel** and resolves only on the broker's
+`basic.ack`; a `basic.nack` rejects. "Published" therefore means "the broker took
+responsibility", not "the bytes reached the socket". `mandatory: true` turns an unroutable
+message into a `basic.return`, which RabbitMQ sends before the confirm for the same message, so
+the confirm callback already knows it came back and rejects with `UnroutableEvent` instead of
+reporting success.
+
+What stays open: COMMIT done, process gone before the confirm, and the order exists with no
+event. There is no shared COMMIT between Postgres and RabbitMQ; the transactional outbox closes
+it in homework 22.
+
+## Consumer: manual ack, after the effect
+
+`channel.consume(…, { noAck: false })`, and every delivery ends in exactly one of three calls:
+
+| Outcome | Call | What the broker does |
+|---|---|---|
+| effect applied, or already there | `ack` | forgets the message |
+| cannot ever succeed (not parseable, unknown order — FK `23503`) | `nack(requeue = false)` | dead-letters it, reason `rejected` |
+| anything else (database down, timeout) | `reject(requeue = true)` | redelivers it, until `x-delivery-limit` dead-letters it, reason `delivery_limit` |
+
+The ack goes after the `INSERT`, never before: an ack is not "it arrived", it is "do not give
+this to anyone again", and that is only true once the effect is in the database. Ack early and a
+crash loses everything in the window; ack late and a crash redelivers it — there is no third
+option, and the consumer is built for the second.
+
+`reject` rather than `nack` for the retry path because on RabbitMQ 4.3 only `reject` counts
+towards the delivery limit; with `nack` a failing message would loop for ever. On the 4.2.9 in
+compose I measured both: a quorum queue with `x-delivery-limit: 2`, the same message requeued
+by each call in turn — **both** dead-lettered it after 3 deliveries. The code uses the call that
+is bounded on either version.
+
+A `null` delivery is not "nothing to do": it is `basic.cancel` from the broker (the queue was
+deleted, or `consumer_timeout` fired). The consumer process exits non-zero on it instead of
+staying up, subscribed to nothing, acking into the void.
+
+## prefetch = 32
+
+The effect is one `INSERT`, 2–3 ms in every run below (`effect-ms-max`), and its worst case is a
+pool that cannot hand out a connection, which fails after `DB_CONNECTION_TIMEOUT_MS = 5 s` — so
+**32 × 5 s = 160 s < 1800 s** (the stock `consumer_timeout`), more than ten times under the limit,
+while 32 deliveries in flight keep a 10-connection pool busy across the network round trip in a
+way `prefetch = 1` cannot. The broker default of 0 means *unlimited*: the first consumer to
+subscribe takes the whole queue and a second one idles. The value is set with `channel.prefetch(32)`
+before `consume`, and `demo:publish` prints the number it actually passed.
+
+## Idempotency: the effect is its own mark
+
+Idempotency is a property of the operation; an idempotency key is a tool that makes a
+non-idempotent operation safe to repeat. `UPDATE orders SET status = 'packed' WHERE id = 42` is
+idempotent by itself; `qty = qty - 1` is not. The fulfilment effect is written so that it does
+not need a separate key store:
+
+```sql
+INSERT INTO order_fulfilments (event_id, order_id, line_count, total_minor, handled_by)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT DO NOTHING
+RETURNING event_id
+```
+
+`event_id` is the primary key and `order_id` is unique, so a second delivery of the same event
+inserts nothing; one row back means "applied", zero means "duplicate", and there is no
+`SELECT` first, so no window between the check and the write. The deduplication lives in
+Postgres, next to the data: it survives a consumer restart and is shared by every replica —
+unlike a `Set` in process memory, which lasts exactly as long as the process and does not
+exist between two pods.
+
+Here the row *is* both the effect and the "processed" mark, so they cannot drift apart. The
+moment an effect grows beyond one statement (a second table, a call to a warehouse API), a
+separate mark appears, and a crash between "marked" and "applied" leaves a key with no effect —
+closing that takes the mark and the effect in one transaction, one COMMIT, which is
+homework 22's `processed_messages`.
+
+## The three runs
+
+Each demo spawns the consumer as a **separate process** (`node dist/consumer.js`) and reads its
+JSON-line stdout, runs pending migrations, re-declares the topology, purges both queues, and
+resets its own buyer and product (`broker-demo@marketplace.test`) — so no seed is needed, and
+they run in any order, any number of times. Each one checks its invariants and exits `1` if
+one is broken.
+
+```
+$ npm run demo:publish
+consumer pid 24533, prefetch 32
+
+  order 21 placed → order.placed c7f973c810ddfa2d2a1cea6509e090da confirmed
+  order 22 placed → order.placed bfe26f0ab36a20d3af2f7aad72f0f148 confirmed
+  order 23 placed → order.placed e6190c0183c477804a865ea3ed763f0c confirmed
+  order 24 placed → order.placed 9954f0e3ddb89258247ca812a915ffcb confirmed
+  order 25 placed → order.placed 31b75726e9e46d78cbea6105ff2b3389 confirmed
+
+published=5
+delivered=5
+effect=5
+acked=5
+work=0
+dlq=0
+prefetch=32
+effect-ms-max=2.83
+exit=0
+```
+
+```
+$ npm run demo:dlq
+published poison-1790876015067: an entity spread, not an order.placed event
+consumer: dead-letter (eventId is missing)
+
+x-death on poison-1790876015067:
+  reason rejected, queue fulfilment.order-placed, count 1, exchange shop.events, routing-keys order.placed
+x-first-death-reason: rejected
+x-first-death-queue:  fulfilment.order-placed
+
+rejected=1
+work=0
+dlq=1
+dlq-reason=rejected
+effect=0
+exit=0
+```
+
+The poisoned message is what a producer sends when it spreads its ORM entity instead of
+building the contract: no `eventId`, no `type`. No retry can make it parse, so the consumer
+does not retry — `nack(requeue = false)`, and the work queue's DLX moves it to the DLQ. The
+demo then reads it back with `basic.get`, prints `x-death` / `x-first-death-reason`, and puts
+it back with `nack(requeue = true)` so it is still there (`dlq=1`) — the DLQ has no consumer,
+it is where a person or a replay tool looks.
+
+```
+$ npm run demo:duplicate
+consumer A pid 24617: applies the effect, then holds the ack
+order 26 placed → order.placed cade871bcd7989db4477f9af3f4c486b confirmed
+consumer A: effect in the database (1 row), ack not sent — killed with SIGKILL
+consumer B pid 24618: normal consumer
+consumer B: delivery #2, redelivered=true, effect skipped as a duplicate, acked
+
+deliveries=2
+effect=1
+skipped=1
+redelivered=1
+work=0
+dlq=0
+exit=0
+```
+
+**How the duplicate is produced:** a real `kill -9`. Consumer A runs with
+`--hold-ack-after-effect`: it commits the `INSERT`, reports it, and never acks. The demo sends
+it `SIGKILL` — no handler runs, no `channel.close()`, the OS closes the socket, and the broker
+sees a dead connection and returns the unacked delivery to the queue. A clean `channel.close()`
+would also requeue, but that is a shutdown; a crash at 3 a.m. looks like this. Consumer B gets
+the same message with `redelivered = true` (delivery #2 by the quorum queue's
+`x-delivery-count`), the `INSERT` finds the row and returns nothing, B counts it as skipped and
+acks. Two deliveries, one effect.
+
+## At-least-once, not exactly-once
+
+RabbitMQ does not deliver exactly once, and nothing does: the ack travels over the same network
+that can fail, so a consumer that applied the effect can always die before the broker hears
+about it, and the broker's only safe move then is to deliver again. What this setup gives is
+**at-least-once delivery** — manual ack after the effect, confirms on publish, durable quorum
+queues and persistent messages, so a message is either acknowledged or delivered again — plus an
+**idempotent effect**: the `INSERT … ON CONFLICT DO NOTHING` keyed by a stable `eventId`, which
+turns every repeat into a no-op. Together they give an **exactly-once result**, and
+`demo:duplicate` is the place where that is visible: `deliveries=2`, `effect=1`. What I had to
+build for the result to be one was the stable `eventId` derived from the order, the natural key
+in the effect table, and the ack placed after the `INSERT` rather than before it.
+
 # The OpenAPI contract in detail
 
 ## What the spec contains
@@ -1674,6 +1935,14 @@ src/orders/                       OrdersController + OrdersService: status chang
 src/realtime/order-events.service.ts  the bus: Subject + per-order sequence and replay buffer
 src/realtime/orders.gateway.ts    WebSocket gateway: join, room orders:<id>, owner check
 src/realtime/order-access.ts      the one ownership rule both transports apply
+src/messaging/events.ts           the order.placed contract: envelope, stable eventId, parser
+src/messaging/topology.ts         exchange, queue, binding, DLX + DLQ — declared by the consuming side
+src/messaging/publisher.ts        confirm channel + mandatory: "published" means the broker said so
+src/messaging/order-placed.consumer.ts  manual ack after the effect, prefetch, ON CONFLICT DO NOTHING
+src/messaging/broker.ts           BROKER_URL (+ password file) → amqplib connection
+src/messaging/demo-kit.ts         clean slate, consumer child process, queue depths, key=value report
+src/consumer.ts                   the consumer as its own process (JSON lines on stdout)
+src/demo-publish.ts / demo-dlq.ts / demo-duplicate.ts  the three broker demos
 db/init.sql                       products table + seed, run by compose on first start
 test/testkit/                     the container, the rollback isolation and the builders
 test/integration/                 repository tests against a real Postgres
@@ -1696,7 +1965,7 @@ backup.cron                       the nightly schedule, and the weekly drill
 RESTORE-DRILL.md                  the drill protocol: date, size, time, RTO, RPO
 pgbouncer/pgbouncer.ini           transaction pooling + a session-mode alias for pg_dump
 pgbouncer/userlist.txt            SCRAM credentials for the pooler (development values)
-docker-compose.yml                PgBouncer on 56432, Postgres behind it on 55432
+docker-compose.yml                PgBouncer on 56432, Postgres behind it on 55432, RabbitMQ on 5672/15672
 Dockerfile / .dockerignore        image built without secrets in any layer
 .env.example                      the variable contract; .env and secrets/ are ignored
 ```
