@@ -8,6 +8,9 @@ export const EVENTS_EXCHANGE = 'shop.events';
 
 export const ORDER_PLACED = 'order.placed';
 
+// The outbox aggregate type: what Debezium would route on.
+export const ORDER_AGGREGATE = 'order';
+
 // What every event shares, and all a publisher needs to put one on the wire: the
 // type doubles as the routing key, the eventId as the AMQP message-id.
 export interface DomainEvent {
@@ -44,12 +47,15 @@ export interface OrderPlacedEvent extends DomainEvent {
 // Derived from the business fact, not drawn at random. A random id would be
 // stable across a redelivery of the same message and different for a republish of
 // the same fact — and a republish is exactly what a retried operation produces.
-// Deriving it means "order 42 was placed" has one identity forever.
+// Deriving it means "order 42 was placed" has one identity forever. Shaped as a
+// UUID because it is also the outbox row's primary key, and a uuid id is what the
+// Debezium Outbox Event Router expects to find there.
 export function orderPlacedEventId(orderId: string): string {
-  return createHash('sha256').update(`${ORDER_PLACED}:${orderId}`).digest('hex').slice(0, 32);
+  const hex = createHash('sha256').update(`${ORDER_PLACED}:${orderId}`).digest('hex');
+  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join('-');
 }
 
-export function orderPlacedEvent(input: {
+export function toOrderPlacedEvent(input: {
   orderId: string;
   buyerId: string;
   totalMinor: number;

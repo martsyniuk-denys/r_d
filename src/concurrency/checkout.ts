@@ -1,7 +1,8 @@
 import { DataSource, EntityManager } from 'typeorm';
 
 import { Currency } from '../entities';
-import { OrderPlacedEvent, orderPlacedEvent } from '../messaging/events';
+import { ORDER_AGGREGATE, OrderPlacedEvent, toOrderPlacedEvent } from '../messaging/events';
+import { appendToOutbox } from '../outbox/outbox';
 import { OrdersRepository, fromEntityManager } from '../repositories';
 import { returning } from './sql';
 
@@ -46,6 +47,12 @@ export interface OrderPlacedPublisher {
   publish(event: OrderPlacedEvent): Promise<void>;
 }
 
+export interface PlaceOrderHooks {
+  // Runs inside the transaction, after the outbox row is written and before
+  // COMMIT. demo:crash-write throws from here.
+  afterOutbox?: (manager: EntityManager, event: OrderPlacedEvent) => Promise<void>;
+}
+
 export async function checkout(
   dataSource: DataSource,
   command: CheckoutCommand,
@@ -59,11 +66,11 @@ export async function checkout(
     throw error;
   }
 
-  // After COMMIT, never inside the transaction: an event published from inside
-  // could announce an order that a later statement rolls back. What is left open
-  // is the other side — COMMIT done, process gone before the confirm — and there
-  // is no shared COMMIT between Postgres and RabbitMQ to close it. That is the
-  // transactional outbox, and a later homework; a failure here propagates.
+  // The event that matters is already in the outbox, committed with the order,
+  // and the relay will put it on the broker. This direct publish after COMMIT is
+  // the homework 19 path, kept for its three demos: it can still be lost (COMMIT
+  // done, process gone before the confirm), and a later relay run of the same row
+  // is a duplicate the consumer recognises by eventId.
   if (events !== undefined) await events.publish(accepted.event);
 
   return accepted;
@@ -72,6 +79,7 @@ export async function checkout(
 export async function placeOrder(
   manager: EntityManager,
   command: CheckoutCommand,
+  hooks: PlaceOrderHooks = {},
 ): Promise<CheckoutAccepted> {
   const { buyerId, productId, qty } = command;
 
@@ -117,13 +125,16 @@ export async function placeOrder(
     [JSON.stringify({ orderId: order.id, buyerId, totalMinor }), order.id],
   );
 
-  const event = orderPlacedEvent({
+  const event = toOrderPlacedEvent({
     orderId: order.id,
     buyerId,
     totalMinor,
     currency,
     lines: [{ productId, qty, unitPriceMinor: priceMinor }],
   });
+  await appendToOutbox(manager, { type: ORDER_AGGREGATE, id: order.id }, event);
+
+  if (hooks.afterOutbox !== undefined) await hooks.afterOutbox(manager, event);
 
   return {
     ok: true,

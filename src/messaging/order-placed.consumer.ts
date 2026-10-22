@@ -44,29 +44,53 @@ export interface RunningConsumer {
 
 const FOREIGN_KEY_VIOLATION = '23503';
 
-// The effect, expressed through its natural key. Applied twice, it inserts once:
-// ON CONFLICT DO NOTHING turns the second attempt into "0 rows", which is how the
-// consumer tells an applied event from a duplicate — no lookup first, so no window
-// between the check and the write.
+// The logical consumer, not the process: every replica of the fulfilment consumer
+// shares one inbox, or a redelivery to a different pod would look new.
+export const FULFILMENT_CONSUMER = 'fulfilment';
+
+// Two levels of deduplication, one transaction, one COMMIT:
+//
+//   inbox   INSERT INTO processed_messages … ON CONFLICT DO NOTHING — no row back
+//           means this consumer already handled this message: skip the effect.
+//   effect  INSERT INTO order_fulfilments … ON CONFLICT DO NOTHING — the effect
+//           itself keyed by the business fact, so even without the inbox (another
+//           event id for the same order) it cannot be applied twice.
+//
+// The mark and the effect commit together or not at all. Mark in one place and
+// apply in another (Redis and Postgres, or two transactions) and a crash between
+// them is a mark without an effect — the dual write the outbox removed from the
+// producer, moved to the consumer. No lookup first, so no window between a check
+// and a write either.
 export async function applyFulfilment(
   dataSource: DataSource,
   event: OrderPlacedEvent,
   handledBy: string,
 ): Promise<boolean> {
-  const rows: { event_id: string }[] = await dataSource.query(
-    `INSERT INTO order_fulfilments (event_id, order_id, line_count, total_minor, handled_by)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT DO NOTHING
-     RETURNING event_id`,
-    [
-      event.eventId,
-      event.data.orderId,
-      event.data.lines.length,
-      event.data.totalMinor,
-      handledBy,
-    ],
-  );
-  return rows.length === 1;
+  return dataSource.transaction(async (manager) => {
+    const marked: unknown[] = await manager.query(
+      `INSERT INTO processed_messages (message_id, consumer)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING
+       RETURNING message_id`,
+      [event.eventId, FULFILMENT_CONSUMER],
+    );
+    if (marked.length === 0) return false;
+
+    const rows: unknown[] = await manager.query(
+      `INSERT INTO order_fulfilments (event_id, order_id, line_count, total_minor, handled_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT DO NOTHING
+       RETURNING event_id`,
+      [
+        event.eventId,
+        event.data.orderId,
+        event.data.lines.length,
+        event.data.totalMinor,
+        handledBy,
+      ],
+    );
+    return rows.length === 1;
+  });
 }
 
 function eventIdOf(message: ConsumeMessage): string | null {
