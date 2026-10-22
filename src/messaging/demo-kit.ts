@@ -8,6 +8,7 @@ import { DataSource } from 'typeorm';
 import { dataSourceOptions } from '../data-source';
 import { connectBroker } from './broker';
 import { EventPublisher } from './publisher';
+import type { RelayEvent } from '../relay';
 import { ConsumerEvent } from './order-placed.consumer';
 import { FULFILMENT_DLQ, FULFILMENT_QUEUE, declareTopology } from './topology';
 
@@ -17,7 +18,7 @@ import { FULFILMENT_DLQ, FULFILMENT_QUEUE, declareTopology } from './topology';
 const DEMO_BUYER_EMAIL = 'broker-demo@marketplace.test';
 const DEMO_PRODUCT_NAME = 'Broker demo item';
 const DEMO_BALANCE_MINOR = 10_000_000;
-const DEMO_STOCK = 100;
+export const DEMO_STOCK = 100;
 const DEMO_PRICE_MINOR = 1_250;
 
 export interface DemoContext {
@@ -29,7 +30,9 @@ export interface DemoContext {
   productId: string;
 }
 
-export async function openDemo(name: string): Promise<DemoContext> {
+// Each family of demos owns its own buyer, so a reset in one never deletes the
+// orders another is counting.
+export async function openDemo(name: string, buyerEmail = DEMO_BUYER_EMAIL): Promise<DemoContext> {
   const dataSource = new DataSource({ ...dataSourceOptions, logging: ['error'] });
   await dataSource.initialize();
   // A fresh clone has no order_fulfilments table yet; bringing the schema up to
@@ -45,7 +48,7 @@ export async function openDemo(name: string): Promise<DemoContext> {
   await channel.purgeQueue(FULFILMENT_QUEUE);
   await channel.purgeQueue(FULFILMENT_DLQ);
 
-  const { buyerId, productId } = await resetFixtures(dataSource);
+  const { buyerId, productId } = await resetFixtures(dataSource, buyerEmail);
   const publisher = await EventPublisher.open(connection);
 
   return { dataSource, connection, channel, publisher, buyerId, productId };
@@ -59,18 +62,27 @@ export async function closeDemo(context: DemoContext): Promise<void> {
 }
 
 // The demo owns one buyer and one product and nothing else: their earlier orders
-// go (and with them, by cascade, the fulfilments), stock and balance are reset.
+// go (and with them, by cascade, the fulfilments and idempotency keys), and so do
+// the outbox rows and inbox marks of the events about them — the outbox has no
+// foreign key to cascade along. Stock and balance are reset.
 async function resetFixtures(
   dataSource: DataSource,
+  buyerEmail: string,
 ): Promise<{ buyerId: string; productId: string }> {
   const [{ id: buyerId }]: { id: string }[] = await dataSource.query(
     `INSERT INTO users (email, display_name, country, balance_minor)
      VALUES ($1, 'Broker demo buyer', 'UA', $2)
      ON CONFLICT (email) DO UPDATE SET balance_minor = EXCLUDED.balance_minor
      RETURNING id`,
-    [DEMO_BUYER_EMAIL, DEMO_BALANCE_MINOR],
+    [buyerEmail, DEMO_BALANCE_MINOR],
   );
 
+  await dataSource.query(
+    `DELETE FROM processed_messages
+      WHERE message_id IN (SELECT id::text FROM outbox WHERE payload->'data'->>'buyerId' = $1)`,
+    [buyerId],
+  );
+  await dataSource.query(`DELETE FROM outbox WHERE payload->'data'->>'buyerId' = $1`, [buyerId]);
   await dataSource.query(`DELETE FROM orders WHERE buyer_id = $1`, [buyerId]);
 
   const existing: { id: string }[] = await dataSource.query(
@@ -126,24 +138,26 @@ export async function settledDepth(
   return current;
 }
 
-type Observed = ConsumerEvent | { kind: 'holding'; eventId: string };
+type ConsumerObserved = ConsumerEvent | { kind: 'holding'; eventId: string };
 
 const children = new Set<ChildProcess>();
-// A demo that dies half-way must not leave a consumer behind to eat the next
-// run's messages.
+// A demo that dies half-way must not leave a consumer or a relay behind to eat
+// the next run's messages.
 process.on('exit', () => {
   for (const child of children) child.kill('SIGKILL');
 });
 
-export class ConsumerProcess {
-  readonly events: Observed[] = [];
+// A dist/ script run as a child process, its stdout read as one JSON event per
+// line.
+export class JsonProcess<E extends { kind: string }> {
+  readonly events: E[] = [];
   private readonly waiters: (() => void)[] = [];
   private readonly exited: Promise<NodeJS.Signals | number | null>;
 
-  private constructor(readonly child: ChildProcess) {
+  protected constructor(readonly child: ChildProcess) {
     createInterface({ input: child.stdout! }).on('line', (line) => {
       try {
-        this.events.push(JSON.parse(line) as Observed);
+        this.events.push(JSON.parse(line) as E);
       } catch {
         return;
       }
@@ -157,40 +171,29 @@ export class ConsumerProcess {
     });
   }
 
-  static async start(...args: string[]): Promise<ConsumerProcess> {
-    const child = spawn(process.execPath, [join(__dirname, '..', 'consumer.js'), ...args], {
+  protected static spawnScript(script: string, args: string[]): ChildProcess {
+    const child = spawn(process.execPath, [join(__dirname, '..', script), ...args], {
       env: process.env,
       stdio: ['ignore', 'pipe', 'inherit'],
     });
     children.add(child);
     child.on('exit', () => children.delete(child));
-    const consumer = new ConsumerProcess(child);
-    await consumer.waitFor((events) => events.some((e) => e.kind === 'ready'), 15_000, 'ready');
-    return consumer;
+    return child;
   }
 
   get pid(): number {
     return this.child.pid ?? -1;
   }
 
-  get prefetch(): number {
-    const ready = this.events.find((e) => e.kind === 'ready');
-    return ready?.kind === 'ready' ? ready.prefetch : 0;
-  }
-
-  count(predicate: (event: Observed) => boolean): number {
+  count(predicate: (event: E) => boolean): number {
     return this.events.filter(predicate).length;
   }
 
-  async waitFor(
-    condition: (events: Observed[]) => boolean,
-    timeoutMs: number,
-    what: string,
-  ): Promise<void> {
+  async waitFor(condition: (events: E[]) => boolean, timeoutMs: number, what: string): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (!condition(this.events)) {
       if (this.child.exitCode !== null || this.child.signalCode !== null) {
-        throw new Error(`consumer ${this.pid} exited while waiting for: ${what}`);
+        throw new Error(`${this.child.spawnargs[1]} (${this.pid}) exited while waiting for: ${what}`);
       }
       const left = deadline - Date.now();
       if (left <= 0) throw new Error(`timed out after ${timeoutMs} ms waiting for: ${what}`);
@@ -204,17 +207,43 @@ export class ConsumerProcess {
     }
   }
 
-  // Graceful: basic.cancel, in-flight deliveries settle, connection closed.
+  // Graceful: the process finishes what it holds and closes its connections.
   async stop(): Promise<NodeJS.Signals | number | null> {
     this.child.kill('SIGTERM');
     return this.exited;
   }
 
-  // kill -9: no handler runs, the OS closes the socket, the broker sees a dead
-  // connection and puts every unacked delivery back.
+  // kill -9: no handler runs, the OS closes the sockets. The broker puts every
+  // unacked delivery back; Postgres rolls back the open transaction and releases
+  // its row locks.
   async crash(): Promise<NodeJS.Signals | number | null> {
     this.child.kill('SIGKILL');
     return this.exited;
+  }
+}
+
+export class ConsumerProcess extends JsonProcess<ConsumerObserved> {
+  static async start(...args: string[]): Promise<ConsumerProcess> {
+    const consumer = new ConsumerProcess(JsonProcess.spawnScript('consumer.js', args));
+    await consumer.waitFor((events) => events.some((e) => e.kind === 'ready'), 15_000, 'ready');
+    return consumer;
+  }
+
+  get prefetch(): number {
+    const ready = this.events.find((e) => e.kind === 'ready');
+    return ready?.kind === 'ready' ? ready.prefetch : 0;
+  }
+}
+
+export class RelayProcess extends JsonProcess<RelayEvent> {
+  static async start(...args: string[]): Promise<RelayProcess> {
+    const relay = new RelayProcess(JsonProcess.spawnScript('relay.js', args));
+    await relay.waitFor((events) => events.some((e) => e.kind === 'ready'), 15_000, 'ready');
+    return relay;
+  }
+
+  ticks(): number {
+    return this.count((e) => e.kind === 'tick');
   }
 }
 
@@ -243,3 +272,10 @@ export function runDemo(main: () => Promise<number>): void {
       process.exit(1);
     });
 }
+
+export async function countOf(dataSource: DataSource, sql: string, parameters: unknown[]): Promise<number> {
+  const [{ count }]: { count: string }[] = await dataSource.query(sql, parameters);
+  return Number(count);
+}
+
+export const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

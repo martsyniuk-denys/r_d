@@ -53,6 +53,10 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:publish` | 5 checkouts → 5 `order.placed` → 5 effects, 5 acks, empty DLQ |
 | `npm run demo:dlq` | a poisoned message is rejected into the DLQ; the reason is read from `x-death` |
 | `npm run demo:duplicate` | the consumer is `kill -9`-ed after the effect, before the ack: 2 deliveries, 1 effect |
+| `npm run relay` | the outbox relay: `FOR UPDATE SKIP LOCKED` → publish → `UPDATE published_at` |
+| `npm run demo:outbox` | 2 requests with one `Idempotency-Key` → 1 order, 1 outbox row, 1 delivery, 1 effect |
+| `npm run demo:crash-write` | the transaction fails after the outbox insert: no order, no row, nothing published |
+| `npm run demo:crash-relay` | the relay is `kill -9`-ed between publish and `UPDATE`: 2 deliveries, 1 effect |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -330,6 +334,11 @@ export SKIP_VAULT=1    # the grader has no access to the secret store
 npm ci
 npm run build          # the demos run from dist/
 
+npx tsc --noEmit
+npm run demo:outbox      # requests=2 orders=1 outbox=1 published=1 deliveries=1 effect=1 processed=1
+npm run demo:crash-write # write-failed=1 orders=0 outbox=0 published=0 deliveries=0 effect=0
+npm run demo:crash-relay # published=2 deliveries=2 applied=1 effect=1 processed=1
+
 npm run demo:publish   # published=5 delivered=5 effect=5 acked=5 dlq=0 prefetch=32
 npm run demo:dlq       # rejected=1 work=0 dlq=1 dlq-reason=rejected effect=0
 npm run demo:duplicate # deliveries=2 effect=1 skipped=1
@@ -337,6 +346,14 @@ npm run demo:duplicate # deliveries=2 effect=1 skipped=1
 bash scripts/with-secrets.sh dev bash scripts/backup.sh
 bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 ```
+
+The three outbox demos build before they run (`npm run build --silent && bash
+scripts/with-secrets.sh dev node dist/…`), so they also work straight after `npm ci`. Like the
+broker demos below, they bring the schema up to date (the outbox, inbox and key tables come
+from migration `1792664108077-OutboxInboxIdempotencyKeys`), create their own buyer and product,
+and clean up after their previous run. No `migrate` or `seed` is needed, and they run in any
+order, any number of times. Details in
+[Transactional outbox and idempotency](#transactional-outbox-and-idempotency-outbox-та-ідемпотентність).
 
 `BROKER_URL` is AMQP on `5672` — compose publishes `5672:5672`; `15672` is the management UI
 and does not speak the protocol (the code refuses that port with a message saying so). The
@@ -1509,7 +1526,7 @@ reporting success.
 
 What stays open: COMMIT done, process gone before the confirm, and the order exists with no
 event. There is no shared COMMIT between Postgres and RabbitMQ; the transactional outbox closes
-it in homework 22.
+it — see [Transactional outbox and idempotency](#transactional-outbox-and-idempotency-outbox-та-ідемпотентність).
 
 ## Consumer: manual ack, after the effect
 
@@ -1665,6 +1682,338 @@ turns every repeat into a no-op. Together they give an **exactly-once result**, 
 `demo:duplicate` is the place where that is visible: `deliveries=2`, `effect=1`. What I had to
 build for the result to be one was the stable `eventId` derived from the order, the natural key
 in the effect table, and the ack placed after the `INSERT` rather than before it.
+
+# Transactional outbox and idempotency (Outbox та ідемпотентність)
+
+Everything up to the broker homework rested on one assumption: the whole effect of checkout
+lives in one database, so one COMMIT makes it atomic. Publishing `order.placed` breaks that.
+Postgres and RabbitMQ are two resource managers with no shared COMMIT, and between "order
+committed" and "event confirmed" there is a gap where a process can die. Publish after COMMIT
+and a crash loses the event. Publish before COMMIT and a rollback announces an order that never
+existed.
+
+The outbox closes that gap by not writing to the broker from the business operation at all.
+The event becomes a row, committed together with the order, and a separate relay moves rows to
+the broker. That gives **at-least-once** delivery and nothing better, so the consumer has to make
+the effect idempotent. That's what pays for the outbox.
+
+```
+POST /checkout  Idempotency-Key: k
+  │
+  ▼  BEGIN
+  │  INSERT idempotency_keys (buyer, k) ON CONFLICT DO NOTHING     ← level 3: API edge
+  │  UPDATE products / users, INSERT orders, order_items, jobs
+  │  INSERT outbox (id = eventId, aggregate_type, aggregate_id, type, payload)
+  │  COMMIT                                ← order and event: one COMMIT, or neither
+  │
+relay (separate process, polls every 100 ms)
+  │  BEGIN
+  │  SELECT … WHERE published_at IS NULL ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 50
+  │  publish → shop.events / order.placed, wait for the broker's confirm
+  │  UPDATE outbox SET published_at = now(), attempts = attempts + 1
+  │  COMMIT
+  ▼
+fulfilment.order-placed ──► consumer (separate process)
+                              BEGIN
+                              INSERT processed_messages (message_id, consumer) ON CONFLICT DO NOTHING   ← level 2: inbox
+                              INSERT order_fulfilments … ON CONFLICT DO NOTHING                         ← level 1: natural key
+                              COMMIT, then ack
+```
+
+| Piece | Where |
+|---|---|
+| migration: `outbox`, `processed_messages`, `idempotency_keys`, partial index | `src/migrations/1792664108077-OutboxInboxIdempotencyKeys.ts` |
+| entities | `src/entities/outbox-message.entity.ts`, `processed-message.entity.ts`, `idempotency-key.entity.ts` |
+| event contract, `toOrderPlacedEvent()` | `src/messaging/events.ts` |
+| order + outbox row in one transaction | `placeOrder()` in `src/concurrency/checkout.ts`, `appendToOutbox()` in `src/outbox/outbox.ts` |
+| Idempotency-Key at the API edge | `src/orders/place-order-once.ts`, `POST /checkout` in `src/orders/checkout.http.ts` |
+| relay: one pass | `relayBatch()` in `src/outbox/relay.ts` |
+| relay as a process (`npm run relay`) | `src/relay.ts` |
+| idempotent consumer, two levels | `applyFulfilment()` in `src/messaging/order-placed.consumer.ts` |
+| the three demos | `src/demo-outbox.ts`, `src/demo-crash-write.ts`, `src/demo-crash-relay.ts` |
+
+The broker is the RabbitMQ from the broker homework: a separate process, so there really are two
+resource managers. Secrets come from the same store. Every new npm script that touches the
+database starts with `bash scripts/with-secrets.sh dev …`, and `BROKER_URL` already lives
+there next to `DB_URL`. No new env file was added.
+
+## The outbox table
+
+```sql
+CREATE TABLE outbox (
+  id             uuid PRIMARY KEY,          -- = the event's eventId
+  aggregate_type text NOT NULL,             -- 'order'
+  aggregate_id   text NOT NULL,             -- the order id
+  type           text NOT NULL,             -- 'order.placed', also the routing key
+  payload        jsonb NOT NULL,            -- the event contract, not the entity
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  published_at   timestamptz,               -- NULL = not relayed yet
+  attempts       integer NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+);
+CREATE INDEX idx_outbox_unpublished ON outbox (created_at, id) WHERE published_at IS NULL;
+```
+
+Created by a migration, not by `synchronize`. As in the earlier homeworks, it was generated from
+the entities and trimmed of the generator's two known false diffs. `up` → `down` → `up` was run
+before committing.
+
+The partial index holds the backlog, not the history. The relay's query matches it exactly
+(`WHERE published_at IS NULL ORDER BY created_at, id`), and a row drops out of it the moment it
+is marked. `outbox` has **no foreign key** to `orders`. It is a log of what was said, read by
+something that knows nothing about the domain (the relay today, Debezium later), and an event
+must be able to outlive the row it was about.
+
+The column roles are the ones the **Debezium Outbox Event Router** reads, so moving from polling
+to CDC changes connector config, not consumers. Debezium's canonical names have no underscore
+(`aggregatetype`, `aggregateid`), and `route.by.field` defaults to `aggregatetype`. Here the
+snake_case names are kept and mapped explicitly:
+
+```properties
+transforms=outbox
+transforms.outbox.type=io.debezium.transforms.outbox.EventRouter
+transforms.outbox.table.field.event.id=id
+transforms.outbox.table.field.event.key=aggregate_id
+transforms.outbox.table.field.event.payload=payload
+transforms.outbox.route.by.field=aggregate_type
+transforms.outbox.table.fields.additional.placement=type:header:type
+```
+
+`published_at` and `attempts` belong to the polling relay; a CDC pipeline ignores them.
+
+**Cleanup.** The table only grows, and published rows still cost space and vacuum work even though
+the partial index skips them. A nightly job deletes what has been out for a week, in batches so
+it never holds a long lock:
+`DELETE FROM outbox WHERE id IN (SELECT id FROM outbox WHERE published_at < now() - interval '7 days' LIMIT 10000)`,
+repeated until it deletes nothing. Unpublished rows are never deleted. A row with a growing
+`attempts` and no `published_at` is a stuck event, and that's what to alert on.
+
+## The business operation: one COMMIT
+
+`placeOrder()` is the transactional checkout from the concurrency homework, with one extra
+statement at the end: `appendToOutbox(manager, { type: 'order', id: order.id }, event)`. Same
+`EntityManager`, so same connection, same transaction, same COMMIT. That matters: the
+transaction lives on one client (`dataSource.transaction(...)`), not on `pool.query('BEGIN')`,
+where BEGIN and COMMIT could go to two different connections. Nothing inside the transaction
+talks to the broker, because a broker cannot roll back.
+
+The payload is built by `toOrderPlacedEvent()`, an explicit contract (`eventId`, `type`,
+`version`, `occurredAt`, `data: { orderId, buyerId, totalMinor, currency, lines }`), never an
+entity spread. A column rename stays a migration, not a breaking change for every consumer. The
+`eventId` is derived from the order (`sha256('order.placed:' + orderId)`, shaped as a UUID because
+it is also `outbox.id`), so the same fact has the same identity on every publish. That identity is
+what the consumer deduplicates on.
+
+`checkout()` keeps the broker homework's optional publish after COMMIT, and only
+`demo:publish` and `demo:duplicate` use it. The outbox row is written either way, so
+when the relay later sends such an event again, the inbox absorbs it as one more duplicate.
+
+## The relay
+
+```sql
+SELECT id, type, payload, created_at FROM outbox
+ WHERE published_at IS NULL
+ ORDER BY created_at, id
+ FOR UPDATE SKIP LOCKED
+ LIMIT 50
+```
+
+then every row is published on the confirm channel with `messageId = outbox.id`, and only
+after all confirms come back
+`UPDATE outbox SET published_at = now(), attempts = attempts + 1 WHERE id = ANY(…)`, then COMMIT.
+All of it is one transaction on one connection (`createQueryRunner()`), so the row lock covers
+the whole publish.
+
+- **SKIP LOCKED, not a bare `FOR UPDATE`.** With `FOR UPDATE` a second relay waits on the first
+  one's locks: no duplicates, and no parallelism either. With `SKIP LOCKED` it takes the next rows
+  instead. Two relays never hold the same row, and they work in parallel.
+- **`published_at IS NULL`, not a cursor on `id`.** An id is handed out when the row is inserted
+  and becomes visible at COMMIT, and those two orders differ. A transaction that drew id 41 and
+  committed after 42 is invisible at the moment the cursor moves past 41, and "everything above
+  the last id" skips it for good. The `NULL` predicate finds a row whenever it commits.
+- **Ordering.** `ORDER BY created_at, id` is the order of *selection*, not of delivery. Two relays
+  with `SKIP LOCKED` interleave batches, and a failed publish is retried after newer rows went
+  out. This consumer doesn't need ordering: every `order.placed` is a different order and the
+  effect is per order. If it ever does, the order exists only within a partitioning key
+  (`aggregate_id`), by routing one aggregate to one queue and one relay, not by sorting.
+- **A failed publish** (nack, unroutable with `mandatory`, broker gone) leaves the row unpublished
+  with `attempts + 1`, and the next pass tries again. A failure is *not* proof that the message
+  isn't in the queue, because the confirm itself can be what got lost. So "caught the error, rolled
+  back, all clean" doesn't hold, and the consumer deduplicates regardless of how careful the relay is.
+- **`attempts` survives only a failed publish, not a crash.** A crash rolls back the whole pass,
+  including the increment. That's acceptable: the crash is the case `demo:crash-relay` covers,
+  and a crashed relay is visible in its own logs.
+
+### Why publish and `UPDATE published_at` cannot swap places
+
+The order is publish → UPDATE, and the swap looks like it would fix the duplicate:
+mark first, then publish, and a crash can't make the relay publish twice. That's true, and it
+breaks the other way. Mark first, then die (or have the publish fail, or have the broker drop the
+message) before the publish, and the row says "published" about an event that was never sent.
+No later pass looks at it again, because it no longer matches `published_at IS NULL`, and no
+consumer can tell that an event it never received is missing. The choice isn't between good and
+bad. It's between a **duplicate** and a **loss**. A duplicate is cured downstream by
+deduplication, the two levels below. Nothing cures a loss. Doing the UPDATE in a *separate*
+transaction after the publish doesn't change this: there is still a moment where one of the two
+has happened and the other hasn't. So the order stays publish, then mark, and the consumer
+treats every message as possibly the second copy.
+
+## The consumer: two levels, one transaction
+
+```sql
+BEGIN;
+INSERT INTO processed_messages (message_id, consumer) VALUES ($eventId, 'fulfilment')
+ON CONFLICT DO NOTHING RETURNING message_id;      -- no row → already handled: skip, COMMIT, ack
+INSERT INTO order_fulfilments (event_id, order_id, …) VALUES (…)
+ON CONFLICT DO NOTHING RETURNING event_id;        -- no row → the effect is already there
+COMMIT;                                           -- then ack
+```
+
+**Level 1, the natural key.** The effect is phrased so that applying it twice changes nothing:
+one fulfilment per order (`order_id` unique, `event_id` the primary key), inserted with
+`ON CONFLICT DO NOTHING`. Not `UPDATE … SET qty = qty - 1`, which on a second delivery takes
+twice.
+
+**Level 2, the inbox.** `processed_messages (message_id, consumer)` with the pair as primary key.
+The `consumer` is the logical name `fulfilment`, not the process, so every replica shares one inbox
+and two different consumers of the same event each handle it once. The mark and the effect go in
+the **same transaction**. A mark in Redis next to an effect in Postgres, or the two in two
+transactions, is a dual write again, just moved from the producer to the consumer: crash between
+them and there's a mark with no effect, an event that is silently skipped forever.
+
+Both are `INSERT … ON CONFLICT DO NOTHING`, never `SELECT` then `INSERT`. A check followed by a
+write has a window in which two deliveries both see "new".
+
+## The API edge: Idempotency-Key (level 3)
+
+`POST /checkout` (`src/orders/checkout.http.ts`, an express app that needs only a `DataSource`;
+the Nest `/orders` resource is still the in-memory one from the contract homework) takes the same
+`Idempotency-Key` header as the contract homework, now with server state in Postgres:
+
+```sql
+BEGIN;
+INSERT INTO idempotency_keys (buyer_id, key, request_hash) VALUES (…)
+ON CONFLICT DO NOTHING RETURNING key;
+-- one row → this request owns the key: placeOrder() (+ outbox), store order_id, COMMIT → 201
+-- no row  → SELECT request_hash, order_id → 200 + Idempotency-Replay: true
+--           (or 422 if the same key came with a different body)
+```
+
+The claim, the order and its outbox row commit together. A declined or crashed checkout takes
+the claim with it (`demo:crash-write` prints `keys=0`), so the client can retry with the same key.
+Two requests with one key **at the same time** don't race either. The second `INSERT` hits the
+first one's uncommitted row in the unique index, so Postgres makes it wait for that transaction.
+Then `DO NOTHING` applies, and under READ COMMITTED the `SELECT` that follows sees the committed
+`order_id`.
+
+The key is per buyer (`PRIMARY KEY (buyer_id, key)`) and it identifies the **intent**, not the
+body. A hash of the body as the key would merge two legitimate identical orders (two of the same
+item, bought on purpose a minute apart) into one. `request_hash` is stored only to refuse the
+same key reused for a *different* body.
+
+## The three runs
+
+All three spawn the consumer and the relay as **separate processes** (`node dist/consumer.js`,
+`node dist/relay.js`) and read their JSON-line stdout. Each demo uses its own buyer
+(`outbox-demo@`, `crash-write-demo@`, `crash-relay-demo@marketplace.test`). On start each one
+deletes that buyer's orders, their outbox rows and inbox marks, purges the queues and resets stock
+and balance. Every count is scoped to that buyer or to the demo's own `eventId`, because the dev
+database can hold other pending outbox rows (`demo:race` leaves ten), which the relay legitimately
+publishes alongside. Each demo checks its own invariants and exits `1` if one is broken.
+
+```
+$ npm run demo:outbox
+consumer pid 87360, relay pid 87363, api http://127.0.0.1:56934
+
+  POST /checkout  Idempotency-Key: 18c94cbf…  → 201 order 76
+  POST /checkout  Idempotency-Key: 18c94cbf…  → 200 order 76  (Idempotency-Replay: true)
+  outbox row e8fe8c3d-9d4a-d434-765e-34966b98f044 committed with order 76
+  relay: published + marked; consumer: effect applied, inbox marked, acked
+
+requests=2
+created=1
+replayed=1
+orders=1
+outbox=1
+published=1
+relayed=1
+deliveries=1
+applied=1
+effect=1
+processed=1
+exit=0
+```
+
+Two requests sent concurrently with one key produce one order, one outbox row, one publish, one
+delivery, one effect and one inbox mark.
+
+```
+$ npm run demo:crash-write
+consumer pid 87376, relay pid 87377
+
+  inside the transaction: order 77 (1 row), outbox 55b95ced-b216-2f01-1294-f50a497e06dd (1 row) — now failing before COMMIT
+  simulated crash after the outbox insert, before COMMIT → ROLLBACK
+  relay: 5 passes since, nothing of ours picked up
+
+write-failed=1
+outbox-inside-tx=1
+orders=0
+outbox=0
+published=0
+relayed=0
+deliveries=0
+effect=0
+keys=0
+exit=0
+```
+
+**The business write fails.** `placeOrderOnce()` runs in full (key claimed, stock and balance
+taken, order inserted, outbox row inserted), and a hook placed after the outbox insert throws
+before COMMIT. Inside the transaction the demo counts the outbox row (`outbox-inside-tx=1`), so
+the row really was written. After the rollback the order, the row, the key and the stock
+decrement are all gone, and the relay and consumer, running the whole time, never see the event.
+They are one COMMIT, so one ROLLBACK takes both. With two COMMITs, the outbox row would be here.
+
+```
+$ npm run demo:crash-relay
+order 78 + outbox ed21fbec-a795-2406-c198-893859179947 committed
+relay A pid 87385: publishes, then holds before UPDATE published_at
+relay A: confirmed by the broker, consumer applied it (1 row), published_at still NULL — killed with SIGKILL
+relay B pid 87389: normal relay
+relay B: published it again and marked it; consumer: duplicate, skipped, acked
+
+published=2
+deliveries=2
+applied=1
+skipped=1
+acked=2
+effect=1
+processed=1
+marked=1
+exit=0
+```
+
+**The service write fails. How the relay is killed:** a real `kill -9` of a child process, not a
+simulated exception. Relay A runs with `--hold-after-publish=<eventId>`. It locks the row,
+publishes, gets the broker's confirm, and then stops inside `beforeMark`, which is the exact spot
+between publish and `UPDATE published_at`. While it is held, the consumer receives the event and
+commits the effect plus the inbox mark, and the demo checks that `published_at` is still `NULL`.
+Then `SIGKILL`: no handler runs, the OS closes the socket, and Postgres rolls back the relay's
+transaction (through PgBouncer) and releases the row lock. Relay B finds the row still
+unpublished, publishes it again and marks it. The consumer gets the same `eventId` a second time,
+the inbox `INSERT` returns nothing, and it skips the effect and acks.
+
+## At-least-once + idempotent effect = exactly-once result
+
+There is no exactly-once delivery. That's the two generals problem: the last acknowledgement
+always travels over a network that can lose it, so somebody always has to choose between maybe
+sending twice and maybe not sending at all. The outbox picks "maybe twice" on every hop. The
+relay republishes anything it didn't mark, and the consumer acks only after its COMMIT. Kafka's
+exactly-once semantics hold inside Kafka (read-process-write between its own topics). Once the
+other end is a Postgres table, the guarantee comes down to the deduplication key again. What
+turns at-least-once delivery into an exactly-once **result** is the idempotent effect: a stable
+`eventId` derived from the order, the inbox mark in the same transaction as the effect, and an
+effect keyed by the business fact. `demo:crash-relay` is where you can see it: `deliveries=2`,
+`effect=1`.
 
 # The OpenAPI contract in detail
 
@@ -1943,6 +2292,12 @@ src/messaging/broker.ts           BROKER_URL (+ password file) → amqplib conne
 src/messaging/demo-kit.ts         clean slate, consumer child process, queue depths, key=value report
 src/consumer.ts                   the consumer as its own process (JSON lines on stdout)
 src/demo-publish.ts / demo-dlq.ts / demo-duplicate.ts  the three broker demos
+src/outbox/outbox.ts              appendToOutbox(): the event row, inside the business transaction
+src/outbox/relay.ts               one relay pass: FOR UPDATE SKIP LOCKED → publish → UPDATE published_at
+src/relay.ts                      the relay as its own process (JSON lines on stdout)
+src/orders/place-order-once.ts    Idempotency-Key claimed in the same transaction as the order
+src/orders/checkout.http.ts       POST /checkout: 201 / 200 replay / 422 key reused with another body
+src/demo-outbox.ts / demo-crash-write.ts / demo-crash-relay.ts  the three outbox demos
 db/init.sql                       products table + seed, run by compose on first start
 test/testkit/                     the container, the rollback isolation and the builders
 test/integration/                 repository tests against a real Postgres
