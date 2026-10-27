@@ -15,7 +15,8 @@ away from its schema never reaches the client (500 instead of silent drift).
 npm install
 cp .env.example .env                 # real values live here; .env is git-ignored
 cp secrets/db_password.example secrets/db_password
-docker compose up -d --wait          # PgBouncer on 56432, Postgres behind it, Pact broker on 9292
+cp secrets/redis_password.example secrets/redis_password
+docker compose up -d --wait          # PgBouncer 56432, Postgres behind it, RabbitMQ 5672, Redis 56379/56380, Pact broker 9292
 npm run build                        # migrations and scripts run from dist/
 npm run migrate && npm run seed      # schema from src/migrations + fixture rows
 npm start                            # http://localhost:3000
@@ -57,6 +58,11 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:outbox` | 2 requests with one `Idempotency-Key` → 1 order, 1 outbox row, 1 delivery, 1 effect |
 | `npm run demo:crash-write` | the transaction fails after the outbox insert: no order, no row, nothing published |
 | `npm run demo:crash-relay` | the relay is `kill -9`-ed between publish and `UPDATE`: 2 deliveries, 1 effect |
+| `npm run demo:cache` | 60 cards warmed with jittered TTLs; 50 concurrent reads of an expired key → 1 query |
+| `npm run demo:session` | a session in Redis with a rolling TTL, surviving a `kill -9` of the process |
+| `npm run demo:ratelimit` | two pods, one sliding window: `limit` allowed between them, the rest 429 + `Retry-After` |
+| `npm run demo:queue` | BullMQ: retries with exponential backoff, dedup by `jobId`, one upserted job scheduler |
+| `npm run pod` | one stateless API pod: sessions (`GET /session`) and the rate limit (`GET /limited`) |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -330,11 +336,18 @@ of record from here on.
 docker compose up -d --wait
 export DATABASE_URL=postgres://marketplace:marketplace_dev_password@127.0.0.1:56432/marketplace
 export BROKER_URL=amqp://marketplace:marketplace_dev_password@127.0.0.1:5672
+export REDIS_URL=redis://:redis_dev_password@127.0.0.1:56379        # the cache: allkeys-lru
+export REDIS_QUEUE_URL=redis://:redis_dev_password@127.0.0.1:56380  # queue, sessions, limits: noeviction
 export SKIP_VAULT=1    # the grader has no access to the secret store
 npm ci
 npm run build          # the demos run from dist/
 
 npx tsc --noEmit
+npm run demo:cache     # cache-lru=1 cache-maxmemory=1 warmed=60 ttl-distinct≈40 concurrent=50 db-calls=1 db-calls-warm=0
+npm run demo:session   # requests=4 sessions=1 in-redis=1 ttl-renewed=1
+npm run demo:ratelimit # instances=2 limit=5 requests=20 allowed=5 blocked=15 status=429 retry-after=1
+npm run demo:queue     # queue-noeviction=1 attempts=3 completed=1 added=2 queued=1 schedulers=1 scheduled-runs≈7
+
 npm run demo:outbox      # requests=2 orders=1 outbox=1 published=1 deliveries=1 effect=1 processed=1
 npm run demo:crash-write # write-failed=1 orders=0 outbox=0 published=0 deliveries=0 effect=0
 npm run demo:crash-relay # published=2 deliveries=2 applied=1 effect=1 processed=1
@@ -346,6 +359,14 @@ npm run demo:duplicate # deliveries=2 effect=1 skipped=1
 bash scripts/with-secrets.sh dev bash scripts/backup.sh
 bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 ```
+
+The four Redis demos build before they run, like the outbox demos below, and clean up after
+themselves: every key they write is deleted at the end, the queue is obliterated before and after.
+Only `demo:cache` needs Postgres (it creates its own seller and 60 products and brings the schema
+up to date); the other three need nothing but the two Redis instances. `REDIS_URL` is the cache
+on `56379`, `REDIS_QUEUE_URL` the queue instance on `56380` — compose publishes `56379:6379` and
+`56380:6379`, and the password is the compose dev credential `redis_dev_password`. Details in
+[Redis: cache, sessions, limits, queue](#redis-cache-sessions-limits-queue-redis-кеш-сесії-ліміти-черга).
 
 The three outbox demos build before they run (`npm run build --silent && bash
 scripts/with-secrets.sh dev node dist/…`), so they also work straight after `npm ci`. Like the
@@ -2015,6 +2036,289 @@ turns at-least-once delivery into an exactly-once **result** is the idempotent e
 effect keyed by the business fact. `demo:crash-relay` is where you can see it: `deliveries=2`,
 `effect=1`.
 
+# Redis: cache, sessions, limits, queue (Redis: кеш, сесії, ліміти, черга)
+
+The outbox homework made the system correct: the order and its event commit together, and the
+effect is idempotent. Nothing here makes it more correct. Redis makes it faster and keeps it
+standing under load. Four jobs, one rule for all of them: before you trust a Redis structure,
+ask what happens when it fails. For the cache and its lock the answer is "one more trip to
+Postgres". That is why a lock is acceptable there, and why no business invariant in this
+repository is protected by one.
+
+| Piece | Where |
+|---|---|
+| the two instances, policies set explicitly | `docker-compose.yml` (`redis-cache`, `redis-queue`) |
+| connections, `CONFIG GET` at runtime | `src/redis/connection.ts` |
+| cache-aside, jittered TTL, single-flight lock, compare-and-delete | `src/cache/cache-aside.ts` |
+| the cached read: the product card | `src/repositories/product-cards.repository.ts`, `src/cache/product-cards.ts` |
+| the database call counter | `CountingQueryable` in `src/repositories/counting.ts` |
+| session store with a rolling TTL, cookie middleware | `src/sessions/session-store.ts`, `src/sessions/session.middleware.ts` |
+| sliding-window limiter, 429 + `Retry-After` | `src/ratelimit/sliding-window.ts` |
+| a stateless pod (sessions + limit) as a process | `src/pod.ts`, started by `src/redis/pod-process.ts` |
+| BullMQ queue, retries, `jobId`, job scheduler | `src/queue/notifications.ts` |
+| the four demos | `src/demo-cache.ts`, `src/demo-session.ts`, `src/demo-ratelimit.ts`, `src/demo-queue.ts` |
+
+Secrets come from the same store as the database and the broker. `REDIS_URL` and
+`REDIS_QUEUE_URL` live in `.env` next to `DB_URL` and `BROKER_URL`, without a password; the
+password is in `secrets/redis_password`, read through `REDIS_PASSWORD_FILE` the same way
+`db_password` is. No new env file was added. All four demo scripts start with
+`bash scripts/with-secrets.sh dev …`, and `SKIP_VAULT=1` works for them unchanged.
+
+## Two instances, and why
+
+| | `redis-cache` (56379) | `redis-queue` (56380) |
+|---|---|---|
+| holds | product cards, stampede locks | BullMQ jobs, sessions, rate-limit windows |
+| `maxmemory` | 64 MB | 256 MB |
+| `maxmemory-policy` | `allkeys-lru` | `noeviction` |
+| persistence | none | AOF, `appendfsync everysec` |
+| losing a key costs | one query to Postgres | a lost job, a logged-out user, a leaked limit |
+
+**There are two instances because a cache needs `maxmemory` + `allkeys-lru` and BullMQ needs
+`noeviction`, and both settings apply to the whole Redis process.** `SELECT 1` gives you a
+second keyspace with the same memory limit and the same policy, so it does not solve this.
+The demos read both values back over their own connection (`CONFIG GET`), so `cache-lru=1` and
+`queue-noeviction=1` describe the instances they actually talked to. Point the queue at the
+cache and the difference shows up immediately:
+
+```
+$ REDIS_QUEUE_URL=redis://:redis_dev_password@127.0.0.1:56379 node dist/demo-queue.js
+IMPORTANT! Eviction policy is allkeys-lru. It should be "noeviction"
+  FAIL  queue instance never evicts: allkeys-lru
+queue-noeviction=0
+```
+
+**Sessions go into the queue instance, not a third one.** Their requirements match the queue's:
+a session must never be evicted, because LRU would log out whoever was idle longest, and a
+restart should not log everybody out, which AOF covers. A third container would be one more
+thing to run with the same settings. Rate-limit windows are there for the same reason. If they
+lived under LRU, an evicted window would quietly reset a client's count.
+
+## Cache-aside on the product card
+
+The cached read is the product card: the product, its seller's name, the stock, and units and
+orders sold, which is a `LEFT JOIN LATERAL` aggregate over `order_items` joined with `orders`.
+That aggregate gets slower with every checkout, and it is the read a catalogue page repeats
+for every product.
+
+```
+GET card:product:<id>
+  hit   → JSON from Redis, Postgres not touched
+  miss  → SET lock:card:product:<id> <uuid> NX PX 3000
+            won  → GET again (the previous holder may just have filled it)
+                   → SELECT … → SET card:product:<id> <json> EX 300 + random(0..60)
+                   → release: compare-and-delete with our <uuid>
+            lost → poll the key every 20 ms; past the lock's 3 s, read Postgres directly
+```
+
+- **TTL is always set, and it is jittered:** 300 s + `randomInt(0, 61)`. A pass that warms 60
+  keys in one go would otherwise schedule 60 expiries in the same second, and the stampede
+  would come back every five minutes. `ProductCards.invalidate()` exists for a write to call,
+  but it is an extra on top of the TTL and does not replace it. A product that does not exist
+  is cached too, as an absence marker with a 30 s TTL, so a crawler asking for missing ids
+  does not reach Postgres on every request.
+- **The lock is released by its own token only.** The release is a Lua compare-and-delete
+  (`if get == token then del`), which works on any Redis version. `DELEX … IFEQ` does the same
+  natively from 8.4, which the compose image is, but the script does not depend on that. A bare
+  `DEL` from a holder whose lock has already lapsed would delete the lock someone else took
+  in the meantime. Step 5 of the demo shows the case: A's lock lapses, B takes it, A's release
+  removes 0 keys, and B still holds it.
+- **A cache failure is never the user's failure.** Every Redis call in `CacheAside` is wrapped:
+  a failed `GET` is a miss, and a failed `SET` (an `OOM command not allowed` from an instance
+  without eviction, a timeout, a dropped socket) is logged and the value is still returned. If
+  the lock command itself fails, the read goes to Postgres. The cache connection has
+  `maxRetriesPerRequest: 1` and a 500 ms `commandTimeout`, so a Redis that hangs counts as a
+  miss and the request does not wait on it.
+
+`db-calls` is counted by `CountingQueryable`, which sits **under** the repository. Every SQL
+statement the repository sends passes through it, so the number is round trips to Postgres,
+not calls to a function that might or might not reach the database. The loader adds 150 ms
+to the query (`LOAD_DELAY_MS`), standing in for the aggregate on a production-sized
+`order_items`. That makes the stampede window wide enough to see. The lock does not depend on
+it: the double-check under the lock makes `db-calls=1` hold even with no delay.
+
+```
+$ npm run demo:cache
+cache instance: maxmemory-policy allkeys-lru, maxmemory 67108864 bytes
+
+1. warmed 60 cards with 60 queries; TTLs 300..360 s, 40 distinct values
+2. key expired (gone); 50 concurrent reads → 1 query (loaded 1, waited 49)
+3. 100 reads of warm cards → 0 queries (hit 100)
+4. control, lock off: 50 concurrent reads → 50 queries
+5. A's lock lapsed, B took it (true); A's compare-and-delete removed 0 key; B still holds it: true
+
+cache-lru=1
+cache-maxmemory=1
+warmed=60
+ttl-distinct=40
+db-calls-cold=60
+concurrent=50
+db-calls=1
+db-calls-warm=0
+db-calls-without-lock=50
+foreign-lock-kept=1
+```
+
+The key in step 2 really expires (`PEXPIRE 1`, then a check that it is gone) before 50 HTTP
+requests arrive at once. One wins `SET NX` and runs one query; the other 49 wait and get the
+value from the cache. Step 4 is the same burst with `singleFlight: false`, and it costs 50
+queries. `ttl-distinct` changes from run to run (36 and 40 in two runs here, out of 61
+possible values). Without jitter it would be 1.
+
+### If the stampede lock breaks
+
+It can break in two ways. The holder can pause (GC, a page fault, a container being moved)
+for longer than its 3 s lock, so the lock lapses and a second request takes it. Or Redis can
+lose the lock key: a failover to a replica that never saw the write, or a restart of an
+instance that persists nothing. Either way **two requests read the same card from Postgres
+and both write it to the cache.** Both write the same data, the last `SET` wins, and the next
+TTL fixes anything stale. The cost is one extra query, perhaps a few, at the moment the key
+expired. Nothing is corrupted, because the lock never guarded the data. It only guarded how
+many times the database is read. Checking "is the lock still mine?" before the write would not
+make it safe either, because the pause can fall between the check and the write. Only a
+fencing token checked by the store itself closes that gap, and paying for one to save a single
+`SELECT` makes no sense. That is why a plain `SET NX PX` on one Redis is enough here, and why
+it would not be enough for anything whose failure means corrupted state. Stock and balance in
+checkout are protected by an atomic conditional `UPDATE` in Postgres, and the order event by a
+unique key and the inbox. None of them relies on a lock.
+
+## Sessions with a rolling TTL
+
+A session is a hash `sess:<id>` on the queue instance. The id is 256 bits from the CSPRNG
+(`randomBytes(32)`), carried in an `HttpOnly; SameSite=Lax` cookie. Every request through
+`sessionMiddleware` runs one Lua script: if the key exists, increment `hits`, set
+`lastSeenAt`, `EXPIRE` it to the full TTL again, and return the hash. It is one script rather
+than `HGETALL` + `EXPIRE`, because a session that expired between those two commands would
+come back as a hash recreated by `HINCRBY` with no TTL at all, and it would never expire.
+The cookie is re-issued with the same id and a fresh `Max-Age`, so both ends roll together.
+The process keeps nothing in memory.
+
+```
+$ npm run demo:session
+1. pod A (pid 43119): new session VAG5vDV2…, hits 1
+2. after 2 s idle: TTL 57991 ms → request → 59996 ms, hits 2
+   pod A killed with SIGKILL, pod B started (pid 43123)
+3. pod B (pid 43123): same cookie → hits 3, then 4
+   sess:VAG5vDV2… in Redis: true, TTL 60 s of 60
+
+requests=4
+sessions=1
+in-redis=1
+ttl-before-ms=57991
+ttl-after-ms=59996
+ttl-renewed=1
+survived-restart=1
+hits=4
+```
+
+The server runs as a real child process (`dist/pod.js`) and is killed with `SIGKILL`, so nothing
+it held in memory could have been saved. The new process on a new pid finds the same session
+with its counter intact: `hits` goes 1, 2, 3, 4 across the kill. The demo TTL is 60 s
+(`--session-ttl`); the default for a pod is 30 min. The 2 s pause before request 2 is what
+makes `ttl-renewed` mean anything, because without it the TTL would not have had time to drop.
+
+## Rate limit on the shared store
+
+**Model: a sliding-window log, because the point of this limit is to allow no burst.** A fixed
+window lets `2 × limit` through around every reset (5 at 12:00:59 and 5 more at 12:01:00), and
+a token bucket lets a full bucket go at once by design. Here the limit is meant to be a
+hard ceiling over any 10 s span.
+
+The window is a sorted set `rl:<client>`, one member per admitted request, scored by when it
+was admitted. All of it is one Lua script: drop the members older than the window, `ZCARD`,
+and either `ZADD` + `PEXPIRE` or compute `Retry-After` from the oldest member. Unlike the cache
+lock, atomicity here is about correctness. With `ZCARD` and `ZADD` as separate commands,
+another pod gets in between, both see `limit - 1`, both are admitted, and the limit leaks
+exactly when load is high. The script reads the clock with Redis `TIME`, so pods whose clocks
+disagree still share one window. The client is `X-Client-Id` (an API key in practice), falling
+back to the socket address. A rejection is `429` with `Retry-After` in whole seconds, rounded
+up. If Redis is unreachable, the limiter fails open and logs it, so a Redis outage does not
+become an API outage.
+
+```
+$ npm run demo:ratelimit
+pods: pid 43190, pid 43191; limit 5 per 10 s per client
+
+  pod 0 (pid 43190): 3 allowed, 7 blocked
+  pod 1 (pid 43191): 2 allowed, 8 blocked
+  last rejection: 429 Retry-After: 10 s
+
+instances=2
+limit=5
+requests=20
+allowed=5
+blocked=15
+status=429
+retry-after=1
+pods-that-admitted=2
+```
+
+The two pods are separate processes with separate limiter objects; the only thing they share
+is Redis. The 20 requests are sent **concurrently**, alternating between the pods, so the
+atomicity is tested by real interleaving and not by requests taking turns. Exactly 5 get
+through, split between both pods. With the counter in process memory (which is what
+`@nestjs/throttler` does by default), each pod would admit 5, giving `allowed=10` and no 429.
+
+## The queue: BullMQ
+
+One queue, `order-notifications`, on the queue instance, with two kinds of job:
+
+- **`order-placed`**: the confirmation to the buyer for an `order.placed` event, which is the
+  event the outbox relay publishes. Its `jobId` is `order-placed-<eventId>`. The relay delivers
+  at least once, so the same event can be enqueued twice, and the second `add` with the same
+  id does nothing. `attempts: 4`, `backoff: { type: 'exponential', delay: 200, jitter: 0.5 }`.
+  `removeOnComplete: { age: 86400 }` and not `true`: a removed job no longer counts as a
+  duplicate, so `true` would turn deduplication off as soon as the first copy completed.
+- **`recompute-ratings`**: periodic, created by `upsertJobScheduler('recompute-ratings',
+  { every })`. It is an upsert keyed by the scheduler id, so every restart that calls it leaves
+  one scheduler with the latest settings instead of adding another. The repeatable-job API
+  (`repeat`, `getRepeatableJobs`) no longer exists in BullMQ 6.
+
+The worker's connection is opened with `maxRetriesPerRequest: null`, so it waits through a
+Redis outage instead of throwing out of its blocking command. The queue's connection is not:
+on the request path, an `add` should fail fast.
+
+```
+$ npm run demo:queue
+queue instance: maxmemory-policy noeviction
+
+1. add × 2 with jobId order-placed-95d1743a-… → 1 job in the queue (second add returned order-placed-95d1743a-…)
+2. upsertJobScheduler × 2 → 1 scheduler (every 400 ms)
+3. worker started
+   attempt 1: mail provider answered 503
+   attempt 2: mail provider answered 503, 232 ms after the previous one
+   attempt 3: confirmation for order demo sent, 313 ms after the previous one
+   scheduler: 7 runs in 2.5 s
+4. add after completion → job order-placed-95d1743a-… is completed; 1 confirmation job in total
+
+queue-noeviction=1
+attempts=3
+completed=1
+added=2
+queued=1
+schedulers=1
+scheduled-runs=7
+deduped-after-complete=1
+```
+
+The job fails through its data (`failTimes: 2`): the handler throws while `attemptsMade` is
+below it, which stands in for a mail provider answering 503 twice. `attempts` counts how many
+times the handler actually ran. The gaps between attempts grow (≈200 ms, then ≈300–400 ms,
+with jitter and the worker's own polling on top). `queued` is the total across every job state
+after the two adds, before the worker starts. Step 4 is why `removeOnComplete` is an age: the
+same event arriving after the job finished still finds it and is still a duplicate.
+`scheduled-runs` depends on load, because BullMQ creates the next scheduled job only once the
+previous one has been picked up. It was 7 in 2.5 s at 400 ms in both runs here.
+
+## A lock is not idempotency
+
+A lock holds only while it is valid and only while its holder keeps running. The
+idempotent consumer from the outbox homework survives a worker restart and a redelivery,
+because its guarantee is a unique key that Postgres checks on every write. The queue adds a
+second dedup layer (`jobId`) in front of that, not instead of it: a job that sends an email
+and crashes before it is marked complete will run again, so the mail provider call should
+carry the `eventId` as its own idempotency key too.
+
 # The OpenAPI contract in detail
 
 ## What the spec contains
@@ -2298,6 +2602,16 @@ src/relay.ts                      the relay as its own process (JSON lines on st
 src/orders/place-order-once.ts    Idempotency-Key claimed in the same transaction as the order
 src/orders/checkout.http.ts       POST /checkout: 201 / 200 replay / 422 key reused with another body
 src/demo-outbox.ts / demo-crash-write.ts / demo-crash-relay.ts  the three outbox demos
+src/redis/connection.ts           REDIS_URL / REDIS_QUEUE_URL (+ password file) → ioredis, CONFIG GET
+src/cache/cache-aside.ts          cache-aside: jittered TTL, SET NX PX single flight, compare-and-delete
+src/cache/product-cards.ts        the product card behind the cache
+src/repositories/counting.ts      CountingQueryable: statements actually sent to Postgres
+src/sessions/                     Redis hash session store, rolling TTL in one Lua script, cookie middleware
+src/ratelimit/sliding-window.ts   sliding-window log in one Lua script, 429 + Retry-After
+src/queue/notifications.ts        BullMQ queue: attempts + exponential backoff, jobId dedup, job scheduler
+src/pod.ts                        one stateless pod (sessions + limit) as its own process
+src/common/demo-output.ts         key=value report, invariant checks, exit codes — no database import
+src/demo-cache.ts / demo-session.ts / demo-ratelimit.ts / demo-queue.ts  the four Redis demos
 db/init.sql                       products table + seed, run by compose on first start
 test/testkit/                     the container, the rollback isolation and the builders
 test/integration/                 repository tests against a real Postgres
@@ -2320,7 +2634,8 @@ backup.cron                       the nightly schedule, and the weekly drill
 RESTORE-DRILL.md                  the drill protocol: date, size, time, RTO, RPO
 pgbouncer/pgbouncer.ini           transaction pooling + a session-mode alias for pg_dump
 pgbouncer/userlist.txt            SCRAM credentials for the pooler (development values)
-docker-compose.yml                PgBouncer on 56432, Postgres behind it on 55432, RabbitMQ on 5672/15672
+docker-compose.yml                PgBouncer on 56432, Postgres behind it on 55432, RabbitMQ on 5672/15672,
+                                  Redis cache on 56379 (allkeys-lru), Redis queue on 56380 (noeviction + AOF)
 Dockerfile / .dockerignore        image built without secrets in any layer
 .env.example                      the variable contract; .env and secrets/ are ignored
 ```
@@ -2354,6 +2669,8 @@ Nest 11 would pull Express 5 instead.
 | `@pact-foundation/pact` | 17.x |
 | `supertest` | 7.x |
 | `pg` | 8.x |
+| `bullmq` / `ioredis` | 6.x / 5.x (5, not 6: `typeorm` 0.3 has an optional peer on `ioredis@^5`) |
+| `redis` (image) | 8.4-alpine |
 | `typescript` | 5.x |
 
 The build is plain `tsc` (through `nest build`) on purpose: esbuild-based transpilers do not
