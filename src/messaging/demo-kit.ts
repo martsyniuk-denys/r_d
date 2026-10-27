@@ -12,6 +12,8 @@ import type { RelayEvent } from '../relay';
 import { ConsumerEvent } from './order-placed.consumer';
 import { FULFILMENT_DLQ, FULFILMENT_QUEUE, declareTopology } from './topology';
 
+export { Invariants, pause, report, runDemo } from '../common/demo-output';
+
 // What the three broker demos share: a clean slate, a consumer in a child process
 // whose stdout is read line by line, queue depths, and the key=value report.
 
@@ -247,35 +249,7 @@ export class RelayProcess extends JsonProcess<RelayEvent> {
   }
 }
 
-export class Invariants {
-  private readonly failures: string[] = [];
-
-  check(label: string, ok: boolean, detail: string): void {
-    console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${label}: ${detail}`);
-    if (!ok) this.failures.push(label);
-  }
-
-  get broken(): number {
-    return this.failures.length;
-  }
-}
-
-export function report(values: Record<string, number | string>): void {
-  for (const [key, value] of Object.entries(values)) console.log(`${key}=${value}`);
-}
-
-export function runDemo(main: () => Promise<number>): void {
-  main()
-    .then((code) => process.exit(code))
-    .catch((error: unknown) => {
-      console.error(error instanceof Error ? error.message : error);
-      process.exit(1);
-    });
-}
-
 export async function countOf(dataSource: DataSource, sql: string, parameters: unknown[]): Promise<number> {
   const [{ count }]: { count: string }[] = await dataSource.query(sql, parameters);
   return Number(count);
 }
-
-export const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

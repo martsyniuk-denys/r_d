@@ -56,6 +56,65 @@ services:
       retries: 30
       start_period: 15s
 
+  # Two Redis instances, because a cache and a queue want opposite settings of
+  # the same process-wide knob. maxmemory and maxmemory-policy belong to the whole
+  # instance — SELECT 1 does not split them — so one container cannot be both.
+  #
+  # The cache: bounded memory, and when it is full the least recently used key
+  # goes. Losing a key costs one trip to Postgres. No RDB, no AOF: a cache that
+  # comes back empty after a restart is still a correct cache.
+  redis-cache:
+    image: redis:8.4-alpine
+    container_name: marketplace-redis-cache
+    command:
+      - redis-server
+      - --requirepass
+      - redis_dev_password
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ''
+      - --appendonly
+      - 'no'
+    ports:
+      - '56379:6379'
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a redis_dev_password --no-auth-warning ping | grep -q PONG']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # The queue, and everything else that must not vanish on its own: BullMQ jobs,
+  # sessions and rate-limit windows. noeviction makes a full instance refuse writes
+  # loudly instead of silently dropping a job or logging somebody out; AOF with an
+  # fsync every second bounds what a crash can lose to about one second of writes.
+  redis-queue:
+    image: redis:8.4-alpine
+    container_name: marketplace-redis-queue
+    command:
+      - redis-server
+      - --requirepass
+      - redis_dev_password
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+    ports:
+      - '56380:6379'
+    volumes:
+      - redisqueuedata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a redis_dev_password --no-auth-warning ping | grep -q PONG']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   pact-broker-db:
     image: postgres:16-alpine
     container_name: marketplace-pact-broker-db
@@ -105,3 +164,4 @@ volumes:
   pgdata:
   pactbrokerdata:
   rabbitmqdata:
+  redisqueuedata:

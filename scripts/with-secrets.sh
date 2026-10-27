@@ -29,7 +29,8 @@ if [ ! -f "$CREDS" ]; then
   echo "with-secrets: no store for '$ENV_SLUG' — $CREDS is missing." >&2
   echo "  local setup: cp .env.example .env && cp secrets/db_password.example secrets/db_password" >&2
   echo "               (broker: uncomment BROKER_URL in .env, cp secrets/broker_password.example secrets/broker_password)" >&2
-  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL SKIP_VAULT=1" >&2
+  echo "               (redis: uncomment REDIS_URL/REDIS_QUEUE_URL in .env, cp secrets/redis_password.example secrets/redis_password)" >&2
+  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL SKIP_VAULT=1" >&2
   exit 1
 fi
 
