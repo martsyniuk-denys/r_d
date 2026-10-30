@@ -37,7 +37,8 @@ if [ ! -f "$CREDS" ]; then
   echo "               (broker: uncomment BROKER_URL in .env, cp secrets/broker_password.example secrets/broker_password)" >&2
   echo "               (redis: uncomment REDIS_URL/REDIS_QUEUE_URL in .env, cp secrets/redis_password.example secrets/redis_password)" >&2
   echo "               (tokens: node scripts/jwt-keys.mjs generate $ENV_SLUG)" >&2
-  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER SKIP_VAULT=1" >&2
+  echo "               (files: STORAGE_* in .env, cp secrets/storage_secret_key.example secrets/storage_secret_key)" >&2
+  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* SKIP_VAULT=1" >&2
   exit 1
 fi
 
@@ -56,6 +57,18 @@ fi
 
 DB_PASSWORD="$(tr -d '\r\n' < "$PASSWORD_FILE")"
 export DB_PASSWORD
+
+# The object-storage secret key lives in a file next to db_password, named by
+# STORAGE_SECRET_KEY_FILE in the env file, and is exported as STORAGE_SECRET_KEY.
+if [ -n "${STORAGE_SECRET_KEY_FILE:-}" ]; then
+  if [ ! -f "$STORAGE_SECRET_KEY_FILE" ]; then
+    echo "with-secrets: $CREDS points at $STORAGE_SECRET_KEY_FILE, which is missing." >&2
+    echo "  cp secrets/storage_secret_key.example secrets/storage_secret_key" >&2
+    exit 1
+  fi
+  STORAGE_SECRET_KEY="$(tr -d '\r\n' < "$STORAGE_SECRET_KEY_FILE")"
+  export STORAGE_SECRET_KEY
+fi
 
 case "$ENV_SLUG" in
   dev|development) JWT_DIR="$ROOT/secrets/jwt/dev" ;;

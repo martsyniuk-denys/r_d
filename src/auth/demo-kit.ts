@@ -92,12 +92,20 @@ export class Api {
     readonly url: string,
   ) {}
 
+  get port(): number {
+    return Number(new URL(this.url).port);
+  }
+
   // The same entry point as npm run start, with the environment this demo was
   // started with — which is the store's, through scripts/with-secrets.sh.
-  static async start(): Promise<Api> {
-    const port = await freePort();
+  // `avoid`: ports this demo already used. A second start on the same port would
+  // meet a dead keep-alive socket in fetch's connection pool and hang.
+  static async start(options: { avoid?: number[]; env?: Record<string, string> } = {}): Promise<Api> {
+    const avoid = options.avoid ?? [];
+    let port = await freePort();
+    while (avoid.includes(port)) port = await freePort();
     const child = spawn(process.execPath, [join(__dirname, '..', 'main.js')], {
-      env: { ...process.env, PORT: String(port), NO_COLOR: '1' },
+      env: { ...process.env, ...options.env, PORT: String(port), NO_COLOR: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     live.add(child);

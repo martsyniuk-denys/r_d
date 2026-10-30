@@ -40,6 +40,8 @@ tags:
     description: Marketplace product catalogue.
   - name: orders
     description: Customer orders.
+  - name: files
+    description: Two-step uploads straight into object storage, and short-lived downloads.
   - name: ops
     description: Operational endpoints used by probes and deployment tooling.
 
@@ -155,6 +157,165 @@ paths:
                 $ref: '#/components/schemas/Me'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /uploads/intent:
+    post:
+      operationId: createUploadIntent
+      summary: Start an upload — the API signs, the client sends the bytes to storage
+      description: |
+        Validates `content_type` against an allowlist, generates the object key
+        itself (`uploads/{userId}/{uuid}.{ext}` — the client's `filename` is never
+        part of it) and records a PENDING file. Up to 10 MiB the answer is one
+        presigned PUT (5 minutes, Content-Type and Content-Length signed); above,
+        a multipart upload with one presigned URL per part (15 minutes). The bytes
+        never pass through this API. Idempotent on `Idempotency-Key`, per user.
+      tags: [files]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Client-generated replay key, one per upload intent. The same key with the
+            same body returns the same intent (the same file id and URLs) instead of a
+            second PENDING row; with a different body it is 422.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 255
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadIntentRequest'
+      responses:
+        '200':
+          description: Where and how to send the bytes.
+          headers:
+            Idempotency-Replay:
+              $ref: '#/components/headers/IdempotencyReplay'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadIntent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/IdempotencyKeyReuse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /uploads/{fileId}/parts:
+    parameters:
+      - name: fileId
+        in: path
+        required: true
+        description: File identifier from the intent.
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getUploadParts
+      summary: Resume a multipart upload
+      description: |
+        Asks storage which parts it already holds (ListParts) and returns fresh
+        presigned URLs for the missing ones only. A restarted client calls this and
+        uploads what is left, not the whole file.
+      tags: [files]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Parts already in storage, and URLs for the rest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadParts'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /uploads/commit:
+    post:
+      operationId: commitUpload
+      summary: Finish an upload
+      description: |
+        Completes a multipart upload from the parts storage lists, then checks with
+        HeadObject that the object exists and has the declared size. Only then is
+        the file COMPLETED; nothing uploaded, a part missing or a size mismatch is
+        409. Committing a completed file again returns it unchanged.
+      tags: [files]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadCommitRequest'
+      responses:
+        '200':
+          description: The committed file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredFile'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /files/{fileId}:
+    parameters:
+      - name: fileId
+        in: path
+        required: true
+        description: File identifier.
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: downloadFile
+      summary: Download a file of yours
+      description: |
+        Checks the token and the owner on every call, then redirects to a presigned
+        GET that lives 60 seconds. The API is on the authorization path, not on the
+        data path; a link in an email points here, never at storage.
+      tags: [files]
+      security:
+        - bearerAuth: []
+      responses:
+        '302':
+          description: Redirect to a short-lived presigned URL.
+          headers:
+            Location:
+              description: The presigned URL.
+              schema:
+                type: string
+                format: uri
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -624,6 +785,19 @@ components:
             detail: Order 'o_1' does not belong to user '42'.
             instance: /orders/o_1
 
+    Conflict:
+      description: The upload is not in a state that allows this (nothing uploaded, parts missing, size mismatch).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/upload-incomplete
+            title: Conflict
+            status: 409
+            detail: Nothing was uploaded for file '3f0c…' yet.
+            instance: /uploads/commit
+
     InternalServerError:
       description: Internal server error.
       content:
@@ -732,6 +906,137 @@ components:
         expires_at:
           type: string
           format: date-time
+
+    UploadIntentRequest:
+      type: object
+      additionalProperties: false
+      required: [filename, content_type, size]
+      properties:
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Informational only. It never becomes part of the object key.
+        content_type:
+          type: string
+          enum: [image/jpeg, image/png, image/webp, application/pdf, video/mp4]
+        size:
+          type: integer
+          minimum: 1
+          maximum: 5368709120
+          description: Bytes. Signed into a single PUT, and compared with the object at commit.
+
+    PartUrl:
+      type: object
+      required: [part_number, url]
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        url:
+          type: string
+          format: uri
+
+    UploadIntent:
+      type: object
+      required: [file_id, key, mode, expires_in]
+      description: |
+        `mode: single` carries `url`, `method` and `headers` for one PUT; `mode:
+        multipart` carries `part_size`, `part_count` and one URL per part.
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+          example: uploads/42/0b6c1d1e-5d0f-4b5e-9a39-0e7c2a3b6f10.png
+        mode:
+          type: string
+          enum: [single, multipart]
+        url:
+          type: string
+          format: uri
+        method:
+          type: string
+          enum: [PUT]
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        part_size:
+          type: integer
+          minimum: 5242880
+        part_count:
+          type: integer
+          minimum: 2
+          maximum: 10000
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartUrl'
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Lifetime of the URLs, in seconds.
+
+    UploadParts:
+      type: object
+      required: [file_id, part_size, part_count, uploaded, missing, expires_in]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        part_size:
+          type: integer
+        part_count:
+          type: integer
+        uploaded:
+          type: array
+          items:
+            type: object
+            required: [part_number, size]
+            properties:
+              part_number:
+                type: integer
+              size:
+                type: integer
+        missing:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartUrl'
+        expires_in:
+          type: integer
+
+    UploadCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [file_id]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+
+    StoredFile:
+      type: object
+      required: [file_id, key, status, content_type, size, etag]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+        status:
+          type: string
+          enum: [PENDING, COMPLETED]
+        content_type:
+          type: string
+        size:
+          type: integer
+        etag:
+          type: string
+          nullable: true
+          description: As storage reports it. For a multipart object it ends in `-<parts>` and is not the MD5 of the file.
 
     Health:
       type: object

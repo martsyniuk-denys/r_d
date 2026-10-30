@@ -7,5 +7,6 @@ export { OutboxMessage } from './outbox-message.entity';
 export { ProcessedMessage } from './processed-message.entity';
 export { RefreshToken } from './refresh-token.entity';
 export { RevokedAccessToken } from './revoked-access-token.entity';
+export { FILE_STATUSES, FileStatus, StoredFile } from './stored-file.entity';
 export { CURRENCIES, Currency, Product, PRODUCT_STATUSES, ProductStatus } from './product.entity';
 export { User, USER_ROLES, UserRole } from './user.entity';

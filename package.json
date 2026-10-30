@@ -2,7 +2,7 @@
   "name": "marketplace-api-contract",
   "version": "1.0.0",
   "private": true,
-  "description": "Marketplace API coursework: OpenAPI contract, typed config, SQL data layer a TypeORM layer with migrations, and JWT auth with refresh-token rotation",
+  "description": "Marketplace API coursework: OpenAPI contract, typed config, SQL data layer a TypeORM layer with migrations, JWT auth with refresh-token rotation, and direct-to-storage uploads behind an edge cache",
   "main": "dist/main.js",
   "scripts": {
     "build": "nest build",
@@ -36,6 +36,10 @@
     "demo:auth": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-auth.js",
     "demo:reuse": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-reuse.js",
     "demo:rbac": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-rbac.js",
+    "demo:upload": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-upload.js",
+    "demo:multipart": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-multipart.js",
+    "demo:cdn": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-cdn.js",
+    "edge": "bash scripts/with-secrets.sh dev node dist/edge.js",
     "jwt:keys": "node scripts/jwt-keys.mjs",
     "pod": "bash scripts/with-secrets.sh dev node dist/pod.js",
     "lint": "redocly lint openapi/openapi.yaml",
@@ -53,6 +57,8 @@
     "db:psql": "docker compose exec postgres psql -U marketplace -d marketplace"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1160.0",
+    "@aws-sdk/s3-request-presigner": "^3.1160.0",
     "@nestjs/common": "^10.4.22",
     "@nestjs/config": "^3.3.0",
     "@nestjs/core": "^10.4.22",

@@ -115,6 +115,29 @@ services:
       timeout: 3s
       retries: 20
 
+  # Object storage: an S3-compatible server, private by default — an anonymous GET
+  # is 403. RustFS rather than MinIO because MinIO no longer publishes images; the
+  # S3 API is the same, so the code only knows an endpoint. The bucket is created
+  # by the code (ensureBucket in src/storage/s3.ts), not here, so `up --wait` has no
+  # one-shot container to trip over. Data lives in a named volume, not tmpfs: the
+  # demos clean up after themselves, and a tmpfs that is too small kills the
+  # server in the middle of a run.
+  storage:
+    image: rustfs/rustfs:1.0.4
+    container_name: marketplace-storage
+    environment:
+      RUSTFS_ACCESS_KEY: marketplace
+      RUSTFS_SECRET_KEY: marketplace_dev_storage_password
+    ports:
+      - '59000:9000'
+    volumes:
+      - storagedata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:9000/health || exit 1']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   pact-broker-db:
     image: postgres:16-alpine
     container_name: marketplace-pact-broker-db
@@ -165,3 +188,4 @@ volumes:
   pactbrokerdata:
   rabbitmqdata:
   redisqueuedata:
+  storagedata:

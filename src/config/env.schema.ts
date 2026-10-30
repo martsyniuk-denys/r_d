@@ -2,6 +2,8 @@ import { createPrivateKey, createPublicKey, KeyObject } from 'node:crypto';
 
 import { z } from 'zod';
 
+import { PUT_URL_TTL_SECONDS } from '../files/upload-plan';
+
 // A PEM travels through the environment base64-encoded: a multi-line export does
 // not survive every shell and CI runner, and the reward for trying is
 // "error:1E08010C:DECODER routines::unsupported" on the first signature.
@@ -51,6 +53,7 @@ export const STORE_VARIABLES = [
   'REFRESH_TOKEN_PEPPER',
   'JWT_PREVIOUS_PUBLIC_KEY',
   'JWT_PREVIOUS_KID',
+  'STORAGE_SECRET_KEY',
 ] as const;
 
 export const envSchema = z.object({
@@ -107,6 +110,28 @@ export const envSchema = z.object({
   JWT_ACCESS_TTL_SECONDS: z.coerce.number().int().min(30).max(3600).default(600),
 
   REFRESH_TTL_SECONDS: z.coerce.number().int().min(60).default(30 * 24 * 3600),
+
+  // Object storage. An empty endpoint means AWS S3 itself; anything else is an
+  // S3-compatible server (RustFS in compose) addressed path-style.
+  STORAGE_ENDPOINT: z
+    .string()
+    .url({ message: 'must be a URL such as http://127.0.0.1:59000, or unset for AWS S3' })
+    .optional(),
+
+  STORAGE_REGION: z.string().min(1).default('us-east-1'),
+
+  STORAGE_BUCKET: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/, { message: 'must be a valid S3 bucket name' }),
+
+  STORAGE_ACCESS_KEY: z.string().min(3),
+
+  // Lifetime of a presigned single PUT. 300 s is the decision (see upload-plan.ts);
+  // the variable exists so demo:upload can watch the same URL expire in seconds.
+  UPLOAD_PUT_TTL_SECONDS: z.coerce.number().int().min(1).max(3600).default(PUT_URL_TTL_SECONDS),
+
+  // Read and write on every file of the bucket: from the store, no default.
+  STORAGE_SECRET_KEY: z.string().min(8, { message: 'must be at least 8 characters' }),
 });
 
 export type Env = z.infer<typeof envSchema>;
