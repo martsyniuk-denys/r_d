@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 
+import { Principal } from '../auth/principal';
 import { Page, paginate } from '../common/cursor';
 import { ProductsService } from '../products/products.service';
 import { OrderEventsService, OrderStatus } from '../realtime/order-events.service';
@@ -35,8 +36,12 @@ export class OrdersService {
     private readonly events: OrderEventsService,
   ) {}
 
-  list(limit: number, cursor?: string): Page<Order> {
-    return paginate(this.orders, limit, cursor);
+  // Ownership in the read itself — the in-memory equivalent of WHERE buyer_id = $1.
+  // An admin reads every order.
+  listFor(principal: Principal, limit: number, cursor?: string): Page<Order> {
+    const visible =
+      principal.role === 'admin' ? this.orders : this.orders.filter((o) => o.buyer_id === principal.userId);
+    return paginate(visible, limit, cursor);
   }
 
   get(id: string): Order | undefined {

@@ -1,3 +1,4 @@
+import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,4 +45,16 @@ export function appEnvFromContainer(): void {
   process.env.DB_PASSWORD_FILE = passwordFile;
   process.env.NODE_ENV = 'test';
   process.env.LOG_LEVEL = 'error';
+
+  // A throwaway ES256 pair per run, the same shape the store exports: the suite
+  // never sees, and never needs, a real signing key.
+  const { privateKey, publicKey } = generateKeyPairSync('ec', {
+    namedCurve: 'P-256',
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  });
+  process.env.JWT_PRIVATE_KEY = Buffer.from(privateKey).toString('base64');
+  process.env.JWT_PUBLIC_KEY = Buffer.from(publicKey).toString('base64');
+  process.env.JWT_KID = 'test';
+  process.env.REFRESH_TOKEN_PEPPER = randomBytes(24).toString('base64url');
 }

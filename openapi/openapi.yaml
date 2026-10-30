@@ -12,6 +12,11 @@ info:
       * every 4xx/5xx error is `application/problem+json` (RFC 9457).
 
     Money is always integer minor units (`*_cents`), never a float and never a decimal string.
+
+    Authentication (homework 24): `POST /auth/login` returns a short-lived ES256 access
+    token and an opaque refresh token. Operations that declare `bearerAuth` answer
+    401 without a valid access token and 403 when the token is valid but the caller
+    may not do this (wrong role, or somebody else's order).
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -23,11 +28,14 @@ servers:
   - url: http://localhost:3000
     description: Local development server
 
-# The API deliberately has no authentication in v1.
-# The explicit empty array satisfies the redocly `security-defined` rule.
+# Public by default (the catalogue, health, login and refresh); every protected
+# operation names `bearerAuth` itself. The explicit empty array satisfies the
+# redocly `security-defined` rule.
 security: []
 
 tags:
+  - name: auth
+    description: Login, refresh-token rotation and logout.
   - name: products
     description: Marketplace product catalogue.
   - name: orders
@@ -52,6 +60,101 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Health'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/login:
+    post:
+      operationId: login
+      summary: Log in with email and password
+      description: |
+        Starts a new token family: one access token (JWT, ES256, short-lived) and one
+        opaque refresh token. Unknown email and wrong password are the same 401.
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: A new token pair.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/refresh:
+    post:
+      operationId: refreshTokens
+      summary: Exchange a refresh token for a new pair
+      description: |
+        Rotation: every successful call returns a new pair and retires the refresh
+        token it was given. Presenting a retired refresh token again is treated as
+        theft — the whole family is revoked, including the newest token, and the
+        call is 401. Clients must serialise refreshes (one in flight at a time).
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: A new token pair; the refresh token sent is now used.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: End the session
+      description: |
+        Two effects in one transaction: the refresh-token family of this session is
+        revoked, and this access token's `jti` is denylisted until its `exp`.
+      tags: [auth]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Both tokens of the session are dead.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/me:
+    get:
+      operationId: getMe
+      summary: Who the access token says the caller is
+      tags: [auth]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The verified claims of the access token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -100,8 +203,13 @@ paths:
     post:
       operationId: createProduct
       summary: Create a product
-      description: Creates a new product in the catalogue. The operation is idempotent on the `Idempotency-Key` header.
+      description: |
+        Creates a new product in the catalogue, sold by the caller. Only the `seller`
+        and `admin` roles may; a buyer's valid token is 403. The operation is
+        idempotent on the `Idempotency-Key` header.
       tags: [products]
+      security:
+        - bearerAuth: []
       parameters:
         - name: Idempotency-Key
           in: header
@@ -137,6 +245,10 @@ paths:
                 $ref: '#/components/schemas/Product'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '422':
           $ref: '#/components/responses/IdempotencyKeyReuse'
         '500':
@@ -176,9 +288,12 @@ paths:
       operationId: listOrders
       summary: List orders (cursor pagination)
       description: |
-        Returns a page of orders. The next page is requested from the same URL
-        with the `cursor` value returned as `next_cursor` by the previous response.
+        Returns a page of the caller's own orders (every order, for an admin). The
+        next page is requested from the same URL with the `cursor` value returned as
+        `next_cursor` by the previous response.
       tags: [orders]
+      security:
+        - bearerAuth: []
       parameters:
         - name: limit
           in: query
@@ -210,6 +325,8 @@ paths:
                 $ref: '#/components/schemas/OrderPage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -219,8 +336,11 @@ paths:
       description: |
         Creates an order from catalogue items. Line prices and `total_cents` are
         computed by the server — the client sends only `product_id` and `qty`.
-        The operation is idempotent on the `Idempotency-Key` header.
+        The buyer is the subject of the access token. The operation is idempotent
+        on the `Idempotency-Key` header, per buyer.
       tags: [orders]
+      security:
+        - bearerAuth: []
       parameters:
         - name: Idempotency-Key
           in: header
@@ -256,6 +376,8 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
@@ -276,8 +398,12 @@ paths:
     get:
       operationId: getOrder
       summary: Get an order by identifier
-      description: Returns a single order together with its line items.
+      description: |
+        Returns a single order together with its line items. Only its buyer (or an
+        admin) may read it; anybody else's valid token is 403.
       tags: [orders]
+      security:
+        - bearerAuth: []
       responses:
         '200':
           description: Order found.
@@ -287,6 +413,10 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -302,16 +432,6 @@ paths:
           type: string
           minLength: 1
         example: o_1
-      - name: X-User-Id
-        in: header
-        required: false
-        description: |
-          Identity of the caller. Required only for an order that has a `buyer_id`;
-          an order created without this header has none and is public.
-        schema:
-          type: string
-          minLength: 1
-        example: u_demo
     patch:
       operationId: updateOrderStatus
       summary: Change the status of an order
@@ -322,8 +442,11 @@ paths:
         gets it as an SSE frame — one write, two transports.
 
         Transitions are not restricted: any status in the enum may be written, and
-        each accepted write is one event with the next sequence number.
+        each accepted write is one event with the next sequence number. Only the
+        buyer of the order (or an admin) may write it.
       tags: [orders]
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -339,6 +462,8 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -356,25 +481,6 @@ paths:
           type: string
           minLength: 1
         example: o_1
-      - name: userId
-        in: query
-        required: false
-        description: |
-          Identity of the caller, for clients that cannot set headers — the browser
-          `EventSource` constructor takes a URL and nothing else. `X-User-Id` wins
-          when both are present.
-        schema:
-          type: string
-          minLength: 1
-        example: u_demo
-      - name: X-User-Id
-        in: header
-        required: false
-        description: Identity of the caller. Only an order with a `buyer_id` requires one.
-        schema:
-          type: string
-          minLength: 1
-        example: u_demo
       - name: Last-Event-ID
         in: header
         required: false
@@ -394,8 +500,12 @@ paths:
         Long-lived `text/event-stream` response. Each status change arrives as one
         SSE frame with `id:` (the per-order sequence number), `event: order.status`
         and a JSON `data:` payload. The first line of the stream is `retry: 1000`,
-        which sets the client's reconnect delay.
+        which sets the client's reconnect delay. Needs the access token in the
+        `Authorization` header, so it is read with a fetch-based SSE client — the
+        browser `EventSource` cannot send one, and a token in the URL ends up in logs.
       tags: [orders]
+      security:
+        - bearerAuth: []
       responses:
         '200':
           description: The event stream. Stays open until the client disconnects.
@@ -412,6 +522,8 @@ paths:
                   data: {"id":4,"order_id":"o_1","status":"paid","previous_status":"created","changed_at":"2026-09-30T20:15:04.000Z"}
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -420,6 +532,15 @@ paths:
           $ref: '#/components/responses/InternalServerError'
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token from `POST /auth/login` or `POST /auth/refresh`: a JWT signed
+        with ES256, valid for `expires_in` seconds, revocable by `POST /auth/logout`.
+
   headers:
     IdempotencyReplay:
       description: Present with the value `true` when the response was replayed for a previously used `Idempotency-Key`.
@@ -467,8 +588,31 @@ components:
             detail: Idempotency-Key '6f1f8f4e...' was already used with a different request body.
             instance: /orders
 
+    Unauthorized:
+      description: |
+        No access token, or one that is malformed, wrongly signed, expired or revoked
+        (for the refresh endpoint: a refresh token that is unknown, used or revoked).
+        The client should refresh, or log in again.
+      headers:
+        WWW-Authenticate:
+          description: '`Bearer realm="marketplace"` on protected operations (RFC 6750).'
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://marketplace.example/problems/unauthorized
+            title: Unauthorized
+            status: 401
+            detail: The access token is missing, expired, revoked or invalid.
+            instance: /orders/o_1
+
     Forbidden:
-      description: The order belongs to another user, or the request carries no identity at all.
+      description: |
+        The caller is authenticated, and may not do this: the role does not allow it,
+        or the order belongs to another user. Refreshing the token will not help.
       content:
         application/problem+json:
           schema:
@@ -477,8 +621,8 @@ components:
             type: https://marketplace.example/problems/forbidden
             title: Forbidden
             status: 403
-            detail: Order 'o_1' does not belong to 'u_intruder'.
-            instance: /orders/o_1/events
+            detail: Order 'o_1' does not belong to user '42'.
+            instance: /orders/o_1
 
     InternalServerError:
       description: Internal server error.
@@ -522,6 +666,72 @@ components:
           type: string
           description: Reference to this specific occurrence (the request path that caused it).
           example: /orders
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          minLength: 3
+          maxLength: 254
+          example: buyer@example.com
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          format: password
+
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: The opaque refresh token from the last login or refresh.
+
+    TokenPair:
+      type: object
+      required: [token_type, access_token, expires_in, refresh_token, refresh_expires_in]
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+        access_token:
+          type: string
+          description: JWT (ES256) with `sub`, `role`, `sid` (token family), `jti`, `iss`, `aud`, `exp`.
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Lifetime of the access token, in seconds.
+          example: 600
+        refresh_token:
+          type: string
+          description: Opaque, single-use. Not a JWT — there is nothing in it to decode.
+        refresh_expires_in:
+          type: integer
+          minimum: 1
+          description: Lifetime of the refresh token, in seconds.
+          example: 2592000
+
+    Me:
+      type: object
+      required: [user_id, role, expires_at]
+      properties:
+        user_id:
+          type: string
+          example: '42'
+        role:
+          type: string
+          enum: [buyer, seller, admin]
+          description: The role as of the token's issue — a cached copy, not a live read.
+        expires_at:
+          type: string
+          format: date-time
 
     Health:
       type: object
@@ -628,11 +838,10 @@ components:
           type: string
           nullable: true
           description: |
-            Who the order belongs to, taken from the `X-User-Id` header at creation.
-            `null` means the order was created anonymously: it has no owner, so its
-            realtime stream is public. An order with a `buyer_id` is private — the
-            WebSocket room and the SSE stream both require a matching identity.
-          example: u_demo
+            Who the order belongs to: the subject of the access token that created
+            it. Only this user (or an admin) may read the order, change its status,
+            or listen to its WebSocket room and SSE stream.
+          example: '42'
         currency:
           type: string
           enum: [UAH, USD, EUR]

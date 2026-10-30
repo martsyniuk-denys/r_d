@@ -1,7 +1,11 @@
 import { io } from 'socket.io-client';
 
 const BASE = process.env.BASE_URL ?? 'http://localhost:3000';
-const USER = process.env.DEMO_USER_ID ?? 'u_demo';
+// Two seeded buyers (npm run seed): the owner of both orders, and somebody else.
+// The password is the seed's dev fixture, overridable for a differently seeded database.
+const OWNER = process.env.DEMO_OWNER_EMAIL ?? 'olena.kovalenko@example.com';
+const INTRUDER = process.env.DEMO_INTRUDER_EMAIL ?? 'andrii.shevchenko@example.com';
+const PASSWORD = process.env.DEMO_PASSWORD ?? 'marketplace-dev-password';
 const SETTLE_MS = Number(process.env.DEMO_SETTLE_MS ?? 750);
 const ACK_TIMEOUT_MS = 5000;
 
@@ -12,11 +16,12 @@ const SAME_ROOM = process.argv.includes('--same-room');
 
 const log = (...args) => console.error(...args);
 
-async function api(method, path, { body, headers } = {}) {
+async function api(method, path, { body, headers, token } = {}) {
   const res = await fetch(BASE + path, {
     method,
     headers: {
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }),
       ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -37,22 +42,27 @@ async function firstProductId() {
   return page.items[0].id;
 }
 
-async function createOrder(productId, label) {
+async function login(email) {
+  const pair = await api('POST', '/auth/login', { body: { email, password: PASSWORD } });
+  return pair.access_token;
+}
+
+async function createOrder(token, productId, label) {
   const order = await api('POST', '/orders', {
+    token,
     body: { items: [{ product_id: productId, qty: 1 }] },
     headers: {
       'Idempotency-Key': `realtime-demo-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      'X-User-Id': USER,
     },
   });
   log(`  order ${label}: ${order.id} (buyer ${order.buyer_id}, status ${order.status})`);
   return order.id;
 }
 
-function connect(userId) {
+function connect(token) {
   const socket = io(BASE, {
     transports: ['websocket'],
-    auth: userId === null ? {} : { userId },
+    auth: token === null ? {} : { token },
     reconnection: false,
   });
 
@@ -93,9 +103,12 @@ async function main() {
   log(`Realtime room-isolation demo → ${BASE}`);
   log(`Mode: ${SAME_ROOM ? 'CONTROL — both clients in order A' : 'MAIN — one client per order'}\n`);
 
+  const owner = await login(OWNER);
+  const intruderToken = await login(INTRUDER);
+
   const productId = await firstProductId();
-  const orderA = await createOrder(productId, 'a');
-  const orderB = await createOrder(productId, 'b');
+  const orderA = await createOrder(owner, productId, 'a');
+  const orderB = await createOrder(owner, productId, 'b');
 
   const roomB = SAME_ROOM ? orderA : orderB;
   const expectedB = SAME_ROOM ? 1 : 0;
@@ -105,15 +118,15 @@ async function main() {
   const anonymousAck = await join(anonymous, orderA);
   log(`    anonymous join   → ${JSON.stringify(anonymousAck)}`);
 
-  const intruder = await connect('u_intruder');
+  const intruder = await connect(intruderToken);
   const intruderAck = await join(intruder, orderA);
   log(`    foreign user     → ${JSON.stringify(intruderAck)}`);
 
   anonymous.close();
   intruder.close();
 
-  const clientA = await connect(USER);
-  const clientB = await connect(USER);
+  const clientA = await connect(owner);
+  const clientB = await connect(owner);
   const eventsA = collect(clientA);
   const eventsB = collect(clientB);
 
@@ -131,7 +144,7 @@ async function main() {
   log(`\n  PATCH /orders/${orderA}/status {"status":"paid"}`);
   await api('PATCH', `/orders/${orderA}/status`, {
     body: { status: 'paid' },
-    headers: { 'X-User-Id': USER },
+    token: owner,
   });
 
   await sleep(SETTLE_MS);

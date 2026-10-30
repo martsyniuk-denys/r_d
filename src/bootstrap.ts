@@ -25,6 +25,9 @@ export async function configureApp(app: NestExpressApplication): Promise<NestExp
       validateRequests: true,
       validateResponses: true,
       validateApiSpec: true,
+      // Authentication is the guards' job, not the validator's: one place decides
+      // 401 vs 403, and a missing header is not answered differently from a bad token.
+      validateSecurity: false,
     }),
   );
 

@@ -4,7 +4,7 @@ import { Pool } from 'pg';
 import { Page, decodeCursor, encodeCursor } from '../common/cursor';
 import { notFound } from '../common/problem';
 import { PG_POOL } from '../db/database.module';
-import { ProductRecord, ProductsRepository, UsersRepository } from '../repositories';
+import { ProductRecord, ProductsRepository } from '../repositories';
 
 export interface Product {
   id: string;
@@ -36,11 +36,9 @@ const toInternalId = (publicId: string): string | null => {
 @Injectable()
 export class ProductsService {
   private readonly products: ProductsRepository;
-  private readonly users: UsersRepository;
 
   constructor(@Inject(PG_POOL) pool: Pool) {
     this.products = new ProductsRepository(pool);
-    this.users = new UsersRepository(pool);
   }
 
   async list(limit: number, cursor?: string): Promise<Page<Product>> {
@@ -61,10 +59,8 @@ export class ProductsService {
     return toProduct(record);
   }
 
-  async create(input: CreateProduct): Promise<Product> {
-    const sellerId = await this.users.firstId();
-    if (sellerId === null) throw new Error('No seller in the database — run npm run seed first.');
-
+  // The seller is the authenticated caller, never "the first user in the table".
+  async create(input: CreateProduct, sellerId: string): Promise<Product> {
     const record = await this.products.insert({
       sellerId,
       name: input.title,

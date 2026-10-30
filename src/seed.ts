@@ -2,8 +2,9 @@ import 'reflect-metadata';
 
 import { EntityManager } from 'typeorm';
 
+import { hashPassword } from './auth/password';
 import { AppDataSource } from './data-source';
-import { Currency, Order, OrderItem, OrderStatus, Product, ProductStatus, User } from './entities';
+import { Currency, Order, OrderItem, OrderStatus, Product, ProductStatus, User, UserRole } from './entities';
 
 interface UserFixture {
   email: string;
@@ -11,6 +12,7 @@ interface UserFixture {
   country: string;
   balanceMinor: number;
   createdAt: string;
+  role: UserRole;
 }
 
 interface ProductFixture {
@@ -34,15 +36,20 @@ interface OrderFixture {
 
 export const BUYER_BALANCE_MINOR = 50_000_000;
 
+// Every fixture account logs in with this password. It is a dev fixture of the
+// same kind as the compose credentials — it opens a local seeded database and
+// nothing else — and it is what scripts/realtime-demo.mjs logs in with.
+export const SEED_PASSWORD = 'marketplace-dev-password';
+
 const USERS: UserFixture[] = [
-  { email: 'leader.shoes@example.com', displayName: 'Лідер Взуття', country: 'UA', balanceMinor: 0, createdAt: '2025-01-10T08:00:00Z' },
-  { email: 'comfort.shoes@example.com', displayName: 'Комфорт Шуз', country: 'UA', balanceMinor: 0, createdAt: '2025-01-11T08:00:00Z' },
-  { email: 'style.market@example.com', displayName: 'Стиль Маркет', country: 'PL', balanceMinor: 0, createdAt: '2025-01-12T08:00:00Z' },
-  { email: 'practic.sport@example.com', displayName: 'Практик Спорт', country: 'DE', balanceMinor: 0, createdAt: '2025-01-13T08:00:00Z' },
-  { email: 'olena.kovalenko@example.com', displayName: 'Олена Коваленко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-01T08:00:00Z' },
-  { email: 'andrii.shevchenko@example.com', displayName: 'Андрій Шевченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-02T08:00:00Z' },
-  { email: 'marta.bondarenko@example.com', displayName: 'Марта Бондаренко', country: 'PL', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-03T08:00:00Z' },
-  { email: 'yurii.tkachenko@example.com', displayName: 'Юрій Ткаченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-04T08:00:00Z' },
+  { email: 'leader.shoes@example.com', displayName: 'Лідер Взуття', country: 'UA', balanceMinor: 0, createdAt: '2025-01-10T08:00:00Z', role: 'seller' },
+  { email: 'comfort.shoes@example.com', displayName: 'Комфорт Шуз', country: 'UA', balanceMinor: 0, createdAt: '2025-01-11T08:00:00Z', role: 'seller' },
+  { email: 'style.market@example.com', displayName: 'Стиль Маркет', country: 'PL', balanceMinor: 0, createdAt: '2025-01-12T08:00:00Z', role: 'seller' },
+  { email: 'practic.sport@example.com', displayName: 'Практик Спорт', country: 'DE', balanceMinor: 0, createdAt: '2025-01-13T08:00:00Z', role: 'seller' },
+  { email: 'olena.kovalenko@example.com', displayName: 'Олена Коваленко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-01T08:00:00Z', role: 'buyer' },
+  { email: 'andrii.shevchenko@example.com', displayName: 'Андрій Шевченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-02T08:00:00Z', role: 'buyer' },
+  { email: 'marta.bondarenko@example.com', displayName: 'Марта Бондаренко', country: 'PL', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-03T08:00:00Z', role: 'buyer' },
+  { email: 'yurii.tkachenko@example.com', displayName: 'Юрій Ткаченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-04T08:00:00Z', role: 'buyer' },
 ];
 
 const PRODUCTS: ProductFixture[] = [
@@ -270,6 +277,7 @@ const ORDERS: OrderFixture[] = [
 async function seedUsers(manager: EntityManager): Promise<Map<string, User>> {
   const repo = manager.getRepository(User);
   const byEmail = new Map<string, User>();
+  const passwordHash = await hashPassword(SEED_PASSWORD);
 
   for (const fixture of USERS) {
     const existing = await repo.findOne({ where: { email: fixture.email } });
@@ -279,6 +287,8 @@ async function seedUsers(manager: EntityManager): Promise<Map<string, User>> {
     user.country = fixture.country;
     user.balanceMinor = fixture.balanceMinor;
     user.createdAt = new Date(fixture.createdAt);
+    user.role = fixture.role;
+    user.passwordHash = passwordHash;
 
     byEmail.set(fixture.email, await repo.save(user));
   }

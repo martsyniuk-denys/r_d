@@ -9,18 +9,18 @@ import { ConfigService } from '@nestjs/config';
 import { AppModule } from '../../src/app.module';
 import { configureApp } from '../../src/bootstrap';
 import { connectionUri, testPool } from '../testkit/database';
-import { aUser } from '../testkit/builders';
+import { anAccount, loginAs } from '../testkit/auth';
 
 describe('Products end to end', () => {
   let app: INestApplication;
   let pool: Pool;
+  let seller: string;
 
   beforeAll(async () => {
     // The environment was pointed at the testcontainer by setupFiles, before
     // app.module.ts was imported — see test/testkit/jest-setup-env.ts.
     pool = testPool();
-    // POST /products attaches the catalogue entry to the first seller in the table
-    await aUser().create(pool);
+    const account = await anAccount(pool, 'seller');
 
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
 
@@ -35,6 +35,9 @@ describe('Products end to end', () => {
     // whatever .env happens to point at.
     const configured = new URL(nest.get(ConfigService).get<string>('DB_URL', ''));
     expect(configured.port).toBe(new URL(connectionUri()).port);
+
+    // Writing to the catalogue is the seller role's; the product is sold by the caller.
+    seller = (await loginAs(app, account)).access_token;
   });
 
   afterAll(async () => {
@@ -45,6 +48,7 @@ describe('Products end to end', () => {
   it('creates a product and reads the same product back', async () => {
     const created = await request(app.getHttpServer())
       .post('/products')
+      .auth(seller, { type: 'bearer' })
       .set('Idempotency-Key', `e2e-${Date.now()}-create`)
       .send({ title: 'Mechanical keyboard', price_cents: 260_000, currency: 'UAH' })
       .expect(201);
@@ -72,12 +76,14 @@ describe('Products end to end', () => {
 
     const first = await request(app.getHttpServer())
       .post('/products')
+      .auth(seller, { type: 'bearer' })
       .set('Idempotency-Key', key)
       .send(body)
       .expect(201);
 
     const replay = await request(app.getHttpServer())
       .post('/products')
+      .auth(seller, { type: 'bearer' })
       .set('Idempotency-Key', key)
       .send(body)
       .expect(201);
@@ -101,6 +107,7 @@ describe('Products end to end', () => {
   it('answers 400 when the request does not match the published contract', async () => {
     const missingHeader = await request(app.getHttpServer())
       .post('/products')
+      .auth(seller, { type: 'bearer' })
       .send({ title: 'No key', price_cents: 1000, currency: 'UAH' })
       .expect(400);
 
@@ -108,6 +115,7 @@ describe('Products end to end', () => {
 
     await request(app.getHttpServer())
       .post('/products')
+      .auth(seller, { type: 'bearer' })
       .set('Idempotency-Key', `e2e-${Date.now()}-invalid`)
       .send({ title: '', price_cents: -5, currency: 'BTC' })
       .expect(400);
