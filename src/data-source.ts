@@ -17,6 +17,7 @@ import {
   Product,
   RefreshToken,
   RevokedAccessToken,
+  StoredFile,
   User,
 } from './entities';
 
@@ -92,6 +93,7 @@ export const dataSourceOptions: PostgresConnectionOptions = {
     IdempotencyKey,
     RefreshToken,
     RevokedAccessToken,
+    StoredFile,
   ],
   migrations: [join(__dirname, 'migrations', '*.js')],
   migrationsTableName: 'migrations',

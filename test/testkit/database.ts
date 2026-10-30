@@ -57,4 +57,11 @@ export function appEnvFromContainer(): void {
   process.env.JWT_PUBLIC_KEY = Buffer.from(publicKey).toString('base64');
   process.env.JWT_KID = 'test';
   process.env.REFRESH_TOKEN_PEPPER = randomBytes(24).toString('base64url');
+
+  // The suites do not upload anything. A closed local port makes the bucket check
+  // at startup fail fast (a logged warning), instead of reaching for a real store.
+  process.env.STORAGE_ENDPOINT = 'http://127.0.0.1:9';
+  process.env.STORAGE_BUCKET = 'test-files';
+  process.env.STORAGE_ACCESS_KEY = 'test';
+  process.env.STORAGE_SECRET_KEY = randomBytes(24).toString('base64url');
 }
