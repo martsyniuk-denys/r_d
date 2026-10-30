@@ -3,6 +3,10 @@ import { createApp } from '../dist/bootstrap.js';
 const KEY = '6f1f8f4e-4d4b-4a53-9a0e-2c1f0b7a1c11';
 const ORDER_BODY = { items: [{ product_id: 'p_1', qty: 2 }] };
 
+// Orders are behind a token since the auth homework: the smoke run logs in as a
+// seeded buyer (npm run seed), with the seed's dev fixture password.
+const BUYER = { email: 'olena.kovalenko@example.com', password: 'marketplace-dev-password' };
+
 let failed = 0;
 function check(label, ok, actual) {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${actual === undefined ? '' : ` → ${actual}`}`);
@@ -14,10 +18,12 @@ async function main() {
   await app.listen(0);
   const base = `http://127.0.0.1:${app.getHttpServer().address().port}`;
 
+  let token;
   const call = async (method, path, { body, key } = {}) => {
     const headers = {};
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (key !== undefined) headers['Idempotency-Key'] = key;
+    if (token !== undefined) headers.Authorization = `Bearer ${token}`;
     const res = await fetch(base + path, {
       method,
       headers,
@@ -25,6 +31,10 @@ async function main() {
     });
     return { res, json: await res.json() };
   };
+
+  const login = await call('POST', '/auth/login', { body: BUYER });
+  if (login.res.status !== 200) throw new Error(`login as ${BUYER.email} → ${login.res.status}; run npm run seed first`);
+  token = login.json.access_token;
 
   console.log('\nAcceptance criteria — option B');
 

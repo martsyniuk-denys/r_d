@@ -1,6 +1,9 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 
+import { AuthController } from './auth/auth.controller';
+import { AuthService } from './auth/auth.service';
+import { AccessTokenGuard, RolesGuard } from './auth/guards';
 import { IdempotencyService } from './common/idempotency.service';
 import { DatabaseModule } from './db/database.module';
 import { HealthController } from './health/health.controller';
@@ -21,7 +24,16 @@ import { validate } from './config/env.schema';
     }),
     DatabaseModule,
   ],
-  controllers: [HealthController, ProductsController, OrdersController],
-  providers: [ProductsService, OrdersService, IdempotencyService, OrderEventsService, OrdersGateway],
+  controllers: [HealthController, AuthController, ProductsController, OrdersController],
+  providers: [
+    AuthService,
+    AccessTokenGuard,
+    RolesGuard,
+    ProductsService,
+    OrdersService,
+    IdempotencyService,
+    OrderEventsService,
+    OrdersGateway,
+  ],
 })
 export class AppModule {}

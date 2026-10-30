@@ -15,6 +15,8 @@ import {
   OutboxMessage,
   ProcessedMessage,
   Product,
+  RefreshToken,
+  RevokedAccessToken,
   User,
 } from './entities';
 
@@ -88,6 +90,8 @@ export const dataSourceOptions: PostgresConnectionOptions = {
     OutboxMessage,
     ProcessedMessage,
     IdempotencyKey,
+    RefreshToken,
+    RevokedAccessToken,
   ],
   migrations: [join(__dirname, 'migrations', '*.js')],
   migrationsTableName: 'migrations',

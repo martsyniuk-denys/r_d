@@ -1,9 +1,11 @@
-import { Body, Controller, Get, Headers, Param, Patch, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 
+import { AccessTokenGuard, CurrentPrincipal } from '../auth/guards';
+import { Principal } from '../auth/principal';
 import { IdempotencyService } from '../common/idempotency.service';
 import { Page } from '../common/cursor';
-import { ProblemError, forbidden, notFound } from '../common/problem';
+import { ProblemError, forbidden, notFound, unauthorized } from '../common/problem';
 import { AccessDenial, access } from '../realtime/order-access';
 import {
   ORDER_STATUS_EVENT,
@@ -25,7 +27,11 @@ interface UpdateStatusBody {
   status: OrderStatus;
 }
 
+// Every route here needs a token (401 without one). Which order a caller may
+// touch is not decided by a guard: it is decided after the order is loaded, by
+// access() — or, for the list, by filtering on the buyer while reading.
 @Controller('orders')
+@UseGuards(AccessTokenGuard)
 export class OrdersController {
   constructor(
     private readonly orders: OrdersService,
@@ -34,38 +40,44 @@ export class OrdersController {
   ) {}
 
   @Get()
-  list(@Query('limit') limit?: string, @Query('cursor') cursor?: string): Page<Order> {
-    return this.orders.list(Number(limit ?? 20), cursor);
+  list(
+    @CurrentPrincipal() principal: Principal,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ): Page<Order> {
+    return this.orders.listFor(principal, Number(limit ?? 20), cursor);
   }
 
+  // The buyer is the subject of the verified token — there is no header or body
+  // field through which a caller could name somebody else.
   @Post()
   async create(
     @Headers('idempotency-key') key: string,
-    @Headers('x-user-id') buyerId: string | undefined,
+    @CurrentPrincipal() principal: Principal,
     @Body() body: CreateOrderBody,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Order> {
-    const result = await this.idempotency.run(ROUTE, key, body, () =>
-      this.orders.create(body.items, buyerId ?? null),
+    const result = await this.idempotency.run(`${ROUTE}:${principal.userId}`, key, body, () =>
+      this.orders.create(body.items, principal.userId),
     );
     if (result.replayed) res.setHeader('Idempotency-Replay', 'true');
     return result.body;
   }
 
   @Get(':orderId')
-  get(@Param('orderId') orderId: string): Order {
-    const order = this.orders.get(orderId);
-    if (!order) throw notFound(`Order '${orderId}' does not exist.`);
-    return order;
+  get(@Param('orderId') orderId: string, @CurrentPrincipal() principal: Principal): Order {
+    const allowed = access(orderId, this.orders.get(orderId), principal);
+    if (!allowed.ok) throw asProblem(allowed.denial);
+    return allowed.order;
   }
 
   @Patch(':orderId/status')
   updateStatus(
     @Param('orderId') orderId: string,
-    @Headers('x-user-id') userId: string | undefined,
+    @CurrentPrincipal() principal: Principal,
     @Body() body: UpdateStatusBody,
   ): Order {
-    const allowed = access(orderId, this.orders.get(orderId), userId ?? null);
+    const allowed = access(orderId, this.orders.get(orderId), principal);
     if (!allowed.ok) throw asProblem(allowed.denial);
 
     return this.orders.setStatus(allowed.order, body.status);
@@ -78,13 +90,11 @@ export class OrdersController {
   streamEvents(
     @Param('orderId') orderId: string,
     @Headers('last-event-id') lastEventId: string | undefined,
-    @Headers('x-user-id') headerUserId: string | undefined,
-    @Query('userId') queryUserId: string | undefined,
+    @CurrentPrincipal() principal: Principal,
     @Req() req: Request,
     @Res() res: Response,
   ): void {
-    const identity = headerUserId ?? queryUserId ?? null;
-    const allowed = access(orderId, this.orders.get(orderId), identity);
+    const allowed = access(orderId, this.orders.get(orderId), principal);
     if (!allowed.ok) throw asProblem(allowed.denial);
 
     res.writeHead(200, {
@@ -120,5 +130,12 @@ function parseLastEventId(header: string | undefined): number {
 }
 
 function asProblem(denial: AccessDenial): ProblemError {
-  return denial.reason === 'not_found' ? notFound(denial.detail) : forbidden(denial.detail);
+  switch (denial.reason) {
+    case 'not_found':
+      return notFound(denial.detail);
+    case 'anonymous':
+      return unauthorized(denial.detail);
+    case 'forbidden':
+      return forbidden(denial.detail);
+  }
 }

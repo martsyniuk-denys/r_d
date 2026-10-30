@@ -9,6 +9,8 @@ import {
 import { Subscription } from 'rxjs';
 import { Server, Socket } from 'socket.io';
 
+import { AuthService } from '../auth/auth.service';
+import { Principal } from '../auth/principal';
 import { OrdersService } from '../orders/orders.service';
 import { DenialReason, access } from './order-access';
 import { ORDER_STATUS_EVENT, OrderEventsService, OrderStatusEvent } from './order-events.service';
@@ -37,6 +39,7 @@ export class OrdersGateway implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly orders: OrdersService,
     private readonly events: OrderEventsService,
+    private readonly auth: AuthService,
   ) {}
 
   // The gateway is a subscriber of the bus, not its owner: it forwards whatever
@@ -52,13 +55,13 @@ export class OrdersGateway implements OnModuleInit, OnModuleDestroy {
   }
 
   @SubscribeMessage('join')
-  join(@ConnectedSocket() client: Socket, @MessageBody() message: JoinMessage): JoinAck {
+  async join(@ConnectedSocket() client: Socket, @MessageBody() message: JoinMessage): Promise<JoinAck> {
     const orderId = typeof message?.orderId === 'string' ? message.orderId : null;
     if (orderId === null) {
       return { ok: false, reason: 'bad_request', detail: "join needs a string 'orderId'." };
     }
 
-    const allowed = access(orderId, this.orders.get(orderId), identityOf(client));
+    const allowed = access(orderId, this.orders.get(orderId), await this.principalOf(client));
     if (!allowed.ok) {
       const { reason, detail } = allowed.denial;
       this.logger.warn(`join refused (${reason}): ${detail}`);
@@ -69,14 +72,17 @@ export class OrdersGateway implements OnModuleInit, OnModuleDestroy {
     client.join(room);
     return { ok: true, room };
   }
-}
 
-function identityOf(client: Socket): string | null {
-  const fromAuth = (client.handshake.auth as Record<string, unknown> | undefined)?.userId;
-  if (typeof fromAuth === 'string' && fromAuth.length > 0) return fromAuth;
-
-  const fromQuery = client.handshake.query?.userId;
-  if (typeof fromQuery === 'string' && fromQuery.length > 0) return fromQuery;
-
-  return null;
+  // The same access token as over HTTP, from the handshake: io(url, { auth: { token } }).
+  // Verified on every join rather than once per connection, so a token revoked by
+  // logout stops opening rooms on a socket that is already connected.
+  private async principalOf(client: Socket): Promise<Principal | null> {
+    const token = (client.handshake.auth as Record<string, unknown> | undefined)?.token;
+    if (typeof token !== 'string' || token.length === 0) return null;
+    try {
+      return await this.auth.verifyAccess(token);
+    } catch {
+      return null;
+    }
+  }
 }

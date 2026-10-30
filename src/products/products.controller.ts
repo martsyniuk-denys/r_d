@@ -1,6 +1,8 @@
-import { Body, Controller, Get, Headers, Param, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 
+import { AccessTokenGuard, CurrentPrincipal, Roles, RolesGuard } from '../auth/guards';
+import { Principal } from '../auth/principal';
 import { IdempotencyService } from '../common/idempotency.service';
 import { Page } from '../common/cursor';
 import { CreateProduct, Product, ProductsService } from './products.service';
@@ -19,13 +21,20 @@ export class ProductsController {
     return this.products.list(Number(limit ?? 20), cursor);
   }
 
+  // Reading the catalogue is public; writing to it is a role: seller or admin.
+  // The guard order matters — who you are (401) is settled before what you may do (403).
   @Post()
+  @UseGuards(AccessTokenGuard, RolesGuard)
+  @Roles('seller', 'admin')
   async create(
     @Headers('idempotency-key') key: string,
+    @CurrentPrincipal() principal: Principal,
     @Body() body: CreateProduct,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Product> {
-    const result = await this.idempotency.run(ROUTE, key, body, () => this.products.create(body));
+    const result = await this.idempotency.run(`${ROUTE}:${principal.userId}`, key, body, () =>
+      this.products.create(body, principal.userId),
+    );
     if (result.replayed) res.setHeader('Idempotency-Replay', 'true');
     return result.body;
   }

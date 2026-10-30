@@ -5,5 +5,7 @@ export { OrderFulfilment } from './order-fulfilment.entity';
 export { OrderItem } from './order-item.entity';
 export { OutboxMessage } from './outbox-message.entity';
 export { ProcessedMessage } from './processed-message.entity';
+export { RefreshToken } from './refresh-token.entity';
+export { RevokedAccessToken } from './revoked-access-token.entity';
 export { CURRENCIES, Currency, Product, PRODUCT_STATUSES, ProductStatus } from './product.entity';
-export { User } from './user.entity';
+export { User, USER_ROLES, UserRole } from './user.entity';

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { envSchema } from '../dist/config/env.schema.js';
+import { envSchema, STORE_VARIABLES } from '../dist/config/env.schema.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const EXAMPLE = join(ROOT, '.env.example');
@@ -45,10 +45,21 @@ for (const key of documented.keys()) {
   if (!schemaKeys.includes(key)) problems.push(`${key}: in .env.example but not in the schema`);
 }
 
-const parsed = envSchema.safeParse(Object.fromEntries(documented));
+// A store variable is documented with an empty value — a fake signing key would
+// still be a private key in git. Anything else must hold a value the schema accepts.
+for (const key of STORE_VARIABLES) {
+  if (documented.has(key) && documented.get(key) !== '') {
+    problems.push(`${key}: comes from the secret store — .env.example must leave it empty`);
+  }
+}
+
+const values = Object.fromEntries([...documented].filter(([key, value]) => value !== '' && !STORE_VARIABLES.includes(key)));
+const parsed = envSchema.safeParse(values);
 if (!parsed.success) {
   for (const issue of parsed.error.issues) {
-    problems.push(`${issue.path.join('.') || '(root)'}: value in .env.example is invalid — ${issue.message}`);
+    const key = issue.path.join('.') || '(root)';
+    if (STORE_VARIABLES.includes(key)) continue;
+    problems.push(`${key}: value in .env.example is invalid — ${issue.message}`);
   }
 }
 
