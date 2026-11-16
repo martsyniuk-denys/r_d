@@ -1,0 +1,5 @@
+engine=localstack
+sim-allowed-action=ec2:DescribeNatGateways
+sim-allowed=allowed
+sim-denied-action=rds:CreateDBInstance
+sim-denied=explicitDeny

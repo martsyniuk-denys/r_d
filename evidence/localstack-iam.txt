@@ -1,0 +1,14 @@
+user hw31-probe-nobody: 0 inline, 0 attached policies
+  no policy:  CreateBucket hw31-probe-a-64191 → 200
+  deny-all:   CreateBucket hw31-probe-b-64191 → 200, PutObject → 200
+  fake key:   GetObject → 200 (body: only the owner should read this)
+  forged JWT: AssumeRoleWithWebIdentity → 200, AccessKeyId LSIAQAAAAAAAAMW7GHOG
+localstack=4.14.0
+enforce-iam=1
+no-policy=200
+deny-all=200
+fake-key=200
+oidc-forged-jwt=200
+log-lines=14
+iam-log-lines=10
+enforce-iam-log-lines=0

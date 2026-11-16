@@ -1,0 +1,6 @@
+name: hw31-demo
+description: The hourly stack of the AWS homework — RDS Multi-AZ, ALB, and a NAT behind a flag
+runtime:
+  name: nodejs
+  options:
+    typescript: true

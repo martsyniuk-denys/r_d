@@ -69,7 +69,21 @@
     "obs:down": "bash scripts/with-secrets.sh dev docker compose -f observability/compose.yml down",
     "demo:logs": "npm run build --silent && bash scripts/with-secrets.sh dev node demo/logs.mjs",
     "demo:metrics": "npm run build --silent && bash scripts/with-secrets.sh dev node demo/metrics.mjs",
-    "demo:trace": "npm run build --silent && bash scripts/with-secrets.sh dev node demo/trace.mjs"
+    "demo:trace": "npm run build --silent && bash scripts/with-secrets.sh dev node demo/trace.mjs",
+    "localstack:up": "docker compose -f localstack/compose.yml up -d --wait",
+    "localstack:down": "docker compose -f localstack/compose.yml down",
+    "up:base": "bash scripts/with-secrets.sh dev bash scripts/aws.sh base up",
+    "up:demo": "bash scripts/with-secrets.sh dev bash scripts/aws.sh demo up",
+    "preview:demo": "bash scripts/with-secrets.sh dev bash scripts/aws.sh demo preview",
+    "destroy:demo": "bash scripts/with-secrets.sh dev bash scripts/aws.sh demo destroy",
+    "destroy:base": "bash scripts/with-secrets.sh dev bash -c 'bash scripts/aws.sh base destroy && EVIDENCE_FILE=evidence/demos.txt bash scripts/aws-checks.sh demo base'",
+    "teardown:check": "bash scripts/with-secrets.sh dev bash scripts/aws-checks.sh demo base",
+    "evidence:base": "bash scripts/with-secrets.sh dev bash scripts/aws-evidence.sh base",
+    "evidence:iam": "bash scripts/with-secrets.sh dev bash scripts/aws-evidence.sh iam",
+    "evidence:localstack-iam": "bash scripts/with-secrets.sh dev bash scripts/localstack-iam.sh",
+    "demo:failover": "bash scripts/with-secrets.sh dev bash demo/failover.sh",
+    "demo:nat": "bash scripts/with-secrets.sh dev bash demo/nat.sh",
+    "demo:alb": "bash scripts/with-secrets.sh dev bash demo/alb.sh"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1160.0",

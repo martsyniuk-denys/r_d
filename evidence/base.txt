@@ -1,0 +1,8 @@
+region=eu-central-1
+vpc-id=vpc-95fb9efb9088f8174
+public-subnets=2
+private-subnets=2
+subnet-azs=2
+private-default-route=0
+security-groups=3
+tagged-resources=11
