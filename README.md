@@ -4067,7 +4067,11 @@ run linked at the top is a dispatch run, because a schedule may be late or dropp
 
 1. a LocalStack 4.14.0 service container, and OIDC → web identity;
 2. **stand**: `pulumi up` base, then demo. Demo creates what the community edition serves (the
-   Lambda's IAM role), and its RDS and ELBv2 calls fail with 501 in the log. Without this step
+   Lambda target and its IAM role), and its RDS and ELBv2 calls fail with 501 in the log.
+   LocalStack gets the runner's Docker socket. Without it the Lambda ends up `Failed: Docker not
+   available`, `DeleteFunction` on such a function is an `InternalError`, and `pulumi destroy`
+   retried it until the job timed out (an earlier run, cancelled after 19 minutes). The destroy
+   step has its own 8-minute limit now. Without this step
    there is nothing to destroy, and six zeros over an empty emulator prove nothing.
    `state-before[...]` records how much there was;
 3. `pulumi destroy --yes`: demo, then base;

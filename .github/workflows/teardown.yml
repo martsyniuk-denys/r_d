@@ -47,6 +47,10 @@ jobs:
           - 23166:4566
         env:
           ENFORCE_IAM: '1'
+        # Lambda needs Docker: a function without it is `Failed` and cannot be deleted,
+        # and `pulumi destroy` retries it until the job times out (run 43907659119).
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
         options: >-
           --health-cmd "curl -fsS http://localhost:4566/_localstack/health"
           --health-interval 3s --health-timeout 3s --health-retries 40
@@ -113,6 +117,7 @@ jobs:
           [ "$(cd infra/base && pulumi stack export --stack base | jq '.deployment.resources | length')" -gt 1 ]
 
       - name: pulumi destroy — demo, then base
+        timeout-minutes: 8 # a hang fails here, visibly, instead of eating the job
         run: |
           bash scripts/aws.sh demo destroy | tail -n 3
           bash scripts/aws.sh base destroy | tail -n 3

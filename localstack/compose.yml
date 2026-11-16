@@ -18,6 +18,11 @@ services:
       - "127.0.0.1:23166:4566"
     environment:
       ENFORCE_IAM: "1"
+    # Lambda runs functions in sibling containers. Without the socket a function
+    # ends up `Failed: Docker not available`, and such a function cannot be deleted
+    # (DeleteFunction → InternalError) — `pulumi destroy` then retries forever.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
       interval: 3s
