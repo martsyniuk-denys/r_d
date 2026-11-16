@@ -7,7 +7,10 @@ import * as pulumi from '@pulumi/pulumi';
 // demo stack (infra/demo), which exists for the length of a session.
 
 const cfg = new pulumi.Config('hw31');
-const githubRepo = cfg.require('githubRepo'); // owner/repo — the only repo CI may come from
+// The `sub` GitHub puts in this repository's tokens, up to the first colon. Here it
+// carries immutable ids — repo:<owner>@<owner-id>/<repo>@<repo-id> — as seen in the
+// teardown run's log; a trust on plain repo:owner/repo would never match it.
+const githubSubject = cfg.require('githubSubject');
 const region = aws.config.requireRegion();
 
 // The fallback lane points the provider at LocalStack through AWS_ENDPOINT_URL. The
@@ -180,7 +183,7 @@ const teardownRole = new aws.iam.Role('teardown', {
             StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com' },
             // Any ref of this repository (the scheduled run is on the default branch,
             // the dispatched one on the branch it was started from) — no other repo.
-            StringLike: { 'token.actions.githubusercontent.com:sub': `repo:${githubRepo}:*` },
+            StringLike: { 'token.actions.githubusercontent.com:sub': `${githubSubject}:*` },
           },
         },
       ],

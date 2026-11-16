@@ -25,6 +25,12 @@ permissions:
   contents: read
   id-token: write
 
+# bash with pipefail: without an explicit shell a step runs `bash -e`, and a failed
+# `pulumi up | tail` would pass as green (it did, in the first run).
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: teardown
   cancel-in-progress: false
@@ -47,6 +53,10 @@ jobs:
 
     env:
       AWS_ENDPOINT_URL: http://127.0.0.1:23166
+      # The Pulumi provider resolves web-identity credentials through STS before it
+      # reads AWS_ENDPOINT_URL, and would ask real AWS STS (which rejects the token:
+      # no account trusts it). The CLI does not need this; the provider does.
+      AWS_ENDPOINT_URL_STS: http://127.0.0.1:23166
       AWS_ROLE_ARN: arn:aws:iam::000000000000:role/hw31-teardown
       AWS_ROLE_SESSION_NAME: teardown-${{ github.run_id }}
       AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/hw31-oidc.jwt
@@ -95,9 +105,12 @@ jobs:
           bash scripts/aws.sh base up | tail -n 4
           bash scripts/aws.sh demo up 2>&1 | grep -E 'created|failed|StatusCode: 501' | head -n 20 || true
           for s in base demo; do
-            echo "state-before[$s]=$(cd infra/$s && pulumi stack export --stack $s \
+            n="$(cd infra/$s && pulumi stack export --stack $s \
               | jq '[.deployment.resources[]? | select(.type | startswith("aws:"))] | length')"
+            echo "state-before[$s]=$n"
           done
+          # Zeros after a destroy of nothing prove nothing: no base, no teardown.
+          [ "$(cd infra/base && pulumi stack export --stack base | jq '.deployment.resources | length')" -gt 1 ]
 
       - name: pulumi destroy — demo, then base
         run: |

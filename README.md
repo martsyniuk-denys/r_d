@@ -3937,8 +3937,13 @@ is $0.622/h. On this lane all of it is $0. The table is the bill the main lane w
 ### The CI role (OIDC) and its policy
 
 `hw31-teardown` trusts only `token.actions.githubusercontent.com`, with `StringEquals` on
-`aud = sts.amazonaws.com` and `StringLike` on `sub = repo:martsyniuk-denys/r_d:*` (any ref of this
-repository, no other repository). Both documents, decoded, are in `evidence/iam.json`. The
+`aud = sts.amazonaws.com` and `StringLike` on
+`sub = repo:martsyniuk-denys@16865806/r_d@1325481547:*` (any ref of this repository, no other
+repository). The ids in `sub` are not decoration. The teardown run's log printed the claim, and
+GitHub issues this repository's tokens with `repo:<owner>@<owner-id>/<repo>@<repo-id>:…`. My
+first trust said `repo:martsyniuk-denys/r_d:*`, which would never have matched on real AWS. On
+LocalStack it "worked", because nothing is checked there. Both documents, decoded, are in
+`evidence/iam.json`. The
 permission policy names every action, and no `Action` is `"*"`:
 
 | Permission | Why teardown needs it |
@@ -4025,7 +4030,13 @@ against LocalStack is not a trustworthy 403 (see [Files](#files-файли)).
   `id-token: write`. It writes GitHub's OIDC JWT (audience `sts.amazonaws.com`) to a file, and the
   AWS CLI and the Pulumi provider trade it for short-lived credentials through
   `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` (`sts:AssumeRoleWithWebIdentity`). The flow is
-  the same against AWS. Here the STS is LocalStack's. The job prints the token's `iss`, `aud` and
+  the same against AWS. Here the STS is LocalStack's. That takes `AWS_ENDPOINT_URL_STS` as well:
+  the Pulumi provider resolves its credentials before it reads `AWS_ENDPOINT_URL`. In the first
+  run it sent the GitHub token to real AWS STS (`InvalidIdentityToken`; no account trusts it).
+  That run also showed why every step runs under `shell: bash` (pipefail): `pulumi up | tail`
+  hid the failure, and the job printed six zeros over a stand that had never been created. Those
+  zeros were true and worthless, so I do not submit that run. The stand step now fails unless
+  `base` has resources before the destroy. The job prints the token's `iss`, `aud` and
   `sub`, never the token.
 - **Locally** the keys come from the store of homework 11 through the same wrapper,
   `scripts/with-secrets.sh`: `AWS_ENDPOINT_URL` and `AWS_ACCESS_KEY_ID` in `.env`, and the secret

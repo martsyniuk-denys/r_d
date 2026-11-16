@@ -1,5 +1,5 @@
 region=eu-central-1
-vpc-id=vpc-95fb9efb9088f8174
+vpc-id=vpc-47c73934ede706e0a
 public-subnets=2
 private-subnets=2
 subnet-azs=2

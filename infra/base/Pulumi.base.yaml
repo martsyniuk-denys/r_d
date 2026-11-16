@@ -5,4 +5,4 @@ config:
       Project: nodejs-pro-hw31
       Stack: base
       ManagedBy: pulumi
-  hw31:githubRepo: martsyniuk-denys/r_d
+  hw31:githubSubject: repo:martsyniuk-denys@16865806/r_d@1325481547
