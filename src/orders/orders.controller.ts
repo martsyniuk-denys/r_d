@@ -6,6 +6,7 @@ import { Principal } from '../auth/principal';
 import { IdempotencyService } from '../common/idempotency.service';
 import { Page } from '../common/cursor';
 import { ProblemError, forbidden, notFound, unauthorized } from '../common/problem';
+import { layerLogger } from '../observability/logger';
 import { AccessDenial, access } from '../realtime/order-access';
 import {
   ORDER_STATUS_EVENT,
@@ -16,6 +17,8 @@ import {
 import { CreateOrderLine, Order, OrdersService } from './orders.service';
 
 const ROUTE = 'POST /orders';
+
+const log = layerLogger('orders.controller');
 const SSE_RETRY_MS = 1000;
 const SSE_KEEPALIVE_MS = 15000;
 
@@ -57,10 +60,12 @@ export class OrdersController {
     @Body() body: CreateOrderBody,
     @Res({ passthrough: true }) res: Response,
   ): Promise<Order> {
+    log.info({ lines: body.items.length }, 'checkout requested');
     const result = await this.idempotency.run(`${ROUTE}:${principal.userId}`, key, body, () =>
       this.orders.create(body.items, principal.userId),
     );
     if (result.replayed) res.setHeader('Idempotency-Replay', 'true');
+    log.info({ orderId: result.body.id, replayed: result.replayed }, 'checkout answered');
     return result.body;
   }
 

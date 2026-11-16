@@ -39,7 +39,8 @@ if [ ! -f "$CREDS" ]; then
   echo "               (tokens: node scripts/jwt-keys.mjs generate $ENV_SLUG)" >&2
   echo "               (files: STORAGE_* in .env, cp secrets/storage_secret_key.example secrets/storage_secret_key)" >&2
   echo "               (cluster: openssl rand -hex 24 > secrets/pulumi_passphrase)" >&2
-  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* SKIP_VAULT=1" >&2
+  echo "               (observability: OTEL_EXPORTER_OTLP_ENDPOINT, PROMETHEUS_URL, TRACE_API_URL, GRAFANA_* in .env, openssl rand -hex 16 > secrets/grafana_admin_password)" >&2
+  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* OTEL_EXPORTER_OTLP_ENDPOINT PROMETHEUS_URL TRACE_API_URL GRAFANA_* SKIP_VAULT=1" >&2
   exit 1
 fi
 
@@ -95,6 +96,15 @@ fi
 if [ -f "$ROOT/secrets/pulumi_passphrase" ]; then
   PULUMI_CONFIG_PASSPHRASE="$(tr -d '\r\n' < "$ROOT/secrets/pulumi_passphrase")"
   export PULUMI_CONFIG_PASSPHRASE
+fi
+
+# The Grafana admin password of the observability stand (observability/compose.yml
+# interpolates it). The addresses next to it — OTEL_EXPORTER_OTLP_ENDPOINT,
+# PROMETHEUS_URL, TRACE_API_URL, GRAFANA_URL, GRAFANA_ADMIN_USER — are plain lines
+# of the store's .env and arrive with it above.
+if [ -f "$ROOT/secrets/grafana_admin_password" ]; then
+  GRAFANA_ADMIN_PASSWORD="$(tr -d '\r\n' < "$ROOT/secrets/grafana_admin_password")"
+  export GRAFANA_ADMIN_PASSWORD
 fi
 
 exec "$@"

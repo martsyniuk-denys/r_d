@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { Pool } from 'pg';
 
 import { Env } from '../config/env.schema';
+import { layerLogger } from '../observability/logger';
 
 export const PG_POOL = Symbol('PG_POOL');
 
@@ -30,7 +31,7 @@ export function createPool(config: ConfigService<Env, true>): Pool {
   });
 
   pool.on('error', (err) => {
-    console.error('[pg] idle client error:', err.message);
+    layerLogger('db.pool').error({ err }, 'idle client error');
   });
 
   return pool;

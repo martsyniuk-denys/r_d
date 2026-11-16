@@ -4,6 +4,7 @@ import { Request, Response } from 'express';
 
 import { forbidden, unauthorized } from '../common/problem';
 import { UserRole } from '../entities/user.entity';
+import { bindUser } from '../observability/context';
 import { AuthService } from './auth.service';
 import { Principal } from './principal';
 
@@ -21,6 +22,7 @@ export class AccessTokenGuard implements CanActivate {
       const match = /^Bearer ([A-Za-z0-9_\-.]+)$/.exec(req.headers.authorization ?? '');
       if (match === null) throw unauthorized('This resource needs an access token: Authorization: Bearer <token>.');
       req.principal = await this.auth.verifyAccess(match[1]);
+      bindUser(req.principal.userId);
       return true;
     } catch (error) {
       // RFC 6750 §3: a 401 for a bearer-protected resource names the scheme.

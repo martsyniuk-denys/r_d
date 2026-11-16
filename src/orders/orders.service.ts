@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 
 import { Principal } from '../auth/principal';
 import { Page, paginate } from '../common/cursor';
+import { layerLogger } from '../observability/logger';
+import { inSpan } from '../observability/span';
 import { ProductsService } from '../products/products.service';
 import { OrderEventsService, OrderStatus } from '../realtime/order-events.service';
 
@@ -20,6 +22,8 @@ export interface Order {
   total_cents: number;
   created_at: string;
 }
+
+const log = layerLogger('orders.service');
 
 export interface CreateOrderLine {
   product_id: string;
@@ -48,7 +52,12 @@ export class OrdersService {
     return this.orders.find((o) => o.id === id);
   }
 
-  async create(lines: CreateOrderLine[], buyerId: string | null): Promise<Order> {
+  create(lines: CreateOrderLine[], buyerId: string | null): Promise<Order> {
+    return inSpan('orders.place', () => this.place(lines, buyerId));
+  }
+
+  private async place(lines: CreateOrderLine[], buyerId: string | null): Promise<Order> {
+    log.info({ lines: lines.length }, 'pricing order lines');
     const items: OrderItem[] = [];
     for (const line of lines) {
       const product = await this.products.get(line.product_id);
@@ -65,6 +74,7 @@ export class OrdersService {
       created_at: new Date().toISOString(),
     };
     this.orders.push(order);
+    log.info({ orderId: order.id, total_cents: order.total_cents }, 'order placed');
     return order;
   }
 

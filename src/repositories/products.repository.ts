@@ -1,4 +1,12 @@
+import { injectedFault } from '../observability/context';
+import { layerLogger } from '../observability/logger';
 import { Queryable } from './queryable';
+
+const log = layerLogger('products.repo');
+
+// The slow-database fault: long enough to stand out on a p99 panel, short of the
+// histogram's top bucket (src/observability/metrics.ts).
+export const SLOW_FAULT_SECONDS = 1.2;
 
 export type Currency = 'UAH' | 'USD' | 'EUR';
 export type ProductStatus = 'draft' | 'active' | 'archived';
@@ -73,10 +81,17 @@ export class ProductsRepository {
   }
 
   async findById(id: string): Promise<ProductRecord | null> {
+    // Demo faults (FAULT_INJECTION=1 only), read from the request's context: a
+    // real round trip that takes its time, and a real error raised by Postgres.
+    const fault = injectedFault();
+    if (fault === 'slow') await this.db.query('SELECT pg_sleep($1)', [SLOW_FAULT_SECONDS]);
+    if (fault === 'error') await this.db.query('SELECT 1 / 0 AS division_by_zero');
+
     const { rows } = await this.db.query<Row>(
       `SELECT ${COLUMNS} FROM products WHERE id = $1`,
       [id],
     );
+    log.debug({ productId: id, found: rows.length === 1 }, 'product loaded');
     return rows.length === 0 ? null : toRecord(rows[0]);
   }
 

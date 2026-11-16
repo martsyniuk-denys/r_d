@@ -81,6 +81,10 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:image` | stages, shell, runtime uid, and the token in history, config and layers |
 | `npm run demo:rollout` | a rolling update under load: `requests`, `ok`, `failed` counted from a file of response codes |
 | `npm run demo:pdb` | two evictions through the Eviction API: `evict-1=201`, `evict-2=429` |
+| `npm run obs:up` / `obs:down` | the observability stand (`observability/compose.yml`): Prometheus 22901, Grafana 22903, Jaeger 22904 + OTLP 22918 |
+| `npm run demo:logs` | one checkout, a burst of 10 and a login with two secret markers: one trace_id per request, ≥ 3 layers, no marker in the log |
+| `npm run demo:metrics` | 60 checkouts (fast, slow, failing) between two scrapes, then 100 different order ids: deltas, `above-top-bucket`, series before/after |
+| `npm run demo:trace` | a failing checkout with our own `traceparent`: the trace from Jaeger vs the header vs the log |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -352,6 +356,59 @@ not meant to be applied on top of a migrated database, and the migrations are th
 of record from here on.
 
 ## Grading
+
+### Observability (the logs, metrics and traces homework)
+
+No cloud account is needed. `package.json` is in the repository root, so there is no `cd`. The
+grader has no store, so every *сховище* row of [Observability → Variables](#variables-4) and the
+API's own store variables (database, signing key, storage) are exported directly. The Grafana
+password goes first, because `observability/compose.yml` refuses to start without it. The
+database and storage values are the compose dev credentials, which are not a secret. The signing
+key is a throwaway ES256 pair generated on the spot (the application needs *a* valid pair, see
+[the earlier homeworks](#the-earlier-homeworks)).
+
+```bash
+export SKIP_VAULT=1                                   # the grader has no access to the store
+export GRAFANA_ADMIN_USER=admin                       # store variables → observability/compose.yml
+export GRAFANA_ADMIN_PASSWORD=grader-grafana-password
+docker compose up -d --wait postgres pgbouncer storage        # the API's own dependencies
+docker compose -f observability/compose.yml up -d --wait      # Prometheus 22901, Grafana 22903, Jaeger 22904 + OTLP 22918
+
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:22918     # Jaeger, OTLP over HTTP
+export PROMETHEUS_URL=http://127.0.0.1:22901
+export TRACE_API_URL=http://127.0.0.1:22904                   # Jaeger query API (/api/traces/<id>)
+export DATABASE_URL=postgres://marketplace:marketplace_dev_password@127.0.0.1:56432/marketplace
+export STORAGE_ENDPOINT=http://127.0.0.1:59000
+export STORAGE_BUCKET=marketplace-files
+export STORAGE_ACCESS_KEY=marketplace
+export STORAGE_SECRET_KEY=marketplace_dev_storage_password
+node -e 'const {generateKeyPairSync}=require("node:crypto");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},publicKeyEncoding:{type:"spki",format:"pem"}});
+require("node:fs").writeFileSync("/tmp/hw29-keys.sh",
+  "export JWT_PRIVATE_KEY="+Buffer.from(k.privateKey).toString("base64")+"\n"+
+  "export JWT_PUBLIC_KEY="+Buffer.from(k.publicKey).toString("base64")+"\n");'
+. /tmp/hw29-keys.sh
+export JWT_KID=grader
+export REFRESH_TOKEN_PEPPER=grader-pepper
+npm ci
+
+npx tsc --noEmit
+npm run demo:logs      # non-json-lines=0 layers=4 distinct-trace-ids=1 trace-id-matches-header=1 burst=10 burst-trace-ids=10 burst-uneven=0 secret-req-logged=1 secret-in-logs=0
+npm run demo:metrics   # sent-ok=52 sent-fail=8 counter-delta=60 errors-delta=8 above-top-bucket=0 series-before=5 series-after=5
+npm run demo:trace     # spans=7 orphan-spans=0 trace-matches-header=1 trace-matches-log=1 span-status-error=1
+```
+
+Each demo builds first (`npm run build --silent && bash scripts/with-secrets.sh dev node demo/….mjs`).
+It brings the schema up to date, resets its own accounts (`demo-logs-*`, `demo-metrics-*`,
+`demo-trace-*@auth-demo.test`) and its product, starts `dist/main.js` on **22910** (the port
+Prometheus scrapes), and stops it on the way out. Run them in any order, as many times as needed.
+Port 22910 has to be free. `demo:logs` takes about 3 s, `demo:metrics` about 14 s (most of it
+waiting for Prometheus to scrape the run, which is informational), and `demo:trace` about 4 s.
+
+The dashboard is at `http://127.0.0.1:22903/d/marketplace-red`, logged in as the two Grafana
+variables above. Jaeger's UI is at `http://127.0.0.1:22904`. To bring the stand down:
+`docker compose -f observability/compose.yml down` (with the Grafana password still exported).
 
 ### Kubernetes (the rollout homework)
 
@@ -3383,6 +3440,349 @@ and let `minReplicas` act as the floor.
 There is no `startupProbe` (the bonus). The 4 s warm-up is short and steady, and readiness already
 covers it. Liveness starts at 10 s, which is longer than the warm-up. There is no sidecar either.
 
+# Observability: logs, metrics, traces (Обсервабельність)
+
+The question for this homework: one request at 03:15 returned 500. How long does it take to say
+what happened? With this in place it takes one key. The `trace_id` of the failing request is in
+its log line, and the same id opens its trace in Jaeger. The trace shows which span failed and
+why. The RED dashboard shows whether it was one request or a trend.
+
+Each demo proves exactly one claim and computes its numbers rather than printing them:
+
+| Demo | Claim | How it would fail |
+|---|---|---|
+| `demo:logs` | the correlator lives in the **context**, not in arguments: 10 parallel requests do not mix, and the deepest layer has the same id | a "current request" in a module variable gives `burst-trace-ids=3 burst-uneven=2` (measured, below) |
+| `demo:metrics` ⭐ | the label set is **bounded**: a hundred different ids add no time series | `route` from the raw path: `series-before=5 series-after=105` (measured, below) |
+| `demo:trace` ⭐ | **one key opens both doors**: the trace_id in the log line = the trace_id of the span = the one that came in `traceparent` | an own uuid in the logs gives `trace-matches-log=0` |
+
+| Piece | Where |
+|---|---|
+| OpenTelemetry SDK: http, express, pg instrumentation, OTLP/HTTP exporter, batching | `src/observability/tracing.ts`, the first import of `src/main.ts` |
+| the request context in AsyncLocalStorage (`userId`, `tenant`, `idempotencyKey`, demo fault) | `src/observability/context.ts`; `userId` is bound by `AccessTokenGuard` (`src/auth/guards.ts`) |
+| pino: JSON on stdout, `trace_id`/`span_id` from the active span in `mixin`, `redact` | `src/observability/logger.ts` |
+| Nest's own lines through the same pino | `src/observability/nest-logger.ts` |
+| the RED registry: counter + histogram, buckets | `src/observability/metrics.ts` |
+| the middleware: one request line + one counter/histogram observation per request, `GET /metrics` | `src/observability/request-log.ts`, wired in `src/bootstrap.ts` |
+| a manual span (`orders.place`) | `src/observability/span.ts`, used by `src/orders/orders.service.ts` |
+| the stand: Prometheus, Jaeger, Grafana, provisioned datasources, dashboard as JSON | `observability/` |
+| the three demos and their kit | `demo/logs.mjs`, `demo/metrics.mjs`, `demo/trace.mjs`, `demo/lib/observed-api.mjs` |
+
+The endpoint is the checkout, `POST /orders` (homeworks 14/22), on the real application:
+`dist/main.js`, the same entry point as `npm run start`. Each demo starts it as a child process
+on port **22910**. That is the port Prometheus scrapes, so the dashboard fills with the demo's
+traffic while it runs. Each demo also resets its own buyer and seller (new password every run)
+and recreates the product. A fresh process means fresh counters, so every demo starts from
+zero. The demos read the child's stdout and stderr line by line, and the process is always
+killed on the way out, including on Ctrl-C.
+
+## Observability
+
+### The stand
+
+`observability/compose.yml` is a separate compose project (`marketplace-observability`). It can be
+brought up, measured and removed without touching the database:
+
+| Service | Image | Port (127.0.0.1) | Role |
+|---|---|---|---|
+| Prometheus | `prom/prometheus:v3.5.0` | 22901 | scrapes `host.docker.internal:22910/metrics` every 5 s |
+| Jaeger | `jaegertracing/jaeger:2.10.0` | 22918 (OTLP/HTTP), 22904 (UI + `/api/traces`) | trace receiver and query API in one process, in memory |
+| Grafana | `grafana/grafana:12.1.1` | 22903 | datasources and the dashboard provisioned from files; no anonymous access |
+
+I picked Jaeger and Prometheus as separate containers over the single `grafana/otel-lgtm` image.
+They are lighter, and this needs neither Loki nor an OTel Collector: logs go to stdout and
+metrics are scraped. I measured `docker stats --no-stream` on Docker Desktop (7.65 GiB):
+
+| | Grafana | Prometheus | Jaeger | stand total |
+|---|---|---|---|---|
+| right after `up --wait` (8 s from nothing) | 105.1 MiB | 19.7 MiB | 13.8 MiB | **138.6 MiB** |
+| after 3 × 3 demo runs | 94.8 MiB | 30.5 MiB | 38.3 MiB | **163.6 MiB** |
+
+The API's own dependencies (Postgres 65 MiB, PgBouncer 6 MiB, RustFS 210 MiB) add about 280 MiB.
+The kind node of homework 28 was ≈ 950 MiB with three API pods. All of it together is
+≈ 1.4 GiB of 7.65 GiB, so the stand fits next to the cluster. The container clock matches the
+host clock (`date +%s` vs `docker run --rm alpine:3.20 date +%s`: 1794835966 / 1794835967, the
+same second within the time `docker run` itself takes).
+
+### Variables
+
+| Variable | Джерело | Purpose |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | **сховище** (#11): the store's `.env` → `with-secrets.sh` | OTLP/HTTP of Jaeger, `http://127.0.0.1:22918`; the exporter appends `/v1/traces`. Unset: spans are still created (the logs keep their `trace_id`), just not exported |
+| `PROMETHEUS_URL` | **сховище** (#11): the store's `.env` | `demo:metrics` asks it whether it scraped the run (informational line) |
+| `TRACE_API_URL` | **сховище** (#11): the store's `.env` | Jaeger's query API; `demo:trace` reads the trace from it |
+| `GRAFANA_URL` | **сховище** (#11): the store's `.env` | the dashboard, for a human and for `curl` |
+| `GRAFANA_ADMIN_USER` | **сховище** (#11): the store's `.env` | interpolated by `observability/compose.yml` (default `admin`) |
+| `GRAFANA_ADMIN_PASSWORD` | **сховище** (#11): `secrets/grafana_admin_password`, exported by `with-secrets.sh` | interpolated by `observability/compose.yml`; **no default**: without it compose refuses to start and names the variable |
+| `LOG_LEVEL` | `.env` / оточення (default `info`) | the demos run the API with `debug`: the repository layer logs at debug |
+| `OTEL_SERVICE_NAME` | оточення (default `marketplace-api`) | `service.name` of the spans and `service` of the log lines |
+| `OTEL_BSP_SCHEDULE_DELAY` | оточення (default 1000 ms) | batch export interval; the demos use 200 |
+| `FAULT_INJECTION` | оточення, set by the demos for their child only | enables `X-Fault: slow\|error`; off in every other start |
+| `OBS_APP_PORT` | оточення (default 22910) | the port the demos start the API on; Prometheus only scrapes 22910 |
+
+No new env file was added. The addresses joined `DB_URL` and `STORAGE_*` in the git-ignored `.env`,
+and the Grafana password joined `db_password` in `secrets/` (with `secrets/grafana_admin_password.example`
+next to it). Every npm script that needs any of them goes through `bash scripts/with-secrets.sh dev …`:
+the three demos, `obs:up` and `obs:down`. `SKIP_VAULT=1` works unchanged. The OTel variables are not
+in the zod schema (`src/config/env.schema.ts`) because they are read by `tracing.ts` before the schema
+runs. `.env.example` documents them in a commented block, as it already did for `BROKER_URL` and
+`REDIS_URL`.
+
+### Logs: one JSON object per line, the correlator from the context
+
+```json
+{"level":"info","time":"…","service":"marketplace-api","layer":"products.repo",
+ "trace_id":"796559d5…3ae8","span_id":"1070cbb1a4f70047","userId":"73","tenant":"demo-tenant",
+ "idempotencyKey":"obs-…","productId":"7","found":true,"msg":"product loaded"}
+```
+
+- **The correlator is the trace_id of the active OpenTelemetry span**, read in pino's `mixin` on every
+  line with `trace.getActiveSpan()?.spanContext().traceId`. There is no uuid of my own. A second id
+  would be one that no trace backend can find.
+- **`userId`, `tenant`, `idempotencyKey` live in an AsyncLocalStorage** that the first middleware
+  enters (`requestContext()` in `src/bootstrap.ts`). `AccessTokenGuard` adds `userId` once the token
+  is verified, and the mixin reads all three. No function takes `req` in order to log. The repository
+  that logs `product loaded` has no idea there is an HTTP request.
+- **The component** is `layer` (`layerLogger('orders.repo')` = `logger.child({ layer })`). One
+  checkout passes `orders.controller` → `orders.service` → `products.repo`, and then `http` writes
+  the request line. That makes 4 layers with one trace_id. A failing one adds `http.problem`, the
+  line of the exception filter.
+- **Everything is JSON**, including Nest's own startup lines (`NestPinoLogger`) and the pool's error
+  handler. There is one exception: `Startup aborted.` on a broken configuration. That process never
+  serves a request, and its reader is a person looking for the name of a variable. pino-pretty is
+  not a dependency. For reading locally: `npm run start:vault | npx pino-pretty`.
+- **Redaction** (`REDACT_PATHS` in `src/observability/logger.ts`) covers `req.headers.authorization`,
+  `req.headers["proxy-authorization"]`, `req.headers.cookie`, `req.headers["x-api-key"]`,
+  `req.body.password`, `req.body.refresh_token`,
+  `req.body.access_token`, plus the same three fields at the top level and one level down
+  (`*.password`). The paths are written out, because **redact does not guess**. `*.password` hides
+  `body.password` but not `body.account.password`: a nested object with no path of its own goes
+  into the log as it is. A new field that holds a secret means a new line in that list. The request
+  line logs the parsed body on purpose, so you can see that the password is hidden and the rest of
+  the body is not. That includes the email of a login, which is personal data: in production
+the body would go to debug level, or into the redact list too.
+
+**What I measured about the "ALS gets lost on callbacks" hint.** At first I bound the body parser's
+`next()` and the `'finish'` listener with `AsyncResource.bind`. Then I removed both and sent a
+checkout whose body arrived in two chunks 300 ms apart. On Node 24.16 and on Node 22.23 (the
+version of the production image, run in `node:22-alpine`), every line, the request line included,
+still had the user, the key and the trace. Express runs the chain inside `storage.run()`, and those
+events fire within it, so these two binds guarded against nothing and were removed.
+
+The place where it **is** lost on this path is a request the client abandons. The request line also
+listens for `'close'` (see Metrics below). After an abort, `'close'` is emitted by the socket being
+torn down, outside the request's context. I measured it with a checkout under the slow fault and
+the client giving up after 200 ms. The line kept its `trace_id`, because OpenTelemetry binds the
+response emitter to its own context, but `userId` was gone. Since `AsyncResource.bind(record)`, the
+same line has both. Other places of the same kind: the wait queue of a pool, a listener registered
+once at startup, a BullMQ worker. The burst demo is the check that would catch one of them on the
+checkout path.
+
+Also measured: **without an exporter, NodeSDK 0.301 registers no TracerProvider at all**. It falls
+back to the API's no-op tracer, and every line gets `trace_id=00000000000000000000000000000000`. I
+found this by running the API without `OTEL_EXPORTER_OTLP_ENDPOINT`. Since then `tracing.ts` passes
+a `NoopSpanProcessor` when no endpoint is set, so spans exist and are dropped.
+
+### Metrics: RED
+
+```
+http_requests_total{method, route, status}                  counter
+http_request_duration_seconds_bucket{method, route, status, le}   histogram
+```
+
+`route` is the **template** Express routed to: `req.baseUrl + req.route.path`, so `/orders/:orderId`.
+If the OpenAPI validator answered before routing (a 400), it is the template the validator matched
+(`req.openapi.expressRoute`). If nothing matched at all, it is `unmatched`, one value for any path.
+`status` is the HTTP code that was sent, and `method` is the verb. A request the client abandoned
+before any response gets `499` (nginx's "client closed request"), and the line says
+`request aborted by the client`. An SSE stream whose tab was closed keeps the `200` it had already
+sent. Both are recorded on `'close'`, because `'finish'` never fires for them, and a guard stops
+`'close'` after `'finish'` from counting a request twice. The middleware sits before the
+body parser, so a 400 for malformed JSON is counted too, as `route="unmatched"`, because nothing
+was routed yet. `/metrics` is registered ahead of
+everything else, so it is not counted, logged, traced or validated: a scrape is not traffic. This
+is a Histogram, not a Summary, because a Summary's quantiles cannot be aggregated across instances.
+`/metrics` is on the API's own port with no authentication. That is fine for this stand, but in
+production it would move to a separate port that only the cluster network reaches, because the
+default metrics expose heap, event-loop lag and the Node version to anyone who can reach the API.
+
+**Buckets** (seconds): `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10`.
+
+- The **top finite bucket is 10 s**. The slowest thing this service does on purpose is the
+  slow-database fault, `pg_sleep(1.2)`, measured at 1218–1224 ms end to end. A cold pool adds a few
+  hundred ms. 10 s leaves headroom for a database under load and is past the point where a client
+  times out and retries. Above the top bucket everything lands in `+Inf`, and `histogram_quantile()`
+  then returns the top bucket's bound, which is a flat, healthy-looking line exactly when things are
+  worst. `demo:metrics` checks `above-top-bucket=0` against the top bucket the code defines.
+- The steps are **dense below 0.5 s**, because that is where a healthy API is. Measured over one
+  `demo:metrics` run from Prometheus: p50 of a successful checkout ≈ 6.5 ms, and every fast
+  checkout under 50 ms.
+- The slow requests land in the 2.5 bucket, and the failures, which are fast, land low. p99 of
+  `POST /orders` on the dashboard is ≈ 2.4 s. That is linear interpolation inside the 1–2.5 bucket,
+  not a measurement (the real value is 1.2 s), and it is why bucket bounds near the real latencies
+  matter.
+
+### The dashboard
+
+`observability/grafana/dashboards/marketplace-red.json` is provisioned by
+`observability/grafana/provisioning/dashboards/dashboards.yml`. The datasources (Prometheus uid
+`prometheus`, Jaeger uid `jaeger`) are provisioned by `…/datasources/datasources.yml`, so a fresh
+Grafana opens the dashboard with data. It is at `http://127.0.0.1:22903/d/marketplace-red`, behind
+the admin login from the store. It has three panels for the three RED questions, each with
+`[1m]`, because a demo lasts about a minute:
+
+| Panel | RED question | PromQL |
+|---|---|---|
+| Rate | how many requests per second, per route? | `sum by (method, route) (rate(http_requests_total{job="marketplace-api"}[1m]))` |
+| Errors | which share of them ends in 5xx? | `sum by (method, route) (rate(http_requests_total{job="marketplace-api", status=~"5.."}[1m])) / sum by (method, route) (rate(http_requests_total{job="marketplace-api"}[1m]))` |
+| Duration | how long do they take (p50/p95/p99)? | `histogram_quantile(0.99, sum by (le, method, route) (rate(http_request_duration_seconds_bucket{job="marketplace-api"}[1m])))`, and the same with 0.95 and 0.50 |
+
+4xx is left out of Errors on purpose. It is the client's mistake: a 401 without a token or a 404 for
+a stranger's order is the API working correctly.
+
+### Traces
+
+`src/observability/tracing.ts` is the first import of `src/main.ts`. Instrumentation patches `http`,
+`express` and `pg` as they are required, so whatever was loaded before `sdk.start()` stays
+unpatched. Express middleware spans are turned off (`ignoreLayersType: [MIDDLEWARE]`). They added
+a dozen spans per request that answer no question, while the route handler span and `http.route`
+remain. A 5xx turns the server span to `ERROR` by itself. The exception filter
+(`toProblem()`) runs while Express's request-handler span, the server span's child, is active. It
+records the exception on that span as an event, sets its status to `ERROR`, and logs it with the
+same trace_id.
+For 4xx the server span stays `Unset`, which is why the trace demo uses a 5xx.
+
+Spans are exported in batches (`BatchSpanProcessor`). Because of that, `demo:trace` polls Jaeger
+every 500 ms until the span count stops growing, with a deadline of 20 s. On shutdown Nest calls
+`TelemetryShutdown` (`src/app.module.ts`), which runs `sdk.shutdown()` and flushes what is still
+in memory.
+
+A failing checkout, as `demo:trace` prints it (`span ← parent`; reordered parent-first, comments mine):
+
+```
+POST /orders, traceparent 00-796559d5755688937034c214492a3ae8-f81f876650a57690-01 → 500
+  501ff8281e0e17a8 ← f81f876650a57690  POST /orders  [ERROR]        ← parent = the header's parent-id
+  8c99698572ddefc0 ← 501ff8281e0e17a8  request handler - /orders  [ERROR]  ← exception event + status from toProblem()
+  11e0e3df2be38291 ← 8c99698572ddefc0  pg-pool.connect                (the guard's denylist lookup)
+  5ff0f8cb970a35c6 ← 8c99698572ddefc0  pg.query:SELECT marketplace
+  1070cbb1a4f70047 ← 8c99698572ddefc0  orders.place  [ERROR]          ← the manual span
+  574909c7ee78263b ← 1070cbb1a4f70047  pg-pool.connect
+  86966e7f65dafe1a ← 1070cbb1a4f70047  pg.query:SELECT marketplace  [ERROR]   ← division by zero
+  log orders.controller: trace_id=796559d5755688937034c214492a3ae8 span_id=8c99698572ddefc0 "checkout requested"
+  log orders.service: trace_id=796559d5755688937034c214492a3ae8 span_id=1070cbb1a4f70047 "pricing order lines"
+  log http.problem: trace_id=796559d5755688937034c214492a3ae8 span_id=8c99698572ddefc0 "division by zero"
+  log http: trace_id=796559d5755688937034c214492a3ae8 span_id=501ff8281e0e17a8 "request completed"
+```
+
+### The demo faults
+
+The 500 and the slow requests are real database round trips. They are not a thrown string or a
+`setTimeout`. With `FAULT_INJECTION=1`, which only the demos set, and only for their own child,
+`X-Fault: slow` makes `ProductsRepository.findById` run `SELECT pg_sleep(1.2)`, and `X-Fault: error`
+makes it run `SELECT 1 / 0`. Postgres answers that with `division by zero`, which surfaces as a 500
+through the normal error path. The repository reads the fault from the request context, not from an
+argument, so the deepest layer reacting to it is one more proof that the context got that far.
+
+### The three runs
+
+The numbers below are mine, and identical over three runs in a row. Only `slowest-ms` moves, by a
+few ms.
+
+```
+$ npm run demo:logs
+single: 201, 6 lines, layers: orders.controller → orders.service → products.repo → http
+burst: 10 requests (201 ×10), 60 lines in 10 trace groups of sizes 6,6,6,6,6,6,6,6,6,6
+secret: login 401, request lines 1, lines with a marker 0
+non-json-lines=0
+lines-total=102
+layers=4
+distinct-trace-ids=1
+trace-id-matches-header=1
+burst=10
+burst-trace-ids=10
+burst-uneven=0
+burst-mixed-keys=0
+secret-req-logged=1
+secret-in-logs=0
+```
+
+Each request's lines are found by its `Idempotency-Key` (from the context), not by the trace_id
+being tested. The burst lines are grouped by `trace_id`. A group's size must equal the others',
+and no line may carry another request's key (`burst-mixed-keys`). The secret request sends
+`Authorization: Bearer bearer-marker-<random>` and the password `password-marker-<random>`. Its
+request line is in the log with `[Redacted]` in both places, and neither marker appears in any of
+the 102 lines.
+
+```
+$ npm run demo:metrics
+prometheus (http://127.0.0.1:22901): scraped this process before the load
+sent 60: 201 ×52, 500 ×8
+slowest reply 1224 ms; top finite bucket le="10"
+100 ids → 100 × 404; 2 GET routes in the counter
+prometheus: scraped this run (101 GET /orders/:orderId)
+sent-ok=52
+sent-fail=8
+counter-delta=60
+errors-delta=8
+top-bucket-seconds=10
+slowest-ms=1224
+above-top-bucket=0
+ids=100
+series-before=5
+series-after=5
+```
+
+`counter-delta` and `errors-delta` are differences between two scrapes of `/metrics` for
+`POST /orders`. The two `prometheus` lines are informational, and the demo waits for them for at
+most 10 s and 15 s. Every demo starts a new process, and Prometheus computes `rate()` from its own
+scrapes, so a load sent before its first scrape of that process would be hidden in the series'
+starting value and never reach the dashboard. `above-top-bucket` is `_count` minus `_bucket{le="10"}` for the same route. The
+five series are `POST /auth/login 200`, `POST /orders 201`, `POST /orders 500`, `GET /health 200`
+and `GET /orders/:orderId 404`. The route is warmed with one `GET /orders/o_warmup` before
+`series-before` is counted.
+
+```
+$ npm run demo:trace
+status=500
+spans=7
+orphan-spans=0
+trace-matches-header=1
+trace-matches-log=1
+log-lines=4
+span-status-error=1
+```
+
+`trace-matches-header` is 1 when Jaeger returns the trace under the header's trace-id **and** the
+server span's parent is the header's parent-id. `trace-matches-log` is 1 when the request's log
+lines carry exactly one trace_id, that trace_id is Jaeger's, and **every `span_id` they name is a
+span of that trace**. `orphan-spans` counts spans whose parent is neither in the trace nor the
+caller's span from the header.
+
+**Proof that the demos catch what they claim to catch.** I broke `dist/` by hand, ran the demo,
+then rebuilt:
+
+| Breakage | Result |
+|---|---|
+| the trace_id taken from a module variable set by the last request to arrive | `burst-trace-ids=3 burst-uneven=2 burst-mixed-keys=54`, exit 1 |
+| `route` = `req.path` instead of the template | `series-before=5 series-after=105`, exit 1 |
+| no exporter and no span processor (the NodeSDK case above) | `trace_id=000…0` on every line |
+| the `'close'` listener without `AsyncResource.bind`, client aborts a slow checkout | the `499` line has `trace_id`, no `userId` |
+
+### SLO, in one paragraph (bonus)
+
+SLI: the share of `POST /orders` requests that are not 5xx and finish under 500 ms, measured from
+`http_requests_total` and `http_request_duration_seconds_bucket{le="0.5"}` (0.5 is a bucket bound
+on purpose, so the SLI is exact and not interpolated). SLO: 99.5 % over a rolling 30 days. Error
+budget: 0.005 × 30 days × 24 h × 60 min = **216 minutes a month** of complete failure, or the same
+budget spent as 0.5 % of requests. Once it is used up, releases wait and reliability work goes
+first.
+
+### Not done
+
+The rest of the bonus is not done: GlitchTip/Sentry, a second process with an outgoing call, and
+a live alert. Tail sampling, Loki and a profiler are out of scope. The OTel Collector is not part
+of the stand: the API exports straight to Jaeger's OTLP receiver. With a collector in between,
+only `OTEL_EXPORTER_OTLP_ENDPOINT` would change.
+
 # The OpenAPI contract in detail
 
 ## What the spec contains
@@ -3684,6 +4084,14 @@ src/ratelimit/sliding-window.ts   sliding-window log in one Lua script, 429 + Re
 src/queue/notifications.ts        BullMQ queue: attempts + exponential backoff, jobId dedup, job scheduler
 src/pod.ts                        one stateless pod (sessions + limit) as its own process
 src/common/demo-output.ts         key=value report, invariant checks, exit codes — no database import
+src/observability/tracing.ts      OTel NodeSDK: http/express/pg instrumentation, OTLP exporter; first import of main.ts
+src/observability/context.ts      AsyncLocalStorage of the request: userId, tenant, idempotencyKey, demo fault
+src/observability/logger.ts       pino: JSON on stdout, trace_id/span_id + context in mixin, redact paths
+src/observability/metrics.ts      prom-client registry: http_requests_total, http_request_duration_seconds, buckets
+src/observability/request-log.ts  per-request line + RED observation; GET /metrics
+src/observability/span.ts         inSpan(): a manual span that records the exception and ERROR
+demo/logs.mjs / metrics.mjs / trace.mjs  the three observability demos; demo/lib/observed-api.mjs their kit
+observability/                    compose of the stand, Prometheus config, Grafana provisioning + dashboard JSON
 src/demo-cache.ts / demo-session.ts / demo-ratelimit.ts / demo-queue.ts  the four Redis demos
 db/init.sql                       products table + seed, run by compose on first start
 test/testkit/                     the container, the rollback isolation and the builders
@@ -3749,6 +4157,10 @@ Nest 11 would pull Express 5 instead.
 | `@aws-sdk/client-s3` / `s3-request-presigner` | 3.x (`requestChecksumCalculation: 'WHEN_REQUIRED'`) |
 | `rustfs/rustfs` (image) | 1.0.4 |
 | `jsonwebtoken` | 9.x (ES256 with a `KeyObject`; `algorithms` allowlist on verify) |
+| `pino` / `prom-client` | 10.4.0 / 15.1.3 |
+| `@opentelemetry/sdk-node` / `instrumentation-http` / `exporter-trace-otlp-http` | 0.301.2 (SDK 3.1.1, `@opentelemetry/api` 1.10; v3 renamed `sdk-trace-base` to `sdk-trace`, whose `BatchSpanProcessor` takes `{ exporter }`) |
+| `@opentelemetry/instrumentation-express` / `instrumentation-pg` | 0.73.0 / 0.78.0 |
+| `prom/prometheus` / `grafana/grafana` / `jaegertracing/jaeger` (images) | v3.5.0 / 12.1.1 / 2.10.0 |
 | `typescript` | 5.x |
 
 The build is plain `tsc` (through `nest build`) on purpose: esbuild-based transpilers do not
