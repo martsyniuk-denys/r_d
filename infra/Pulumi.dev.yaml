@@ -1,0 +1,7 @@
+config:
+  marketplace-k8s:kubeContext: kind-marketplace
+  marketplace-k8s:namespace: marketplace
+  marketplace-k8s:name: marketplace-api
+  marketplace-k8s:image: marketplace-api:1.0.0
+  marketplace-k8s:replicas: "3"
+  marketplace-k8s:nodePort: "30080"

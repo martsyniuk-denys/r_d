@@ -1,0 +1,6 @@
+name: marketplace-k8s
+description: The marketplace API on a local single-node kind cluster
+runtime:
+  name: nodejs
+  options:
+    typescript: true

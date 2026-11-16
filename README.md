@@ -74,6 +74,13 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run edge` | the edge cache in front of the bucket (`assets/*`, `X-Cache: HIT\|MISS`) |
 | `node scripts/jwt-keys.mjs generate\|rotate\|retire\|fingerprint <env>` | the ES256 keys and the pepper of an environment in `secrets/jwt/<env>/` |
 | `npm run pod` | one stateless API pod: sessions (`GET /session`) and the rate limit (`GET /limited`) |
+| `npm run image:build` | `docker/Dockerfile` → `marketplace-api:1.0.0`, the registry token as a BuildKit secret from `.npm_token` |
+| `npm run scan` | Trivy on the image; `found` vs `SCAN_MAX` → `gate=pass\|fail` and the exit code |
+| `npm run cluster:up` / `cluster:down` | one kind node (`k8s/kind-config.yaml`) + `kind load docker-image` / delete it |
+| `npm run up` / `preview` / `destroy` | the Pulumi program in `infra/` through `with-secrets.sh`, local file backend |
+| `npm run demo:image` | stages, shell, runtime uid, and the token in history, config and layers |
+| `npm run demo:rollout` | a rolling update under load: `requests`, `ok`, `failed` counted from a file of response codes |
+| `npm run demo:pdb` | two evictions through the Eviction API: `evict-1=201`, `evict-2=429` |
 | `npm run db:schema` | *(raw-SQL path of the data-layer homework)* applies `db/schema.sql` |
 | `npm run db:seed` | applies `db/seed.sql` (≈590 000 rows, ends with `VACUUM (ANALYZE)`) |
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
@@ -346,6 +353,50 @@ of record from here on.
 
 ## Grading
 
+### Kubernetes (the rollout homework)
+
+This needs no cloud account: one kind node on the local Docker is enough. It also needs neither
+the compose stack nor the root `npm ci`, because the demos use only Node built-ins, `kubectl`,
+`kind`, `pulumi`, `docker` and `curl`. `npm run scan` uses a local `trivy` if there is one, and the
+`aquasec/trivy` image otherwise. The grader has no store, so the two store variables
+(`DB_PASSWORD`, `PULUMI_CONFIG_PASSPHRASE`, the rows marked *сховище* in
+[Kubernetes → Variables](#variables-3)) are exported directly:
+
+```bash
+export SKIP_VAULT=1                                  # the grader has no access to the store
+export DB_PASSWORD=grader-secret                     # store variable → K8s Secret marketplace-api-db
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi"      # local file backend, no pulumi login
+export PULUMI_CONFIG_PASSPHRASE=hw28-grading         # store variable → encrypts the Pulumi state
+npm --prefix infra ci
+printf 'dummy-npm-token' > .npm_token                # build-stage secret; not in git
+npm run image:build                                  # docker/Dockerfile -> marketplace-api:1.0.0
+npm run cluster:up                                   # kind create + kind load docker-image
+npm run up                                           # pulumi up
+
+kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptionsAllowed}{"\n"}'   # 1, BEFORE demo:pdb
+npm run demo:image     # stages=4 shell-inside=0 runtime-uid=65532 token-in-history=0 token-in-config=0 token-in-layers=0
+SCAN_MAX=-1 npm run scan;    echo "exit=$?"     # gate=fail, exit=1
+SCAN_MAX=99999 npm run scan; echo "exit=$?"     # gate=pass, exit=0
+npm run demo:rollout   # profile=safe requests≈280000 ok=requests failed=0 rollout-seconds≈22, exit 0
+npm run demo:pdb       # healthy=3 minAvailable=2 evict-1=201 evict-2=429
+
+npm run destroy && npm run cluster:down
+```
+
+The names used by the criteria are namespace `marketplace`, Deployment, Service, PDB and HPA
+`marketplace-api`, and Secret `marketplace-api-db`. Criterion 5 runs `pulumi preview` inside
+`infra/`; the stack `dev` is selected by `npm run up`. When Pulumi creates the stack it adds an
+`encryptionsalt:` line to `infra/Pulumi.dev.yaml`. That salt comes from the passphrase, so it is
+different for every person, and it is not committed.
+
+Two optional runs. `PROFILE=broken npm run demo:rollout` gives failures and `exit 1`, then puts the
+safe profile back. `LOAD_KEEPALIVE=0 npm run demo:rollout` opens a new connection for every
+request, capped at 300/s (see [the rollout](#the-rollout) for why the cap exists). Each demo cleans
+up after itself: the generator's file is deleted, and the cluster is left in the safe profile with
+every pod ready. Run them in any order, as many times as needed.
+
+### The earlier homeworks
+
 The files homework and the auth homework share one preamble; the blocks after it are the earlier
 homeworks and still apply. `package.json` is in the repository root, so there is no `cd`. The
 object storage is RustFS from `docker-compose.yml` (S3 API on `59000`); its credentials below are
@@ -398,7 +449,7 @@ out. `demo:upload` takes about 6 s, because it waits for a 2-second URL to expir
 reasoning behind every number are in [Files](#files-файли).
 
 The four variable names are `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID` and
-`REFRESH_TOKEN_PEPPER` — the rows marked *сховище* in the [Auth](#auth-автентифікація-та-авторизація)
+`REFRESH_TOKEN_PEPPER` — the rows marked *secrets store* in the [Auth](#auth-автентифікація-та-авторизація)
 table. Each demo builds first (`npm run build --silent && bash scripts/with-secrets.sh dev node
 dist/demo-….js`), brings the schema up to date (migration `1793349700000-AuthRolesRefreshTokens`),
 resets its own accounts (`demo-auth-*`, `demo-reuse-*`, `demo-rbac-*@auth-demo.test`, a fresh random
@@ -2455,12 +2506,12 @@ reading the catalogue stays public). Three roles live in `users.role`: `buyer` (
 
 | Variable | Джерело | Format | Purpose |
 |---|---|---|---|
-| `JWT_PRIVATE_KEY` | **сховище** (#11): `secrets/jwt/<env>/private.pem` via `with-secrets.sh` | base64 of a PKCS#8 PEM, EC P-256 | signs access tokens |
-| `JWT_PUBLIC_KEY` | **сховище** (#11): `secrets/jwt/<env>/public.pem` | base64 of an SPKI PEM | verifies them; must be the public half of the private key |
-| `JWT_KID` | **сховище** (#11): `secrets/jwt/<env>/kid` | `[A-Za-z0-9._-]{1,64}` | written into every token header; picks the verifying key |
-| `REFRESH_TOKEN_PEPPER` | **сховище** (#11): `secrets/jwt/<env>/pepper` | ≥ 12 characters | HMAC key for `refresh_tokens.token_hash` |
-| `JWT_PREVIOUS_PUBLIC_KEY` | **сховище** (#11): `secrets/jwt/<env>/previous/public.pem`, only during a rotation | base64 SPKI PEM | still verifies tokens of the outgoing key |
-| `JWT_PREVIOUS_KID` | **сховище** (#11): `secrets/jwt/<env>/previous/kid` | as `JWT_KID` | the outgoing key's id |
+| `JWT_PRIVATE_KEY` | **secrets store** (#11): `secrets/jwt/<env>/private.pem` via `with-secrets.sh` | base64 of a PKCS#8 PEM, EC P-256 | signs access tokens |
+| `JWT_PUBLIC_KEY` | **secrets store** (#11): `secrets/jwt/<env>/public.pem` | base64 of an SPKI PEM | verifies them; must be the public half of the private key |
+| `JWT_KID` | **secrets store** (#11): `secrets/jwt/<env>/kid` | `[A-Za-z0-9._-]{1,64}` | written into every token header; picks the verifying key |
+| `REFRESH_TOKEN_PEPPER` | **secrets store** (#11): `secrets/jwt/<env>/pepper` | ≥ 12 characters | HMAC key for `refresh_tokens.token_hash` |
+| `JWT_PREVIOUS_PUBLIC_KEY` | **secrets store** (#11): `secrets/jwt/<env>/previous/public.pem`, only during a rotation | base64 SPKI PEM | still verifies tokens of the outgoing key |
+| `JWT_PREVIOUS_KID` | **secrets store** (#11): `secrets/jwt/<env>/previous/kid` | as `JWT_KID` | the outgoing key's id |
 | `DATABASE_URL` / `DB_URL` | compose / оточення | `postgres://…` | dev credentials of the compose stack, not a secret |
 | `JWT_ISSUER`, `JWT_AUDIENCE` | оточення (default `marketplace-api`) | string | `iss` / `aud`, written and required |
 | `JWT_ACCESS_TTL_SECONDS` | оточення (default `600`) | 30–3600 | access-token lifetime |
@@ -2816,8 +2867,8 @@ ETag, the lifecycle rule, and 403 for anonymous reads. The code only knows an en
 
 | Variable | Джерело | Purpose |
 |---|---|---|
-| `STORAGE_SECRET_KEY` | **сховище** (#11): `secrets/storage_secret_key` via `STORAGE_SECRET_KEY_FILE` and `with-secrets.sh` | read and write on every file of the bucket |
-| `STORAGE_ACCESS_KEY` | **сховище** (#11): the store's `.env` | the key id of that credential |
+| `STORAGE_SECRET_KEY` | **secrets store** (#11): `secrets/storage_secret_key` via `STORAGE_SECRET_KEY_FILE` and `with-secrets.sh` | read and write on every file of the bucket |
+| `STORAGE_ACCESS_KEY` | **secrets store** (#11): the store's `.env` | the key id of that credential |
 | `STORAGE_ENDPOINT` | `.env` / оточення | S3 API address; empty means AWS S3 |
 | `STORAGE_BUCKET` | `.env` / оточення | the one bucket, private |
 | `STORAGE_REGION` | оточення (default `us-east-1`) | the region requests are signed for |
@@ -3055,6 +3106,282 @@ The same idea runs through all three mechanisms. A presigned URL cannot be revok
 A CDN entry cannot be recalled, so the URL is versioned. A broken connection cannot be prevented,
 so the upload is resumable. When undoing something is expensive or impossible, arrange things so
 that it never needs undoing.
+
+# Kubernetes: a rollout under load (Kubernetes: викочування під навантаженням)
+
+On homework 05 the question was whether the image starts. Here it is whether a new revision rolls
+out under load without a single request going unanswered. The answer is the `failed=` line of
+`npm run demo:rollout`, counted from a file with one line per response. Nothing in it is typed in
+by hand.
+
+```
+docker/Dockerfile           4 stages; the last is gcr.io/distroless/nodejs22-debian12:nonroot, uid 65532
+k8s/kind-config.yaml        one kind node, NodePort 30080 mapped to 127.0.0.1:30080
+infra/                      Pulumi (TypeScript): Namespace, Secret, Deployment, Service, PDB, HPA
+scripts/with-secrets.sh     the store from #11 → DB_PASSWORD, PULUMI_CONFIG_PASSPHRASE
+scripts/pulumi.sh           up | preview | destroy against a local file backend
+scripts/load.mjs            load generator: one status code per line, 000 for no response
+scripts/scan.sh             Trivy report → found vs SCAN_MAX → gate=pass|fail
+demo/image.sh, rollout.sh, pdb.sh
+.github/workflows/image.yml build → demo:image → scan with the working threshold
+```
+
+## Kubernetes
+
+### What runs in the pod
+
+The image is the whole application: `dist/main.js` and everything it needs are inside. The
+Deployment runs `dist/k8s-pod.js` from the same image. The full API needs Postgres, Redis, RabbitMQ
+and object storage, and a one-node cluster on a laptop runs none of them. `k8s-pod.js` is the
+stateless HTTP side of the service and shows the three behaviours this homework measures:
+
+| Endpoint | Answers | Question |
+| --- | --- | --- |
+| `GET /healthz` | 200 while the event loop turns | should this pod be killed? (livenessProbe) |
+| `GET /readyz` | 200 only after the warm-up and before SIGTERM, 503 otherwise | may it get traffic? (readinessProbe) |
+| `GET /` | `{rev, pod, pid}` | the work itself; the load generator calls this |
+
+The process waits `WARMUP_MS` = 4 s before `listen()`, standing in for migrations and a pool.
+Without that pause the broken profile would show zero failures, because the app would start faster
+than the rollout could break it. On SIGTERM the steps run in this order:
+
+1. `/readyz` turns 503 at once.
+2. The pod keeps serving for `DRAIN_MS` = 5 s. Each response in that window carries
+   `Connection: close`, so keep-alive clients reconnect, and kube-proxy sends the new connection
+   to another pod.
+3. Only then does `server.close()` run. Idle sockets are closed at once and the rest after 2 s.
+
+If it called `close()` first, the pod would refuse connections that kube-proxy is still sending to
+it. `terminationGracePeriodSeconds` is 15, which is more than 5 + 2, so SIGKILL never lands in the
+middle of the drain. The process also refuses to start without `DB_PASSWORD` and names the variable.
+
+### The cluster, and how much memory it got
+
+**kind v0.33.0 (node image Kubernetes v1.37.0), one node, on Docker Desktop with 7.65 GiB and 8
+CPUs.** With the three API pods running after the rollout demo, `docker stats` showed the kind
+node at **≈ 950 MiB**. `npm run cluster:up` took 74 s the first time, because it pulled the node
+image, and 34 s after that, image load included. kind has no memory flag of its own; the node takes what Docker Desktop allows. kind
+was chosen over minikube because it is lighter and because minikube refuses to start with less
+than 1800 MB.
+
+### Variables
+
+| Variable | Source | Purpose |
+| --- | --- | --- |
+| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password`, exported by `with-secrets.sh` | the database password; Pulumi puts it into the K8s Secret `marketplace-api-db`, and the pod reads it by `secretKeyRef` |
+| `PULUMI_CONFIG_PASSPHRASE` | **сховище** (#11): `secrets/pulumi_passphrase`, exported by `with-secrets.sh` | encrypts the Pulumi state, which holds the Secret's value |
+| `PULUMI_BACKEND_URL` | process environment; `scripts/pulumi.sh` defaults it to `file://<repo>/.pulumi` | a local file backend, never a `pulumi login` to an account |
+| `ROLLOUT_PROFILE` | process environment, set by `demo:rollout` | `safe` (default) or `broken` |
+| `APP_REV` | process environment, set by `demo:rollout` | `REV` in the pod template; a plain `up` keeps the running one |
+| `SCAN_MAX`, `SCAN_SEVERITY`, `SCAN_FIXABLE` | process environment | the scan gate: ceiling, severities, fixable only |
+
+No new env file was added. The value travels this way:
+
+```
+store (.env + secrets/db_password)  →  with-secrets.sh  →  DB_PASSWORD
+  →  Pulumi (pulumi.secret, Secret.data base64)  →  Secret marketplace-api-db
+  →  env[].valueFrom.secretKeyRef  →  process.env.DB_PASSWORD
+```
+
+The Deployment manifest carries only the reference, never the value. The first thing
+`infra/index.ts` does is validate its config. Without `DB_PASSWORD`, `pulumi preview` and
+`pulumi up` exit 1 with `DB_PASSWORD is not set — …`, before any provider is reached. Without
+`PULUMI_CONFIG_PASSPHRASE`, Pulumi itself fails and names it. The program has no fallback such as
+`?? "changeme"`.
+
+The Secret is written as `data` (base64), not `stringData`. `stringData` is write-only, so the API
+never returns it and every `up` would show a diff. With `data`, two `up` runs in a row report
+`8 unchanged`. Don't run `pulumi refresh` on this stack: it drops the Secret from the state, and
+the next `up` then fails with `already exists`.
+
+Base64 is not encryption. In this local cluster the value sits in etcd as plain text, because no
+encryption-provider-config is set. Putting the password in a Secret takes it out of git; it does
+not encrypt it. The BuildKit secret further down is a different thing with a different job. It
+exists only during `docker build` and keeps the registry token out of the image. The K8s Secret
+exists at runtime and keeps the database password out of the repository. Both are needed, and
+neither one replaces the other.
+
+**In a production cluster** Pulumi would not be the one to carry the value. There are two common
+ways to do it. The **External Secrets Operator** runs in the cluster, reads the secret from
+Vault, AWS Secrets Manager or GCP Secret Manager, and keeps a normal K8s Secret in sync with it.
+The Deployment's `secretKeyRef` stays the same, rotation happens in the store, and Pulumi state
+never sees the value. The **Secrets Store CSI driver** mounts the secret from the provider as a
+volume when the pod starts. If it is set up without the optional sync to a K8s Secret, the value
+never reaches etcd at all. Neither one is installed here; the homework only asks for them to be
+named.
+
+### The image
+
+`docker/Dockerfile` has four stages: `deps`, then `build`, then `prod-deps`, then `runtime`. The
+builders are `node:22-bookworm-slim` and the runtime is `gcr.io/distroless/nodejs22-debian12:nonroot`.
+Both are Debian 12, so a native module built in one loads in the other. The runtime has no shell and
+no package manager, and it runs as `USER 65532:65532`. The user is given as a number on purpose:
+`USER nonroot` combined with `runAsNonRoot: true` fails with "image has non-numeric user (nonroot),
+cannot verify user is non-root", because kubelet does not resolve names. Distroless is not here to
+save size; the image is 360 MB, mostly `node_modules`. The point is that after an RCE an attacker
+finds no `sh`.
+
+The npm registry token is a BuildKit secret, `RUN --mount=type=secret,id=npm_token`. It is written
+into a temporary `.npmrc` and deleted again inside the same `RUN`, so it never ends up in a layer.
+It is scoped to `@marketplace-private` on `npm.pkg.github.com`. That registry is not used, which
+makes `.npm_token` a decoy, and the public registry never sees the token. The two other ways to pass
+it both leak:
+an `ARG` ends up in `docker history`, and `COPY` followed by `rm` leaves the bytes in the earlier
+layer with only a whiteout on top. `demo:image` checks all three places, because no single tool sees
+both leaks. To make sure it really catches them, it was run against a deliberately leaky image (an
+`ARG` plus `COPY .npm_token` and then `rm`), which gave:
+
+```
+shell-inside=1  runtime-uid=0  token-in-history=3  token-in-config=0  token-in-layers=1
+```
+
+The real image gives:
+
+```
+$ npm run demo:image
+image=marketplace-api:1.0.0
+layers-searched=24
+stages=4
+shell-inside=0
+runtime-uid=65532
+token-in-history=0
+token-in-config=0
+token-in-layers=0
+```
+
+`shell-inside` comes from actually trying `docker run --entrypoint sh|/bin/sh|/busybox/sh`, not
+from reading the Dockerfile. `runtime-uid` is what `process.getuid()` returns inside the image when
+it starts the default way. `token-in-layers` is found by unpacking `docker save` and reading every
+layer listed in `manifest.json`, whether it is a plain tar, gzip or zstd.
+
+### The scan gate
+
+`npm run scan` runs Trivy on the image (the local `trivy` binary, or `aquasec/trivy:0.76.2` when
+none is installed). It counts the CRITICAL and HIGH findings that already have a fixed version,
+and compares the count with `SCAN_MAX`:
+
+```
+$ SCAN_MAX=-1 npm run scan;    echo "exit=$?"     # found=21 max-allowed=-1    gate=fail  exit=1
+$ SCAN_MAX=99999 npm run scan; echo "exit=$?"     # found=21 max-allowed=99999 gate=pass  exit=0
+```
+
+The verdict is worked out from the report. A scan that could not run at all prints `gate=error` and
+exits 2, because an empty report does not mean a clean image. Of the 21 findings on 2026-11-16, 7
+are `libssl3` in the distroless base and the rest are npm packages: `multer`, which comes with
+`@nestjs/platform-express`, plus `body-parser`, `fast-uri` and `lodash`. The working threshold is
+`SCAN_MAX=25` (the script's default and `.github/workflows/image.yml`). It is a ceiling the team
+raises or lowers on purpose, through `vars.SCAN_MAX`. It is not a promise that the image stays
+green, because the scanner's database changes every day.
+
+### The rollout
+
+| Setting | safe | broken |
+| --- | --- | --- |
+| `strategy.rollingUpdate` | `maxUnavailable: 0`, `maxSurge: 1` | `maxUnavailable: 1`, `maxSurge: 1` |
+| readinessProbe | `/readyz`, every 1 s, 1 failure | none |
+| livenessProbe | `/healthz`, every 10 s, 3 failures, from 10 s | none |
+| `DRAIN_MS` | 5000 | 0 (closes on SIGTERM) |
+| `terminationGracePeriodSeconds` | 15 | 15 |
+
+Liveness and readiness use different paths on purpose. A pod that is warming up or draining is not
+ready, and that is expected. If liveness pointed at `/readyz`, every drain would turn into a restart
+and a slow start would turn into a restart loop. The liveness probe starts late (10 s) and gives up
+slowly (3 × 10 s), because a bad liveness probe is worse than none.
+
+`demo:rollout` first brings the Deployment to the chosen profile at its current revision and waits
+until it settles. Then it starts the load and lets 3 s of baseline run. Then it runs `pulumi up` with
+`APP_REV + 1`. A change to the pod template is what starts a rollout; a rebuilt image under the same
+tag would change nothing that Kubernetes can see. The load keeps going until only new pods are left,
+all of them ready, plus 2 s. `rollout-seconds` runs from the creation of the new ReplicaSet to the
+moment that the last old pod is gone, drain included. A broken run puts the safe profile back on its
+way out.
+
+```
+$ npm run demo:rollout
+# code 200: 286474
+profile=safe
+keepalive=1
+rev-from=1
+rev-to=2
+requests=286474
+ok=286474
+failed=0
+rollout-seconds=23
+```
+
+| Run | Profile | Client | requests | failed | rollout-seconds |
+| --- | --- | --- | ---: | ---: | ---: |
+| 1 | safe | keep-alive, 16 in flight | 286 474 | **0** | 23 |
+| 2 | safe | keep-alive, 16 in flight | 284 597 | **0** | 22 |
+| 3 | safe | keep-alive, 16 in flight | 312 488 | **0** | 22 |
+| 4 | safe | new connection per request, 300/s | 8 221 | **0** | 22 |
+| 5 | broken | keep-alive, 16 in flight | 54 479 | 20 (all `000`) | 2 |
+| 6 | broken | keep-alive, 16 in flight | 52 420 | 3 150 (≈ 6 %) | 2 |
+| 7 | broken | new connection per request, 300/s | 1 877 | 54 (all `000`, ≈ 3 %) | 2 |
+
+The safe profile gave zero failures on every run. The broken one fails every time, but how many
+requests fail swings widely from run to run (20 and 3 150 on the same settings), and it also depends
+on the client. With keep-alive at about 6 000 req/s, most requests stay on
+connections to old pods that are still alive, so the few seconds of breakage are a small share of
+a large count. At a fixed 300 req/s with a new connection for each request, the share is closer to
+a few percent. That is still well below the "one request in six" from the lecture, which used curl
+through a different path. The failures appear as `000` (no response) and not as 5xx, because the
+client talks to the NodePort directly and nothing in between turns a refused or reset connection
+into a 502. The safe profile takes about ten times as long. `maxUnavailable: 0` keeps each old pod
+until its replacement has warmed up (4 s) and turned ready, and the drain adds up to 5 s for every
+old pod.
+
+There is one trap in measuring this on macOS. Without keep-alive and with no rate limit, the first
+version of the generator showed 16 398 failures on the **safe** profile. The cluster was not the
+cause. Every request leaves a host socket in TIME_WAIT for 2 × MSL = 30 s, macOS has 16 383
+ephemeral ports, and so above roughly 540 new connections per second the host runs out of ports
+(`EADDRNOTAVAIL`). A steady cluster with no rollout at all showed the same thing: 12 166 sockets in
+TIME_WAIT after 10 s at 1 200 req/s. That is why `scripts/load.mjs` uses keep-alive by default and
+gets `--rate` (300/s by default) with `LOAD_KEEPALIVE=0`.
+
+### The PodDisruptionBudget
+
+The PDB uses `maxUnavailable: 1` rather than `minAvailable`. The reason is that `maxUnavailable: 1`
+stays "one pod at a time" whatever the HPA does to the replica count, while `minAvailable: 2` turns
+into a budget that blocks every drain once the HPA scales down to 2. With three replicas,
+`disruptionsAllowed` is 1:
+
+```
+$ kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptionsAllowed}{"\n"}'
+1
+$ npm run demo:pdb
+replicas=3
+healthy=3
+minAvailable=2
+disruptions-allowed-before=1
+evict-1=201
+evict-2=429
+```
+
+Both evictions go through the Eviction API, which is the path `kubectl drain` uses. The codes are
+the HTTP statuses of the two `POST …/pods/<name>/eviction` requests, sent through `kubectl proxy`.
+(`kubectl create --raw … -o json` is no use here, because kubectl 1.33+ rejects `--raw` together
+with `--output`.) A plain `kubectl delete pod` never asks the PDB at all; this is how PDBs are
+defined to work, not a bug. `minAvailable=` is the PDB's `status.desiredHealthy`, which is what
+`maxUnavailable: 1` works out to at three replicas. The demo spends the budget and then waits for
+the Deployment to recover, so `disruptionsAllowed` should be read **before** it runs.
+
+### replicas vs HPA
+
+The HPA is `autoscaling/v2` with `minReplicas: 2`, `maxReplicas: 6` and a CPU target of 70 %. kind
+has no metrics-server, so the HPA shows `cpu: <unknown>/70%` and never scales anything. That is why
+`spec.replicas: 3` stays in the program. In a production cluster with metrics-server this becomes a
+field-ownership conflict: two writers, the program and the HPA (through the scale subresource),
+both own `spec.replicas`. The HPA scales the Deployment to, say, 5. The next `pulumi up` applies
+`replicas: 3` with server-side apply and takes the field back, which kills two pods that were
+handling load. The HPA then scales up again. The fix is to let the HPA be the only writer. Once the
+HPA is active, remove `replicas` from the Deployment (or use `ignoreChanges: ["spec.replicas"]`)
+and let `minReplicas` act as the floor.
+
+### Not done
+
+There is no `startupProbe` (the bonus). The 4 s warm-up is short and steady, and readiness already
+covers it. Liveness starts at 10 s, which is longer than the warm-up. There is no sidecar either.
 
 # The OpenAPI contract in detail
 

@@ -1,0 +1,18 @@
+{
+  "name": "marketplace-k8s",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pulumi program: the marketplace API on a local kind cluster",
+  "main": "index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pulumi/kubernetes": "4.34.3",
+    "@pulumi/pulumi": "3.276.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "~5.9.3"
+  }
+}

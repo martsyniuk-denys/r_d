@@ -54,7 +54,17 @@
     "db:schema": "docker compose exec -T postgres psql -U marketplace -d marketplace -v ON_ERROR_STOP=1 -q -f - < db/schema.sql",
     "db:seed": "docker compose exec -T postgres psql -U marketplace -d marketplace -v ON_ERROR_STOP=1 -q -f - < db/seed.sql",
     "db:indexes": "docker compose exec -T postgres psql -U marketplace -d marketplace -v ON_ERROR_STOP=1 -q -f - < db/indexes.sql && docker compose exec -T postgres psql -U marketplace -d marketplace -q -c \"ANALYZE;\"",
-    "db:psql": "docker compose exec postgres psql -U marketplace -d marketplace"
+    "db:psql": "docker compose exec postgres psql -U marketplace -d marketplace",
+    "image:build": "bash scripts/image-build.sh",
+    "scan": "bash scripts/scan.sh",
+    "cluster:up": "bash scripts/cluster.sh up",
+    "cluster:down": "bash scripts/cluster.sh down",
+    "up": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh up",
+    "preview": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh preview",
+    "destroy": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh destroy",
+    "demo:image": "bash demo/image.sh",
+    "demo:rollout": "bash scripts/with-secrets.sh dev bash demo/rollout.sh",
+    "demo:pdb": "bash demo/pdb.sh"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1160.0",

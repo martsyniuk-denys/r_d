@@ -11,3 +11,8 @@ spec.json
 secrets/*
 !secrets/*.example
 backups/
+
+# The build-stage registry token (a decoy where there is no private registry) and
+# the local Pulumi file backend, whose state holds the encrypted K8s Secret.
+.npm_token
+.pulumi/
