@@ -1,0 +1,6 @@
+name: hw31-base
+description: The $0 stack of the AWS homework — budget, network, security groups, the CI role
+runtime:
+  name: nodejs
+  options:
+    typescript: true
