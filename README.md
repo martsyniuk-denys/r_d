@@ -357,6 +357,32 @@ of record from here on.
 
 ## Grading
 
+### CI/CD (the pipeline homework)
+
+What is graded is the PR's run on GitHub (the `pr-run:` line in [CI/CD](#cicd)) and the three
+local demos below. None of them talks to GitHub, needs a cluster, or needs the store. Docker is
+needed for the scanner and for `oasdiff`, which runs as an image pinned by digest when no local
+binary is found. The image is built once if it is missing. `package.json` is in the repository
+root.
+
+```bash
+git clone https://github.com/martsyniuk-denys/r_d && cd r_d && git checkout feature/homework_30
+npm ci
+
+export SKIP_VAULT=1               # the grader has no access to the store
+export DB_PASSWORD=grader-secret  # the only app secret the stand reads (the сховище table in CI/CD)
+
+npm run demo:gates                # four steps, both sides: <step>-ok=0, <step>-broken=1
+npm run demo:oidc                 # case=green 1 1, case=foreign-sub 1 0, case=bad-signature 0 0
+PLAN_JSON=/tmp/hw32/plan.json COST_BUDGET_USD=0      npm run gate:cost   # gate=fail, exit 1
+PLAN_JSON=/tmp/hw32/plan.json COST_BUDGET_USD=999999 npm run gate:cost   # gate=pass, exit 0
+```
+
+`plan.json` comes from the run's `pipeline-evidence` artifact
+(`gh run download <run> -n pipeline-evidence -D /tmp/hw32`). It is not committed. The GHCR
+package `ghcr.io/martsyniuk-denys/r_d` is public, so criterion 5 can compare the digest with the
+registry.
+
 ### AWS (the cloud homework, fallback lane: LocalStack)
 
 The grader's gate is the teardown run linked at the top of [AWS](#aws), not anything on this
@@ -1507,7 +1533,8 @@ set, which is what CI does with `github.sha`.
 
 ## CI
 
-`.github/workflows/contract.yml` runs one job, `contract`: compile → integration → e2e →
+`.github/workflows/contract.yml` (since HW-32 a reusable workflow that `gates.yml` calls on every
+PR, see [CI/CD](#cicd)) runs one job, `contract`: compile → integration → e2e →
 consumer contract → **publish** → **provider verification** (with
 `publishVerificationResult: true`) → record the provider version as what is in prod →
 **can-i-deploy**, which fails the job when the answer is not `true`. The broker comes from
@@ -3209,7 +3236,7 @@ scripts/pulumi.sh           up | preview | destroy against a local file backend
 scripts/load.mjs            load generator: one status code per line, 000 for no response
 scripts/scan.sh             Trivy report → found vs SCAN_MAX → gate=pass|fail
 demo/image.sh, rollout.sh, pdb.sh
-.github/workflows/image.yml build → demo:image → scan with the working threshold
+.github/workflows/build.yml build → push → demo:image → scan with the working threshold (HW-32: the one build of the pipeline)
 ```
 
 ## Kubernetes
@@ -3355,7 +3382,7 @@ The verdict is worked out from the report. A scan that could not run at all prin
 exits 2, because an empty report does not mean a clean image. Of the 21 findings on 2026-11-16, 7
 are `libssl3` in the distroless base and the rest are npm packages: `multer`, which comes with
 `@nestjs/platform-express`, plus `body-parser`, `fast-uri` and `lodash`. The working threshold is
-`SCAN_MAX=25` (the script's default and `.github/workflows/image.yml`). It is a ceiling the team
+`SCAN_MAX=25` (the script's default and `.github/workflows/build.yml`). It is a ceiling the team
 raises or lowers on purpose, through `vars.SCAN_MAX`. It is not a promise that the image stays
 green, because the scanner's database changes every day.
 
@@ -4160,6 +4187,273 @@ this?". The answer is IAM, and it is audited. This project's equivalents of an `
 under a data key that KMS wraps, and decrypted with `kms:Decrypt` at start-up. The store would
 still deliver them. I did **not** create a customer-managed key: it is a monthly line of its own,
 and `destroy` only *schedules* its deletion (7–30 days), so it outlives the stack.
+
+# CI/CD: a pipeline in which every step can say no (CI/CD: конвеєр, у якому кожен крок може сказати «ні»)
+
+On #28 I ran everything myself, from my own machine: the build, the scan, `pulumi up`,
+`demo:rollout`. Now the pipeline runs the same scripts on every PR, and a PR can be merged only if
+each of them says yes. None of the pieces is new; what changed is who runs them. A step that
+cannot fail is a report, not a gate, so each gate below is checked both ways:
+`npm run demo:gates` and `npm run demo:oidc` show it failing on a broken input and passing on a
+correct one.
+
+## CI/CD
+
+pr-run: https://github.com/martsyniuk-denys/r_d/pull/23 — the graded run is the latest green `pr` run on the PR head (first green: https://github.com/martsyniuk-denys/r_d/actions/runs/43934560195 — 243 468 requests, failed=0, rollout 24 s, built = deployed = registry digest)
+cost-gate-bypass-label: cost-approved
+
+**Paths for the criteria.** The workflows are in `.github/workflows/`. The trust condition is
+`oidc/policy.json`, and the gate that applies it is `scripts/oidc-gate.mjs`. The cost mapping is
+`src/mapping.ts` (the CLI around it is `src/cost-gate.ts`). The Pulumi program is `infra/`, the
+same program as #28; the only change is that `APP_IMAGE` can override the image. The npm scripts
+are in the root `package.json`.
+
+### Jobs and their dependencies
+
+```
+pr.yml (pull_request, workflow_dispatch)        deploy.yml (push to main, workflow_dispatch)
+  │                                                │  same four jobs, same reusable workflows
+  ├─ gates ── gates.yml ───────────────┐
+  │    ├─ workflows   actionlint                   │
+  │    ├─ types       tsc --noEmit + eslint        │
+  │    ├─ contract    oasdiff breaking, base → PR  │
+  │    ├─ arch        dependency-cruiser           │
+  │    └─ pact        contract.yml (HW #16)        │
+  ├─ build ── build.yml ───────────────┤  the only docker/build-push-action in the repo
+  │    build → push to GHCR → digest in outputs → pull back by digest
+  │    → demo:image → npm run scan (step 4 of the ladder)
+  ├─ deploy ─ deploy-kind.yml  needs: [gates, build], environment: kind
+  │    OIDC gate → kind + crictl pull <repo>@<digest> → pulumi preview --json
+  │    → gate:cost → pulumi up → manifest check → demo:rollout (failed must be 0)
+  └─ evidence  needs: all three, if: always() → artifact pipeline-evidence
+```
+
+| Workflow | Triggers | What it is |
+| --- | --- | --- |
+| `pr.yml` | `pull_request`, `workflow_dispatch` | gates, a single build, preview, cost gate, deploy to kind, rollout, evidence |
+| `deploy.yml` | `push` to `main`, `workflow_dispatch` | the same chain for the main branch: `pulumi up` runs only after every gate is green |
+| `gates.yml`, `build.yml`, `deploy-kind.yml` | `workflow_call` | the reusable parts the two workflows share |
+| `contract.yml` | `workflow_call`, `workflow_dispatch` | Pact (#16), called by `gates.yml` |
+| `teardown.yml` | `schedule` + `workflow_dispatch` | #31's teardown; manual dispatch is there because a scheduled run can come late |
+
+The shared setup steps (Node 22, the npm cache keyed on both lock files, `npm ci`) live in the
+composite action `.github/actions/node`. The assembly of the evidence artifact lives in
+`.github/actions/evidence`.
+
+Every `uses:` that points outside the repository is pinned to a commit SHA, with the tag in a
+comment next to it (`actions/checkout@3d3c42e…  # v7.0.1`). A tag can move: `@v7` today and `@v7`
+next month may be different code, and that code runs with this job's permissions. The whole set
+passes `actionlint` with no findings, and the `workflows` gate runs it on every PR.
+
+**Build once, promote by digest.** The image is built in exactly one place. `build.yml` pushes
+`ghcr.io/martsyniuk-denys/r_d:<github.sha>` and returns `steps.build.outputs.digest` as a job
+output. `deploy-kind.yml` gets that digest as an input and sets
+`APP_IMAGE=<repo>@sha256:…`, which is what Pulumi writes into the pod template. The tag is there
+for people; nothing is deployed by tag. The image is pulled into the kind node with
+`crictl pull` by digest, so the node holds the registry's digest, which is the one the pod spec
+names. `kind load` of an image from the host would repack it under a different digest. After
+`pulumi up`, `scripts/ci/manifest.sh` reads the Deployment back from the cluster and fails if
+its digest differs from the built digest. The GHCR package is public, so the grader can compare
+the digest with the registry.
+
+### Where it deploys, and what the environments are called
+
+There is one environment, **`kind`**. It is a GitHub Environment, and it is the only place that
+holds `STORE_KEY`. The stand is a one-node kind cluster created inside the runner. The Pulumi
+state uses a file backend in the workspace (`PULUMI_BACKEND_URL` defaults to `file://<repo>/.pulumi`,
+the same as #28), so the pipeline never logs in to a Pulumi account. The cluster and its state
+are gone when the job ends. A PR run and a `main` run deploy to the same environment, and in
+both cases the OIDC `sub` is `…:environment:kind`.
+
+### OIDC instead of a long-lived key, with the signature verified
+
+The deploy job is the only job that holds `permissions: id-token: write`. The grant is on the job
+(`deploy-kind.yml`, and on the calling job in `pr.yml` and `deploy.yml`), never on a file. A
+file-level grant would let every job ask for a token, including the jobs that run the PR's code.
+The first step of the job asks GitHub for an ID token with `aud=marketplace-kind-deploy` and
+writes it to a 0600 file. It then runs `scripts/oidc-gate.mjs`, which:
+
+1. fetches `<issuer>/.well-known/openid-configuration` and checks that its `issuer` is the one
+   expected, then follows `jwks_uri`;
+2. verifies the RS256 signature with the key from that set whose `kid` matches. It accepts only
+   RS256, because `none` and `HS*` (an HMAC keyed with a public key) are the classic ways to make
+   a signature "verify" without the issuer's private key;
+3. checks `iss`, `aud`, `exp`/`nbf` and `sub` against `oidc/policy.json`;
+4. prints `iss`, `aud`, `sub`, `sig-verified` and `policy-allow`. It never prints the token.
+
+The issuer, the audience, the JWKS address and the policy file are all parameters, so the gate
+cannot tell CI from `demo:oidc`. The `sub` condition is an exact match, with no patterns:
+
+```
+repo:martsyniuk-denys@16865806/r_d@1325481547:environment:kind
+```
+
+That line is the only thing that tells this repository from any other. Without it, `iss`, `aud`
+and the signature all stay green for any GitHub repository that asks for this audience. This
+repository's `sub` carries GitHub's immutable ids (`owner@owner-id/repo@repo-id`), the same as on
+#31. A condition written as `repo:martsyniuk-denys/r_d:…` would never match it. Because the job
+has `environment: kind`, its `sub` ends in `environment:kind` and not in a `ref:`. A condition on
+the branch would never match a job that has an environment.
+
+Without a cloud, the gate itself decides whether the deploy goes ahead. If the gate says no, the
+step fails and nothing after it runs. On real AWS the same token would go to
+`sts:AssumeRoleWithWebIdentity` through the #31 role, whose trust policy checks the same `aud`
+and `sub`. LocalStack accepts any token, including one without a signature
+(`evidence/localstack-iam.txt`). That is why the check is code of my own, tested on real
+signatures that I make myself.
+
+### Two sets of secrets that never mix
+
+**The pipeline's secrets**, meaning registry and cloud access, are not stored anywhere. The
+registry is reached with the job's `GITHUB_TOKEN` (`packages: write` for the build,
+`packages: read` for the pull into kind). Identity comes from the OIDC token, which lives for
+minutes and exists only for the deploy job. There is no `AWS_*`, registry password or service
+account key in GitHub Secrets. The build-stage npm token is a random value generated in the job,
+because there is no private npm registry (#28).
+
+| `${{ secrets.X }}` | Where it is set | Why |
+| --- | --- | --- |
+| `STORE_KEY` | secret of the `kind` environment | the key to the store (`store/ci.enc`). It opens the store, not a cloud or a registry. Only jobs in the `kind` environment can read it |
+| `PACT_BROKER_URL` | repository secret, optional; **not set** | a hosted Pact broker (#16). When it is empty, the broker from compose runs on the runner |
+| `PACT_BROKER_TOKEN` | repository secret, optional; **not set** | the token for that broker |
+| `GITHUB_TOKEN` | issued by GitHub for each job | GHCR: push in `build`, pull into kind in `deploy` |
+
+**The app's secrets** live in the store from #11 and appear when the app is deployed, not when it
+is built. On a laptop the store is `.env` plus `secrets/`. A runner has neither, so for CI the
+store is `store/ci.enc`: `NAME=value` lines encrypted with AES-256-CBC and PBKDF2 (200,000
+iterations), committed only as ciphertext. `scripts/with-secrets.sh ci …` decrypts it into its
+own process, never to disk, exports the values and unsets `STORE_KEY` before it runs the command.
+The app and Pulumi never see the key. The values were generated for CI (`scripts/store-ci.sh init`)
+and protect only the stand the runner creates; none of them is a value from the dev store. The
+store reaches the pod in the same way as on #28: Pulumi writes a K8s Secret (`data`, base64), and
+the container reads it with `secretKeyRef`. `scripts/ci/manifest.sh` counts how many times the
+value appears in the Deployment, both as plain text and as base64, and the count must be 0.
+Base64 is not encryption: putting the value in a Secret means it is not in git, not that it is
+encrypted.
+
+| Variable | Store | What it is for |
+| --- | --- | --- |
+| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password` locally, `store/ci.enc` in CI; exported by `with-secrets.sh` | the database password. It reaches the pod through the K8s Secret `marketplace-api-db` and `secretKeyRef` |
+| `PULUMI_CONFIG_PASSPHRASE` | **сховище** (#11): `secrets/pulumi_passphrase` locally, `store/ci.enc` in CI | encrypts the Pulumi state, which holds the Secret's value |
+| `STORE_KEY` | the key **to** the store, not a value in it: `secrets/ci_store_key` locally, the `kind` environment's secret in CI | decrypts `store/ci.enc`, and is dropped before the wrapped command runs |
+
+### Where masking ends
+
+Masking is not protection. The runner replaces the exact characters of each registered value in
+the log, and nothing else. A value that has been base64-encoded, URL-encoded, split across two
+lines, cut with `cut`, or passed to a tool that prints it its own way (a `curl -v` header, a
+stack trace that quotes an argument, `set -x` with a value that became part of a longer
+string) is a different string, and goes into the log as it is. Only values that came from
+`secrets.*` are registered at all. The values from `store/ci.enc` are decrypted inside a process,
+so the runner never learns them and cannot mask them.
+
+The protection is that nothing prints a secret. There is no `echo "$SECRET"`, `env`, `printenv`
+or `set -x` in any step that can see one. The OIDC token goes to a 0600 file and is removed by a
+`trap`. The gate prints its claims, not the token. `manifest.sh` prints a count, not the value.
+The secret value is checked against the manifest by the step that knows it, and only the number
+leaves the job. This is the sixth way a secret can leak, after the five closed on #11 (git
+history, the app log, an image layer, `docker inspect`, `docker history`): the pipeline log.
+
+### The four steps of the quality ladder
+
+| Step | Tool | Catches | Broken input in `demo:gates` |
+| --- | --- | --- | --- |
+| 1. types | `tsc --noEmit` + `eslint` (`eslint.config.mjs`) | a defect in my own code | `test/gates/types/broken.ts`: `env.PROT` (a typo in the type), `==` |
+| 2. contract | `oasdiff breaking --fail-on ERR`, the PR base's `openapi.yaml` against the PR's | a change that breaks a client already on v1, whether or not its Pact consumer is known | the spec with `GET /products/{productId}` renamed away |
+| 3. architecture | `dependency-cruiser` (`.dependency-cruiser.cjs`) | a forbidden import between modules | `test/gates/arch/src/products/leak.ts`: the catalog imports `OrdersService` |
+| 4. image | `npm run scan`, Trivy with the #28 threshold | findings above the threshold | `SCAN_MAX=-1`, which no image passes (`99999` passes) |
+
+**The modules do not reach into each other.** Step 3 is how this sentence is checked:
+
+- `catalog-does-not-know-orders`: orders depend on the catalog (an order line needs a product),
+  never the other way round. Nothing in `products`, `files`, `storage`, `auth`, `entities`,
+  `repositories`, `common`, `config`, `db`, `observability` or `cache` imports `orders` or
+  `realtime`.
+- `storage-only-through-files`: the S3 client is an internal detail of the `files` module.
+  Other modules ask `files`.
+- `leaves-stay-leaves`: `entities` and `observability` are imported by everyone and import no
+  other module.
+
+None of the steps has `continue-on-error` or `|| true`. A step with either one cannot fail, so it
+would not be a gate.
+
+### demo:rollout as a merge condition
+
+After `pulumi up`, the deploy job runs the #28 script unchanged: `npm run demo:rollout` with
+`STORE_SLUG=ci`, the same `demo/rollout.sh` and the same `scripts/load.mjs`, which writes one
+status code per line. The script changes `REV` in the pod template, which starts a rollout, and
+it counts `requests`, `ok` and `failed` from that file. `failed ≠ 0` or `requests < 2000`
+(`MIN_REQUESTS=2000`, lower than #28's 5,000 because a runner is slower than a laptop and also
+runs the cluster) gives a non-zero exit. That fails the job, which fails the PR.
+
+### Cost gate
+
+`pulumi preview --json` runs in the deploy job before `pulumi up`. The infrastructure change
+appears in the PR's checks next to the code change, and its output becomes `plan.json` in the
+artifact. `npm run gate:cost` reads it:
+
+```
+plan-usd    the monthly cost of the state the plan leads to, computed by src/mapping.ts
+base-usd    the cost of the state it starts from (the oldState of each step)
+budget-usd  COST_BUDGET_USD when given, otherwise base-usd + max($10, 20 %)
+gate        pass when plan-usd <= budget-usd; fail exits 1
+```
+
+The default budget follows the change, not the total. An absolute limit would break on the first
+expensive resource and keep every later PR red. In CI the stack is created fresh in each run, so
+`base-usd` is 0 and the default budget is $10 a month. One replica costs $1.68, so going from 3
+replicas to 5 passes ($8.40) and going to 6 fails ($10.08).
+
+**Bypass.** If the PR has the label `cost-approved`, the gate still prints `gate=fail` with
+`bypass=cost-approved` on the next line and exits 0. The verdict is still recorded in the log;
+the label only stops it from blocking. The label name is on the `cost-gate-bypass-label:` line at
+the top of this section.
+
+**Rates** (`RATES` in `src/mapping.ts`). kind bills nothing, so the price is what the same
+requests would cost elsewhere: the pod requests priced as AWS Fargate pods, plus the two
+Kubernetes objects that become a bill on any cloud.
+
+| What | Rate | Source |
+| --- | --- | --- |
+| vCPU of `resources.requests.cpu` | $0.04048 per vCPU-hour | [AWS Fargate pricing](https://aws.amazon.com/fargate/pricing/), Linux/x86, us-east-1 |
+| GiB of `resources.requests.memory` | $0.004445 per GB-hour | same |
+| `Service` of type `LoadBalancer` | $0.0225 per hour (NLB) | [Elastic Load Balancing pricing](https://aws.amazon.com/elasticloadbalancing/pricing/) |
+| `PersistentVolumeClaim` storage | $0.08 per GB-month (gp3) | [Amazon EBS pricing](https://aws.amazon.com/ebs/pricing/) |
+| Month | 730 hours | |
+
+Today's plan: 3 replicas × (50m CPU + 64Mi) = **$5.04/month**. The Service is a NodePort, so it
+costs nothing.
+
+### The artifact pipeline-evidence
+
+The `evidence` job runs with `if: always()`, so a red run has evidence too. It collects what
+`build` and `deploy` uploaded:
+
+| File | Contents |
+| --- | --- |
+| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source`, `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secret-in-manifest`, `gate-scan-exit`, plus the cost lines |
+| `deployment.json` | `kubectl get deploy marketplace-api -o json` after `pulumi up` |
+| `plan.json` | `pulumi preview --json`, the input to the cost gate |
+| `rollout.txt` | the raw output of `demo:rollout` |
+| `build.log` | one line per build in this run |
+
+None of the numbers is typed in by hand. `rollout-*` come from the file the load generator
+writes. `built-digest` comes from the build step's output. `deployed-digest` and
+`secret-in-manifest` come from the Deployment read back from the cluster. `plan-usd` comes from
+`plan.json`, and `oidc-sig-verified` comes from the signature check. If one of these is missing,
+its key is left out of `evidence.txt` rather than replaced with a default.
+
+### Commands
+
+```bash
+npm run demo:gates     # four steps × (ok, broken): <step>-ok=0, <step>-broken≠0
+npm run demo:oidc      # green 1 1 · foreign-sub 1 0 · bad-signature 0 0
+PLAN_JSON=plan.json COST_BUDGET_USD=0 npm run gate:cost   # gate=fail, exit 1
+npm run gate:types | gate:arch                            # one step, as CI runs it
+npm run gate:contract -- <base.yaml> <revision.yaml>
+STORE_SLUG=ci STORE_KEY=$(cat secrets/ci_store_key) npm run plan   # what CI previews
+bash scripts/store-ci.sh names                            # the names in store/ci.enc, never the values
+```
 
 # The OpenAPI contract in detail
 

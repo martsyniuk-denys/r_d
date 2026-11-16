@@ -1,0 +1,61 @@
+# The deploy pipeline: a push to main (or a manual run) goes through the same gates
+# and the same single build, then the same digest goes to the `kind` environment —
+# pulumi up only after every gate is green.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Deploys of main queue up; none is cancelled halfway through a rollout.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  gates:
+    uses: ./.github/workflows/gates.yml
+    with:
+      base: ${{ github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.event.repository.default_branch }}
+    secrets:
+      PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+
+  build:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+      packages: write
+
+  deploy:
+    needs: [gates, build]
+    uses: ./.github/workflows/deploy-kind.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    with:
+      repository: ${{ needs.build.outputs.repository }}
+      digest: ${{ needs.build.outputs.digest }}
+    # a reusable workflow reads its environment's secrets (STORE_KEY of `kind`) only
+    # when the caller passes them down
+    secrets: inherit
+
+  evidence:
+    name: pipeline-evidence
+    needs: [gates, build, deploy]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/evidence
+        with:
+          head-sha: ${{ github.sha }}
+          image-ref: ${{ needs.build.outputs.image-ref }}
+          built-digest: ${{ needs.build.outputs.digest }}
+          scan-exit: ${{ needs.build.outputs.scan-exit }}

@@ -1,0 +1,6 @@
+{
+  "comment": "Trust condition of the deploy gate (scripts/oidc-gate.mjs). sub is exact, no wildcards: the only job allowed through is one in THIS repository running in the `kind` environment. GitHub writes this repository's sub with immutable ids (owner@owner-id/repo@repo-id), as the token in the run log shows.",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "audience": "marketplace-kind-deploy",
+  "subjects": ["repo:martsyniuk-denys@16865806/r_d@1325481547:environment:kind"]
+}

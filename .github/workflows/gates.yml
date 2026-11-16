@@ -1,0 +1,85 @@
+# The quality gates — reusable, called by pr.yml and deploy.yml. Four places that
+# can say no, each a job of its own so the run shows which one did:
+#
+#   types     tsc --noEmit + eslint                  a defect in my own code
+#   contract  oasdiff, base spec → this spec         a break for whoever lives on v1
+#   arch      dependency-cruiser                     a forbidden import between modules
+#   pact      consumer contract, provider verification, can-i-deploy (HW #16)
+#
+# The fourth step of the ladder, the image scan, runs where the image is: build.yml.
+#   workflows actionlint over .github/workflows      a pipeline that is valid YAML only
+#
+# Every one of these exits non-zero on its broken input — `npm run demo:gates` shows
+# both sides locally. No continue-on-error, no `|| true`.
+name: gates
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: git ref or sha whose openapi.yaml is the contract this change must not break
+        type: string
+        required: true
+    secrets:
+      PACT_BROKER_URL:
+        required: false
+      PACT_BROKER_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  workflows:
+    name: workflows (actionlint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # needs: on a missing job, a typo inside ${{ }}, an unknown runs-on label — what a
+      # YAML parser lets through
+      - run: docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+  types:
+    name: types and style (tsc + eslint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node
+      - run: npm run gate:types
+
+  contract:
+    name: contract (oasdiff breaking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The spec as the base has it
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          git show FETCH_HEAD:openapi/openapi.yaml > "$RUNNER_TEMP/base.yaml"
+          echo "base $BASE = $(git rev-parse FETCH_HEAD)"
+      - run: npm run gate:contract -- "$RUNNER_TEMP/base.yaml" openapi/openapi.yaml
+
+  arch:
+    name: architecture (dependency-cruiser)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node
+      - run: npm run gate:arch
+
+  pact:
+    name: pact
+    uses: ./.github/workflows/contract.yml
+    secrets:
+      PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
