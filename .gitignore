@@ -16,3 +16,7 @@ backups/
 # the local Pulumi file backend, whose state holds the encrypted K8s Secret.
 .npm_token
 .pulumi/
+
+# The cost gate compiles src/mapping.ts here; demo:gates writes a temporary tsconfig.
+.cache/
+.tsconfig.gate.*

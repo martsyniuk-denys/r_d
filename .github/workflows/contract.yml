@@ -1,14 +1,24 @@
+# Pact (HW #16): consumer contract, provider verification and can-i-deploy. Called by
+# gates.yml as one of the gates of every PR and deploy run; dispatchable by hand.
 name: contract
 
 on:
-  push:
-    branches: ['**']
-  pull_request:
+  workflow_call:
+    secrets:
+      PACT_BROKER_URL:
+        required: false
+      PACT_BROKER_TOKEN:
+        required: false
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 jobs:
   contract:
     name: consumer contract, provider verification and the deploy gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     env:
       # The address and the token are secrets, never constants in the repository.
@@ -22,14 +32,9 @@ jobs:
       USE_LOCAL_BROKER: ${{ secrets.PACT_BROKER_URL == '' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
+      - uses: ./.github/actions/node
 
       - name: Compile
         run: npx tsc --noEmit

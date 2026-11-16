@@ -2,7 +2,7 @@
   "name": "marketplace-api-contract",
   "version": "1.0.0",
   "private": true,
-  "description": "Marketplace API coursework: OpenAPI contract, typed config, SQL data layer a TypeORM layer with migrations, JWT auth with refresh-token rotation, and direct-to-storage uploads behind an edge cache, a Kubernetes rollout, and logs, metrics and traces that share one trace_id",
+  "description": "Marketplace API coursework: OpenAPI contract, typed config, SQL data layer a TypeORM layer with migrations, JWT auth with refresh-token rotation, and direct-to-storage uploads behind an edge cache, a Kubernetes rollout, logs, metrics and traces that share one trace_id, and a CI/CD pipeline whose every step can say no",
   "main": "dist/main.js",
   "scripts": {
     "build": "nest build",
@@ -59,12 +59,21 @@
     "scan": "bash scripts/scan.sh",
     "cluster:up": "bash scripts/cluster.sh up",
     "cluster:down": "bash scripts/cluster.sh down",
-    "up": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh up",
-    "preview": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh preview",
-    "destroy": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh destroy",
+    "cluster:create": "bash scripts/cluster.sh create",
+    "up": "bash scripts/with-secrets.sh ${STORE_SLUG:-dev} bash scripts/pulumi.sh up",
+    "preview": "bash scripts/with-secrets.sh ${STORE_SLUG:-dev} bash scripts/pulumi.sh preview",
+    "plan": "bash scripts/with-secrets.sh ${STORE_SLUG:-dev} bash scripts/pulumi.sh plan",
+    "destroy": "bash scripts/with-secrets.sh ${STORE_SLUG:-dev} bash scripts/pulumi.sh destroy",
     "demo:image": "bash demo/image.sh",
-    "demo:rollout": "bash scripts/with-secrets.sh dev bash demo/rollout.sh",
+    "demo:rollout": "bash scripts/with-secrets.sh ${STORE_SLUG:-dev} bash demo/rollout.sh",
     "demo:pdb": "bash demo/pdb.sh",
+    "gate:types": "bash scripts/gates/types.sh",
+    "gate:contract": "bash scripts/gates/contract.sh",
+    "gate:arch": "bash scripts/gates/arch.sh",
+    "gate:oidc": "node scripts/oidc-gate.mjs",
+    "gate:cost": "tsc -p tsconfig.cost.json && node .cache/cost/cost-gate.js",
+    "demo:gates": "bash demo/gates.sh",
+    "demo:oidc": "node demo/oidc.mjs",
     "obs:up": "bash scripts/with-secrets.sh dev docker compose -f observability/compose.yml up -d --wait",
     "obs:down": "bash scripts/with-secrets.sh dev docker compose -f observability/compose.yml down",
     "demo:logs": "npm run build --silent && bash scripts/with-secrets.sh dev node demo/logs.mjs",
@@ -119,6 +128,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@nestjs/cli": "^10.4.9",
     "@nestjs/testing": "^10.4.22",
     "@pact-foundation/pact": "^17.1.4",
@@ -131,11 +141,14 @@
     "@types/node": "^22.20.1",
     "@types/pg": "^8.23.1",
     "@types/supertest": "^6.0.3",
+    "dependency-cruiser": "^18.7.2",
+    "eslint": "^10.15.0",
     "jest": "^30.5.2",
     "socket.io-client": "^4.8.4",
     "supertest": "^7.3.0",
     "ts-jest": "^29.4.14",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.73.0"
   },
   "engines": {
     "node": ">=18"
