@@ -1,0 +1,12 @@
+# One node, control plane and workloads together. The NodePort of the API is
+# mapped to the host, so the load generator talks to 127.0.0.1:30080 directly.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: marketplace
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        listenAddress: 127.0.0.1
+        protocol: TCP

@@ -13,3 +13,18 @@ spec.json
 .env.development
 .env.production
 secrets
+
+# The build-stage registry token reaches the build only as a BuildKit secret mount.
+.npm_token
+.npmrc
+
+# Nothing below is part of the image.
+.pulumi
+infra
+k8s
+demo
+test
+backups
+pacts
+db
+pgbouncer
