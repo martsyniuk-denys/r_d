@@ -3824,16 +3824,16 @@ numbers". The proof is a teardown run in GitHub Actions whose log ends in six ze
 teardown-run: TEARDOWN_RUN_URL
 region: eu-central-1 (stack config); every emptiness check also covers us-east-1
 
+**Paths for the criteria.** The programs are `infra/base` and `infra/demo` (A1). The
+`package.json` with the npm scripts is the **root** `package.json`. `git ls-files` sorts
+`infra/base/package.json` first, so B3 needs `PKG=package.json`. `infra/package.json` is the
+Kubernetes program from homework 28.
+
 **Why the fallback lane.** I already had an AWS account in the past, so AWS will not give me
 the Free plan or its credits ("You would be ineligible for free plan or Free Tier credits if you
 have an existing AWS account or have had one in the past"). Every hour would be billed in real
 money from the first minute. I declared the fallback lane before the first `pulumi up` and did
 not change it after.
-
-**Paths for the criteria.** The programs are `infra/base` and `infra/demo` (A1). The
-`package.json` with the npm scripts is the **root** `package.json`. `git ls-files` sorts
-`infra/base/package.json` first, so B3 needs `PKG=package.json`. `infra/package.json` is the
-Kubernetes program from homework 28.
 
 | Piece | Where |
 |---|---|
