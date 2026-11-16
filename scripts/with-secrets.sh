@@ -39,6 +39,7 @@ if [ ! -f "$CREDS" ]; then
   echo "               (tokens: node scripts/jwt-keys.mjs generate $ENV_SLUG)" >&2
   echo "               (files: STORAGE_* in .env, cp secrets/storage_secret_key.example secrets/storage_secret_key)" >&2
   echo "               (cluster: openssl rand -hex 24 > secrets/pulumi_passphrase)" >&2
+  echo "               (aws: AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY_FILE in .env, cp secrets/aws_secret_access_key.example secrets/aws_secret_access_key)" >&2
   echo "               (observability: OTEL_EXPORTER_OTLP_ENDPOINT, PROMETHEUS_URL, TRACE_API_URL, GRAFANA_* in .env, openssl rand -hex 16 > secrets/grafana_admin_password)" >&2
   echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* OTEL_EXPORTER_OTLP_ENDPOINT PROMETHEUS_URL TRACE_API_URL GRAFANA_* SKIP_VAULT=1" >&2
   exit 1
@@ -70,6 +71,19 @@ if [ -n "${STORAGE_SECRET_KEY_FILE:-}" ]; then
   fi
   STORAGE_SECRET_KEY="$(tr -d '\r\n' < "$STORAGE_SECRET_KEY_FILE")"
   export STORAGE_SECRET_KEY
+fi
+
+# The AWS secret key of the stand (the fallback lane: LocalStack's `test`) lives in a
+# file named by AWS_SECRET_ACCESS_KEY_FILE and is exported as AWS_SECRET_ACCESS_KEY.
+# CI never comes here: there the credentials are short-lived, from the OIDC role.
+if [ -n "${AWS_SECRET_ACCESS_KEY_FILE:-}" ]; then
+  if [ ! -f "$AWS_SECRET_ACCESS_KEY_FILE" ]; then
+    echo "with-secrets: $CREDS points at $AWS_SECRET_ACCESS_KEY_FILE, which is missing." >&2
+    echo "  cp secrets/aws_secret_access_key.example secrets/aws_secret_access_key" >&2
+    exit 1
+  fi
+  AWS_SECRET_ACCESS_KEY="$(tr -d '\r\n' < "$AWS_SECRET_ACCESS_KEY_FILE")"
+  export AWS_SECRET_ACCESS_KEY
 fi
 
 case "$ENV_SLUG" in

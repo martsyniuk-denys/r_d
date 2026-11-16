@@ -357,6 +357,35 @@ of record from here on.
 
 ## Grading
 
+### AWS (the cloud homework, fallback lane: LocalStack)
+
+The grader's gate is the teardown run linked at the top of [AWS](#aws), not anything on this
+machine. To repeat the local half without a store, Docker and the AWS CLI are enough. The
+LocalStack key pair is the public `test`/`test`, and the passphrase only encrypts a throwaway
+local state. `package.json` (root) has the npm scripts.
+
+```bash
+export SKIP_VAULT=1                                   # the grader has no access to the store
+export AWS_ENDPOINT_URL=http://127.0.0.1:23166        # LocalStack, never real AWS
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi" PULUMI_CONFIG_PASSPHRASE=hw31-grading
+export DB_PASSWORD=grader-secret                      # the RDS master password the demo stack asks for
+npm run localstack:up                                 # localstack/localstack:4.14.0 on 23166
+
+for d in infra/base infra/demo; do ( cd "$d" && npm ci >/dev/null 2>&1 && npx tsc --noEmit ); echo "$d exit=$?"; done
+npm run up:base                  # 19 resources; the budget is skipped: Budgets is 501 here
+npm run evidence:base            # public-subnets=2 private-subnets=2 subnet-azs=2 private-default-route=0 security-groups=3 tagged-resources=11
+npm run evidence:iam             # sim-allowed=allowed sim-denied=explicitDeny (LocalStack's answer; AWS would say implicitDeny)
+npm run evidence:localstack-iam  # deny-all=200 fake-key=200 oidc-forged-jwt=200 enforce-iam-log-lines=0
+npm run preview:demo             # RDS Multi-AZ, ALB, Lambda target: 11 to create
+npm run up:demo                  # 501 on RDS and ELBv2 — the expected answer on this lane
+npm run destroy:demo && npm run destroy:base   # the six keys, all 0, also land in evidence/demos.txt
+npm run localstack:down
+```
+
+`npm run demo:failover|demo:alb|demo:nat` stop at once on this lane (RDS and ELBv2 are 501, and
+the emulator does not bill), see [AWS](#aws).
+
 ### Observability (the logs, metrics and traces homework)
 
 No cloud account is needed. `package.json` is in the repository root, so there is no `cd`. The
@@ -3782,6 +3811,355 @@ The rest of the bonus is not done: GlitchTip/Sentry, a second process with an ou
 a live alert. Tail sampling, Loki and a profiler are out of scope. The OTel Collector is not part
 of the stand: the API exports straight to Jaeger's OTLP receiver. With a collector in between,
 only `OTEL_EXPORTER_OTLP_ENDPOINT` would change.
+
+# AWS: a paid stand, and proof that it is gone (AWS: платний стенд і доказ знесення)
+
+The question for this homework is not "can it be brought up" but "can someone else's paid
+hardware be created and handed back so that nothing of it is left, and can that be shown in
+numbers". The proof is a teardown run in GitHub Actions whose log ends in six zeros.
+
+## AWS
+
+смуга: запасна (LocalStack)
+teardown-run: https://github.com/martsyniuk-denys/r_d/actions/runs/43911960767
+region: eu-central-1 (stack config); every emptiness check also covers us-east-1
+
+**Paths for the criteria.** The programs are `infra/base` and `infra/demo` (A1). The
+`package.json` with the npm scripts is the **root** `package.json`. `git ls-files` sorts
+`infra/base/package.json` first, so B3 needs `PKG=package.json`. `infra/package.json` is the
+Kubernetes program from homework 28.
+
+**Why the fallback lane.** I already had an AWS account in the past, so AWS will not give me
+the Free plan or its credits ("You would be ineligible for free plan or Free Tier credits if you
+have an existing AWS account or have had one in the past"). Every hour would be billed in real
+money from the first minute. I declared the fallback lane before the first `pulumi up` and did
+not change it after.
+
+| Piece | Where |
+|---|---|
+| base stack: budget, VPC, 2 + 2 subnets, IGW, route tables, 3 SGs, OIDC provider, teardown role | `infra/base/index.ts`, `infra/base/Pulumi.base.yaml` |
+| demo stack: RDS Multi-AZ, ALB + target group + Lambda target, NAT behind `hw31:withNat` | `infra/demo/index.ts`, `infra/demo/Pulumi.demo.yaml` |
+| running a stack (backend, passphrase, region from the stack config) | `scripts/aws.sh` |
+| the six emptiness checks, both regions | `scripts/aws-checks.sh` |
+| `evidence/base.txt`, `base-state.json`, `iam.json`, `iam.txt` | `scripts/aws-evidence.sh` |
+| `evidence/localstack-iam.txt` | `scripts/localstack-iam.sh` |
+| `demo:failover`, `demo:alb`, `demo:nat` (main lane only, see below) | `demo/failover.sh`, `demo/alb.sh`, `demo/nat.sh`, `scripts/lib/aws.sh` |
+| nightly + on-demand teardown | `.github/workflows/teardown.yml` |
+| LocalStack `4.14.0`, port 23166 | `localstack/compose.yml` |
+
+### LocalStack, and the price of the pin
+
+`localstack/localstack:4.14.0` is pinned hard, on `127.0.0.1:23166`. Later tags do not start
+without `LOCALSTACK_AUTH_TOKEN`, and that token is tied to a personal account. It would end up in
+a public repository. The price of the pin, in LocalStack's own words: "pinning to a prior version
+will opt you out of any future updates or security patches". This is an emulator on localhost
+that is pulled once and removed after the homework, not a service that should get patches.
+
+What the community edition actually serves (probed before writing the programs):
+
+| API | 4.14.0 community | Effect here |
+|---|---|---|
+| EC2 (VPC, subnets, IGW, route tables, SGs, NAT, EIP), IAM, STS, Lambda, tagging | emulated | the base stack is real: `vpc-…`, `subnet-…`, `sg-…` |
+| Budgets | **501** | the budget is skipped when `AWS_ENDPOINT_URL` is set, and only then |
+| RDS, ELBv2 | **501** | the demo stack stops at `pulumi up` (`evidence/501.txt`) |
+
+One difference from the task's text: 4.14.0 words its 501 as `The API for service rds is either
+not included in your current license plan or has not yet been emulated by LocalStack`, not
+"not included within your LocalStack license". `evidence/501.txt` is the untouched output, so
+`grep -c 'not included within your LocalStack license' evidence/501.txt` prints 0, and
+`grep -c 'not included in your current license plan' evidence/501.txt` prints 9. It is the same
+error. I did not edit the evidence to match the phrase.
+
+### Two stacks
+
+`base` costs exactly $0 and may stay up for a week: the budget, the VPC `10.31.0.0/16` (overlaps
+neither Docker's bridges nor kind), public `10.31.0.0/24` and `10.31.1.0/24`, private
+`10.31.10.0/24` and `10.31.11.0/24` in `eu-central-1a` and `eu-central-1b`, an IGW, two route
+tables, three security groups and the CI role. Nothing in it is billed by the hour, and
+`evidence/base-state.json` has no `aws:rds/`, `aws:lb/`, NAT, EC2 instance or EIP.
+
+`demo` holds everything billed by the hour. It reads the network through a `StackReference` and
+lives for a session: RDS, ALB, target group, the Lambda target and, behind `hw31:withNat=true`,
+one NAT with its EIP.
+
+The **budget is the first resource** in `infra/base/index.ts`. Every other resource depends on it,
+so a parallel `up` also creates it first. It has `COST`, `MONTHLY`, `limitAmount: '5'` for the
+whole account (no tag filter, because cost-allocation tags lag), and one `ACTUAL` notification
+`GREATER_THAN` 20 `PERCENTAGE`. The address comes from `ALERT_EMAIL` in the store, never from git.
+It is a letter, not a brake: actual spend is refreshed every 8–12 hours, which at this stack's
+rate is up to $0.08191 × 12 = $0.98 before the letter can leave.
+
+**Private means a missing line.** The private subnets have their own route table with **no**
+`0.0.0.0/0`. It points neither to the IGW nor to a NAT. Only the database lives there, and it
+never calls out. `evidence/base.txt` counts this from the API (`private-default-route=0`), not
+from the names. A subnet counts as public only if its table routes `0.0.0.0/0` to an `igw-`.
+
+Security groups, one reason per open port (the comments in the code say the same):
+
+| Group | Inbound | Why |
+|---|---|---|
+| `alb` | 80/tcp from `0.0.0.0/0` | internet-facing HTTP. No domain, so no certificate, so no 443 |
+| `app` | 3000/tcp from the `alb` group | a target is reachable through the balancer or not at all |
+| `db` | 5432/tcp from the `app` group | Postgres answers the application and nothing else; no CIDR |
+
+Egress is narrowed too: the ALB reaches only the VPC, the app only 5432, and the database has
+none (stateful SGs let replies out).
+
+Tags come from one block per stack, `aws:defaultTags` in `Pulumi.<stack>.yaml` (`Project:
+nodejs-pro-hw31`, `Stack: base|demo`, `ManagedBy: pulumi`). The same file pins `aws:region`.
+Nothing reads `~/.aws/config` or `AWS_REGION`, and nothing runs `aws configure` or `pulumi login`.
+Endpoint, backend and keys are variables of the process.
+
+### Rate per hour
+
+Rates read on 2026-11-16 from the public AWS bulk price list for `eu-central-1`
+(`https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/<service>/current/eu-central-1/index.json`;
+no account needed). The column "published" is the list's own `publicationDate`. A month is 730
+hours. The UAH column uses the NBU rate of 45.4274 UAH/$ on 16.11.2026.
+
+| Line | Price list (published) | Rate | × 730 h |
+|---|---|---|---|
+| ALB | AWSELB (2026-11-11) | $0.027 per ALB-hour | $19.71 |
+| RDS db.t4g.micro PostgreSQL, Multi-AZ instance | AmazonRDS (2026-11-13) | $0.037/h (Single-AZ: $0.019) | $27.01 |
+| gp3 20 GiB, Multi-AZ | AmazonRDS (2026-11-13) | $0.274 per GiB-month × 20 | $5.48 |
+| Public IPv4 × 2 (under the ALB) | AmazonVPC (2026-11-05) | $0.005/h each, in use or idle | $7.30 |
+| LCU | AWSELB (2026-11-11): $0.008 per LCU-hour | ⚠️ an assumption about training load, not a list rate | $0.29 |
+| **Total** | | **$0.08191/h** | **$59.79** (≈ 2 716 UAH) |
+| NAT Gateway (only for `demo:nat`) | AmazonEC2 (2026-11-14) | $0.052/h + $0.052/GiB processed | one exercise: $0.052 + $0.005 = $0.057 |
+
+Every other number divides or multiplies this one: 4 hours = $0.33 (≈ 15 UAH), a day = $1.97
+(≈ 89 UAH), a month = $59.79. Every rate equals the task's 24.08.2026 snapshot, so none of the
+derived numbers moved. The lists did get republished since then. The Multi-AZ instance is
+"almost double", not double: $0.019 → $0.037. Storage doubles exactly: $0.137 → $0.274. A
+Multi-AZ *DB cluster* on the cheapest class in the same list (`db.m6gd.large`, readable standbys)
+is $0.622/h. On this lane all of it is $0. The table is the bill the main lane would have run up.
+
+### The CI role (OIDC) and its policy
+
+`hw31-teardown` trusts only `token.actions.githubusercontent.com`, with `StringEquals` on
+`aud = sts.amazonaws.com` and `StringLike` on
+`sub = repo:martsyniuk-denys@16865806/r_d@1325481547:*` (any ref of this repository, no other
+repository). The ids in `sub` are not decoration. The teardown run's log printed the claim, and
+GitHub issues this repository's tokens with `repo:<owner>@<owner-id>/<repo>@<repo-id>:…`. My
+first trust said `repo:martsyniuk-denys/r_d:*`, which would never have matched on real AWS. On
+LocalStack it "worked", because nothing is checked there. Both documents, decoded, are in
+`evidence/iam.json`. The
+permission policy names every action, and no `Action` is `"*"`:
+
+| Permission | Why teardown needs it |
+|---|---|
+| `tag:GetResources` | the `tagged-resources-left` check |
+| `rds:DescribeDBInstances` | `rds-left`, and the provider waits on it while deleting |
+| `rds:DescribeDBSubnetGroups`, `rds:ListTagsForResource` | the provider reads the subnet group and tags before deleting |
+| `elasticloadbalancing:DescribeLoadBalancers` | `alb-left`, and the provider's read before delete |
+| `elasticloadbalancing:DescribeLoadBalancerAttributes`, `DescribeListeners`, `DescribeTargetGroups`, `DescribeTargetGroupAttributes`, `DescribeTargetHealth`, `DescribeTags` | the provider refreshes each ALB-side resource before deleting it |
+| `ec2:DescribeNatGateways` | `nat-left`, and waiting for a NAT to reach `deleted` |
+| `ec2:DescribeAddresses` | `eip-left` |
+| `lambda:GetFunction`, `lambda:GetPolicy`, `lambda:ListVersionsByFunction` | reading the Lambda target and its ALB permission before deleting them |
+| `iam:GetRole`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:ListInstanceProfilesForRole` | a role cannot be deleted before what is attached to it is listed and detached |
+| `rds:DeleteDBInstance`, `rds:DeleteDBSubnetGroup` | delete the database, **only if tagged `Project=nodejs-pro-hw31`** |
+| `elasticloadbalancing:DeleteLoadBalancer`, `DeleteListener`, `DeleteTargetGroup`, `DeregisterTargets` | delete the ALB side, same tag condition |
+| `ec2:DeleteNatGateway`, `ec2:ReleaseAddress`, `ec2:DisassociateAddress` | delete the NAT and give its address back (the `eip-left` trap), same tag condition |
+| `lambda:DeleteFunction`, `lambda:RemovePermission` | delete the target, same tag condition |
+| `iam:DetachRolePolicy`, `iam:DeleteRole` | only on `role/hw31-demo-*`, the Lambda's role |
+
+There is no `Create*` and no `Modify*`. Teardown can only take things away. A role that can create
+a database can also run up the bill.
+
+`aws iam simulate-principal-policy` on the role (`npm run evidence:iam` → `evidence/iam.txt`):
+
+```
+engine=localstack
+sim-allowed-action=ec2:DescribeNatGateways
+sim-allowed=allowed
+sim-denied-action=rds:CreateDBInstance
+sim-denied=explicitDeny
+```
+
+**This is not the negative test the task asks for, and I am not counting it as one.** The engine
+that decides was LocalStack, not AWS. The answer itself shows it: no statement mentions
+`rds:CreateDBInstance`, so AWS would answer `implicitDeny`. LocalStack's simulator invented an
+explicit deny. Its simulator and its enforcement are two separate pieces of code, and the
+enforcement does not run at all (next section). The negative test that counts has to run on AWS:
+the same `npm run evidence:iam` without `AWS_ENDPOINT_URL`, expecting `allowed` and
+`implicitDeny`.
+
+### LocalStack does not apply IAM. At all
+
+**LocalStack does not apply this policy. I did not test it locally, because it cannot be tested
+locally.** (LocalStack цю політику не застосовує. Я не перевіряв її локально, бо перевірити
+локально неможливо.) I have not tested that a foreign `sub` is rejected, and nothing in this
+repository claims it.
+
+What it does instead, measured on my machine by `npm run evidence:localstack-iam`. The file is
+`evidence/localstack-iam.txt`, a full transcript; each code is the HTTP status of a SigV4-signed
+request made with `curl --aws-sigv4`, and `ENFORCE_IAM=1` is set on the container:
+
+```
+user hw31-probe-nobody: 0 inline, 0 attached policies
+  no policy:  CreateBucket hw31-probe-a-… → 200
+  deny-all:   CreateBucket hw31-probe-b-… → 200, PutObject → 200
+  fake key:   GetObject → 200 (body: only the owner should read this)
+  forged JWT: AssumeRoleWithWebIdentity → 200, AccessKeyId LSIA…
+localstack=4.14.0
+enforce-iam=1
+no-policy=200
+deny-all=200
+fake-key=200
+oidc-forged-jwt=200
+enforce-iam-log-lines=0
+```
+
+The forged JWT says `sub=repo:EVIL/attacker`, `aud=WRONG`, `alg=none`, and has no signature. The
+role trusts `repo:acme/shop:*`. LocalStack still handed out working credentials. The teardown job
+relies on the same leniency: it assumes `hw31-teardown` before `base` has even created it.
+
+The container log counts lines about a denial or enforcement (`enforce-iam-log-lines=0`), not
+every line that mentions IAM. 10 of 14 lines in the window were IAM/STS requests. Not one was a
+refusal.
+
+A 200 here proves no policy right, only that nobody read it. LocalStack errs toward *allow*: it
+allows more than production does, so a policy mistake would surface at 3 a.m. in production, not
+on this machine. The other emulator in this course that errs the same way is LocalStack again,
+in the files homework (26). That is why `docker-compose.yml` runs RustFS there: an anonymous GET
+against LocalStack is not a trustworthy 403 (see [Files](#files-файли)).
+
+### No keys: OIDC in CI, the store locally
+
+- **CI** has no key at all, neither in the repository nor in GitHub Secrets. The job has
+  `id-token: write`. It writes GitHub's OIDC JWT (audience `sts.amazonaws.com`) to a file, and the
+  AWS CLI and the Pulumi provider trade it for short-lived credentials through
+  `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` (`sts:AssumeRoleWithWebIdentity`). The flow is
+  the same against AWS. Here the STS is LocalStack's. That takes `AWS_ENDPOINT_URL_STS` as well:
+  the Pulumi provider resolves its credentials before it reads `AWS_ENDPOINT_URL`. In the first
+  run it sent the GitHub token to real AWS STS (`InvalidIdentityToken`; no account trusts it).
+  That run also showed why every step runs under `shell: bash` (pipefail): `pulumi up | tail`
+  hid the failure, and the job printed six zeros over a stand that had never been created. Those
+  zeros were true and worthless, so I do not submit that run. The stand step now fails unless
+  `base` has resources before the destroy. The job prints the token's `iss`, `aud` and
+  `sub`, never the token.
+- **Locally** the keys come from the store of homework 11 through the same wrapper,
+  `scripts/with-secrets.sh`: `AWS_ENDPOINT_URL` and `AWS_ACCESS_KEY_ID` in `.env`, and the secret
+  in `secrets/aws_secret_access_key` (`AWS_SECRET_ACCESS_KEY_FILE`). On this lane the pair is
+  LocalStack's well-known `test`/`test`, but it travels the way a real one would. The same goes
+  for `DB_PASSWORD` (the RDS master password, a Pulumi secret in the state) and
+  `PULUMI_CONFIG_PASSPHRASE`. All seven fixed npm scripts go through the wrapper.
+
+### State backend: what changed since homework 28
+
+Locally it is the same `file://<repo>/.pulumi` as for the kind cluster in homework 28. The task
+allows a file backend on this lane, because there is nothing to bill. The difference is CI. In
+homework 28 nobody but my laptop ever had to read the state. Here the teardown job must reach the
+state of the stand it destroys, and a runner cannot see my laptop. On this lane the job brings up
+its own LocalStack and its own stand, so the state is born and destroyed in the runner's workspace
+(`file://$GITHUB_WORKSPACE/.pulumi`, a passphrase generated per job and masked). On the main lane
+that is not enough, because the stand lives in AWS longer than any job. There it would be Pulumi
+Cloud (individual, $0) or an `s3://` backend in the same account, and `PULUMI_BACKEND_URL` is the
+only line that changes in `scripts/aws.sh`.
+
+`encryptionsalt:` is stripped from `Pulumi.<stack>.yaml` before committing. It derives from my
+passphrase, and CI's passphrase is a different one.
+
+### Teardown as code
+
+`.github/workflows/teardown.yml` runs on `schedule: '0 2 * * *'` and on `workflow_dispatch`. The
+run linked at the top is a dispatch run, because a schedule may be late or dropped. Its order:
+
+1. a LocalStack 4.14.0 service container, and OIDC → web identity;
+2. **stand**: `pulumi up` base, then demo. Demo creates what the community edition serves (the
+   Lambda target and its IAM role), and its RDS and ELBv2 calls fail with 501 in the log.
+   LocalStack gets the runner's Docker socket. Without it the Lambda ends up `Failed: Docker not
+   available`, `DeleteFunction` on such a function is an `InternalError`, and `pulumi destroy`
+   retried it until the job timed out (an earlier run, cancelled after 19 minutes). The destroy
+   step has its own 8-minute limit now. Without this step
+   there is nothing to destroy, and six zeros over an empty emulator prove nothing.
+   `state-before[...]` records how much there was;
+3. `pulumi destroy --yes`: demo, then base;
+4. `pulumi stack export` of both stacks, uploaded as an artifact. No `--remove`, because after it
+   there is nothing to export;
+5. the six checks of `scripts/aws-checks.sh`, in eu-central-1 **and** us-east-1. Each contract key
+   is the sum of both regions and is printed once. The job fails if any is non-zero.
+
+Two honest notes about the checks. **`rds-left` and `alb-left` on this lane**: LocalStack answers
+every RDS and ELBv2 call with 501, so no instance can exist there. The script counts that as 0
+and says so in a line of its own (`rds@eu-central-1: 501, API not emulated …`). Any other error
+fails the job, because an unreadable check is not a zero. **`state-resources-left`** counts `aws:*`
+resources in the state of both stacks. `tagged-resources-left` asks the tagging API, which is the
+second source of truth: a resource created by hand outside Pulumi shows up only there.
+
+The emptiness checks run locally as well: `npm run destroy:base` writes the same six keys into
+`evidence/demos.txt`. That file is written by my machine, so it is a floor, not a proof. The
+proof is the CI run.
+
+On the main lane, two things in that workflow would change. `AWS_ROLE_ARN` would be the real role
+from `pulumi stack output teardownRoleArn`, with no `AWS_ENDPOINT_URL`. The stand step would go,
+because the stand already exists in AWS and the job only destroys `demo`. `hw31-teardown`'s
+policy is written for exactly that: it deletes, it never creates. `base` is removed by hand after
+grading (`npm run destroy:base`). A role allowed to delete things should not outlive the course.
+
+### RDS Multi-AZ (written, 501 on this lane)
+
+`infra/demo/index.ts` declares a **Multi-AZ instance deployment**, not a Multi-AZ DB cluster:
+`multiAz: true`, `db.t4g.micro`, PostgreSQL 16, `gp3` 20 GiB, `storageEncrypted: true`,
+`backupRetentionPeriod: 1`, in the private subnets, `publiclyAccessible: false`. Performance
+Insights and Enhanced Monitoring are off: neither is graded, and both are billed.
+`pulumi.runtime.registerResourceTransform` is registered **before** the first resource and sets
+`deletionProtection: false` and `skipFinalSnapshot: true` on every `aws:rds/instance:Instance`.
+`evidence/preview-demo.txt` (`pulumi preview`, which only type-checks and diffs) shows both values
+on the instance. `evidence/501.txt` is the `pulumi up` that follows.
+
+The target behind the ALB is a Lambda rather than an EC2 instance. That adds no hourly line and
+no third public IPv4. The Lambda target group has its health check switched on, because it is
+off by default for Lambda, and the state would never become `healthy`.
+
+`demo:failover`, `demo:alb` and `demo:nat` are written for the main lane. They read the stack's
+outputs, poll rather than sleep, and write their keys into `evidence/demos.txt`, replacing older
+values. On this lane they stop at once with a pointer here: RDS and ELBv2 are 501. A NAT
+"billed hour" measured on an emulator that does not bill would be a number about nothing. **They
+have not been run against AWS**, so `az-*`, `failover-seconds`, `http-code`, `target-state` and
+`nat-*` are absent from `evidence/demos.txt`, by design rather than by accident. Criterion D is
+not graded on this lane.
+
+### RDS Multi-AZ against my stack from homework 15
+
+My homework-15 stack was a single Postgres, PgBouncer in front of it, `scripts/backup.sh` (a
+nightly `pg_dump`, RPO 24 h) and a weekly restore drill. **It had no replica.** So Multi-AZ adds
+something I never had, rather than replacing something I did.
+
+What RDS takes over:
+
+- the synchronous standby in another AZ, and the failover. The endpoint's DNS moves in about
+  60–120 s, without me;
+- the backups as an RPO mechanism: daily snapshots plus transaction logs give point-in-time
+  restore within the retention. That changes the RPO from my 24 hours to minutes, but only within
+  `backupRetentionPeriod: 1`, one day;
+- encryption at rest, minor-version patching, and the host and its disk.
+
+What stays mine:
+
+- **PgBouncer**. RDS does not pool. RDS Proxy is a separate service and a separate line on the
+  bill, and the transaction-mode trade-offs from homework 15 do not go away.
+- **Reads**. A Multi-AZ *instance* standby serves no reads at all. Read scaling would need a read
+  replica: another instance and another hourly line.
+- **The restore drill**. AWS restores a snapshot into a new instance. Proving that the restore
+  holds my data, and measuring the RTO, is still my script.
+- **Long-term and portable copies**. One day of PITR is not an archive. A logical dump that opens
+  outside AWS is still `backup.sh`.
+- **The application side of a failover**: connections drop for the 60–120 s, and the retry
+  wrapper from homework 14 is what turns that into latency instead of 500s.
+- migrations, the master password in the store, sizing, and the retention setting itself.
+
+### KMS
+
+`storageEncrypted: true` uses the AWS-managed key `aws/rds`. AWS does not bill that key per month,
+and it is not mine to delete. KMS is **not** a replacement for the store from homework 11; it is
+the layer under it. The store decides which process gets which secret. KMS holds a
+key-encryption key that never leaves AWS and answers one question: "may this principal decrypt
+this?". The answer is IAM, and it is audited. This project's equivalents of an `ENCRYPTION_KEY`
+(the JWT signing key, the refresh-token pepper, the Pulumi passphrase) would be stored encrypted
+under a data key that KMS wraps, and decrypted with `kms:Decrypt` at start-up. The store would
+still deliver them. I did **not** create a customer-managed key: it is a monthly line of its own,
+and `destroy` only *schedules* its deletion (7–30 days), so it outlives the stack.
 
 # The OpenAPI contract in detail
 

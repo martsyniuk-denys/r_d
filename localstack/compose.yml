@@ -1,0 +1,30 @@
+# The fallback lane of the AWS homework: LocalStack instead of a real account.
+#
+#   npm run localstack:up / localstack:down
+#
+# Pinned hard to 4.14.0: later tags refuse to start without LOCALSTACK_AUTH_TOKEN,
+# and that token is tied to a personal account — it would end up in a public repo.
+# The price of the pin, in LocalStack's words: "pinning to a prior version will opt
+# you out of any future updates or security patches".
+#
+# ENFORCE_IAM=1 is on on purpose: evidence/localstack-iam.txt shows that it changes
+# nothing — the community edition does not evaluate IAM policies at all.
+name: hw31-localstack
+
+services:
+  localstack:
+    image: localstack/localstack:4.14.0
+    ports:
+      - "127.0.0.1:23166:4566"
+    environment:
+      ENFORCE_IAM: "1"
+    # Lambda runs functions in sibling containers. Without the socket a function
+    # ends up `Failed: Docker not available`, and such a function cannot be deleted
+    # (DeleteFunction → InternalError) — `pulumi destroy` then retries forever.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40

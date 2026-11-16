@@ -1,0 +1,276 @@
+Previewing update (demo):
++ pulumi:pulumi:Stack: (create)
+    [urn=urn:pulumi:demo::hw31-demo::pulumi:pulumi:Stack::hw31-demo-demo]
+    > pulumi:pulumi:StackReference: (read)
+        [urn=urn:pulumi:demo::hw31-demo::pulumi:pulumi:StackReference::organization/hw31-base/base]
+        name: "organization/hw31-base/base"
+        --outputs:--
+        outputs          : {
+            albSecurityGroupId    : "sg-b204faae04fefac4c"
+            appSecurityGroupId    : "sg-cc8da1643917e31e7"
+            budgetName            : "skipped: no Budgets API in the LocalStack community edition"
+            dbSecurityGroupId     : "sg-370e499eb7e654f74"
+            privateRouteTableId   : "rtb-62c9ff90b38cc54bd"
+            privateSubnetIds      : [
+                [0]: "subnet-535cc6cdff653687a"
+                [1]: "subnet-179226813fdc91436"
+            ]
+            publicSubnetIds       : [
+                [0]: "subnet-16d0935162e385589"
+                [1]: "subnet-2a2ae03ef299f5e27"
+            ]
+            teardownPolicyDocument: {
+                Statement: [
+                    [0]: {
+                        Action  : [
+                            [0]: "tag:GetResources"
+                            [1]: "rds:DescribeDBInstances"
+                            [2]: "rds:DescribeDBSubnetGroups"
+                            [3]: "rds:ListTagsForResource"
+                            [4]: "elasticloadbalancing:DescribeLoadBalancers"
+                            [5]: "elasticloadbalancing:DescribeLoadBalancerAttributes"
+                            [6]: "elasticloadbalancing:DescribeListeners"
+                            [7]: "elasticloadbalancing:DescribeTargetGroups"
+                            [8]: "elasticloadbalancing:DescribeTargetGroupAttributes"
+                            [9]: "elasticloadbalancing:DescribeTargetHealth"
+                            [10]: "elasticloadbalancing:DescribeTags"
+                            [11]: "ec2:DescribeNatGateways"
+                            [12]: "ec2:DescribeAddresses"
+                            [13]: "lambda:GetFunction"
+                            [14]: "lambda:GetPolicy"
+                            [15]: "lambda:ListVersionsByFunction"
+                            [16]: "iam:GetRole"
+                            [17]: "iam:ListAttachedRolePolicies"
+                            [18]: "iam:ListRolePolicies"
+                            [19]: "iam:ListInstanceProfilesForRole"
+                        ]
+                        Effect  : "Allow"
+                        Resource: "*"
+                        Sid     : "ReadForChecksAndDestroy"
+                    }
+                    [1]: {
+                        Action   : [
+                            [0]: "rds:DeleteDBInstance"
+                            [1]: "rds:DeleteDBSubnetGroup"
+                            [2]: "elasticloadbalancing:DeleteLoadBalancer"
+                            [3]: "elasticloadbalancing:DeleteListener"
+                            [4]: "elasticloadbalancing:DeleteTargetGroup"
+                            [5]: "elasticloadbalancing:DeregisterTargets"
+                            [6]: "ec2:DeleteNatGateway"
+                            [7]: "ec2:ReleaseAddress"
+                            [8]: "ec2:DisassociateAddress"
+                            [9]: "lambda:DeleteFunction"
+                            [10]: "lambda:RemovePermission"
+                        ]
+                        Condition: {
+                            StringEquals: {
+                                aws:ResourceTag/Project: "nodejs-pro-hw31"
+                            }
+                        }
+                        Effect   : "Allow"
+                        Resource : "*"
+                        Sid      : "DeleteOnlyTagged"
+                    }
+                    [2]: {
+                        Action  : [
+                            [0]: "iam:DetachRolePolicy"
+                            [1]: "iam:DeleteRole"
+                        ]
+                        Effect  : "Allow"
+                        Resource: "arn:aws:iam::000000000000:role/hw31-demo-*"
+                        Sid     : "DeleteTheDemoTargetRole"
+                    }
+                ]
+                Version  : "2012-10-17"
+            }
+            teardownRoleArn       : "arn:aws:iam::000000000000:role/hw31-teardown"
+            teardownRoleName      : "hw31-teardown"
+            vpcId                 : "vpc-47c73934ede706e0a"
+        }
+    + aws:iam/role:Role: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:iam/role:Role::target]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        assumeRolePolicy  : (json) {
+            Statement: [
+                [0]: {
+                    Action   : "sts:AssumeRole"
+                    Effect   : "Allow"
+                    Principal: {
+                        Service: "lambda.amazonaws.com"
+                    }
+                }
+            ]
+            Version  : "2012-10-17"
+        }
+
+        maxSessionDuration: 3600
+        name              : "hw31-demo-target"
+        path              : "/"
+        tagsAll           : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+    + aws:lb/targetGroup:TargetGroup: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:lb/targetGroup:TargetGroup::target]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        healthCheck: {
+            enabled           : true
+            healthyThreshold  : 2
+            interval          : 30
+            matcher           : "200"
+            path              : "/"
+            port              : "traffic-port"
+            timeout           : 5
+            unhealthyThreshold: 3
+        }
+        name       : "hw31-target"
+        region     : "eu-central-1"
+        tagsAll    : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+        targetType : "lambda"
+    + aws:lb/loadBalancer:LoadBalancer: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:lb/loadBalancer:LoadBalancer::alb]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        clientKeepAlive             : 3600
+        desyncMitigationMode        : "defensive"
+        dnsRecordClientRoutingPolicy: "any_availability_zone"
+        enableDeletionProtection    : false
+        enableHttp2                 : true
+        idleTimeout                 : 60
+        internal                    : false
+        loadBalancerType            : "application"
+        name                        : "hw31-alb"
+        region                      : "eu-central-1"
+        securityGroups              : [
+            [0]: "sg-b204faae04fefac4c"
+        ]
+        subnets                     : [
+            [0]: "subnet-16d0935162e385589"
+            [1]: "subnet-2a2ae03ef299f5e27"
+        ]
+        tagsAll                     : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+        xffHeaderProcessingMode     : "append"
+    + aws:rds/subnetGroup:SubnetGroup: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:rds/subnetGroup:SubnetGroup::db]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        description: "hw31: private subnets only"
+        name       : "db-194336e"
+        region     : "eu-central-1"
+        subnetIds  : [
+            [0]: "subnet-535cc6cdff653687a"
+            [1]: "subnet-179226813fdc91436"
+        ]
+        tagsAll    : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+    + aws:iam/rolePolicyAttachment:RolePolicyAttachment: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:iam/rolePolicyAttachment:RolePolicyAttachment::target-logs]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        policyArn : "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        role      : "hw31-demo-target"
+    + aws:lambda/function:Function: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:lambda/function:Function::target]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        code                        : archive(assets:e8f1249) {
+            "index.js": asset(text:11334f5) {
+                <contents elided>
+            }
+        }
+        handler                     : "index.handler"
+        memorySize                  : 128
+        name                        : "hw31-demo-target"
+        packageType                 : "Zip"
+        region                      : "eu-central-1"
+        reservedConcurrentExecutions: -1
+        role                        : [unknown]
+        runtime                     : "nodejs22.x"
+        tagsAll                     : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+        timeout                     : 3
+    + aws:rds/instance:Instance: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:rds/instance:Instance::db]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        allocatedStorage          : 20
+        applyImmediately          : true
+        autoMinorVersionUpgrade   : true
+        backupRetentionPeriod     : 1
+        dbName                    : "marketplace"
+        dbSubnetGroupName         : "db-194336e"
+        deleteAutomatedBackups    : true
+        deletionProtection        : false
+        engine                    : "postgres"
+        engineVersion             : "16"
+        identifier                : "hw31-db"
+        instanceClass             : "db.t4g.micro"
+        monitoringInterval        : 0
+        multiAz                   : true
+        password                  : [secret]
+        performanceInsightsEnabled: false
+        publiclyAccessible        : false
+        region                    : "eu-central-1"
+        skipFinalSnapshot         : true
+        storageEncrypted          : true
+        storageType               : "gp3"
+        tagsAll                   : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+        username                  : "marketplace"
+        vpcSecurityGroupIds       : [
+            [0]: "sg-370e499eb7e654f74"
+        ]
+    + aws:lb/listener:Listener: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:lb/listener:Listener::http]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        defaultActions : [
+            [0]: {
+                targetGroupArn: [unknown]
+                type          : "forward"
+            }
+        ]
+        loadBalancerArn: [unknown]
+        port           : 80
+        protocol       : "HTTP"
+        region         : "eu-central-1"
+        tagsAll        : {
+            ManagedBy: "pulumi"
+            Project  : "nodejs-pro-hw31"
+            Stack    : "demo"
+        }
+    + aws:lambda/permission:Permission: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:lambda/permission:Permission::alb-invoke]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        action     : "lambda:InvokeFunction"
+        function   : "hw31-demo-target"
+        principal  : "elasticloadbalancing.amazonaws.com"
+        region     : "eu-central-1"
+        sourceArn  : [unknown]
+        statementId: "alb-invoke-1033a30"
+    + aws:lb/targetGroupAttachment:TargetGroupAttachment: (create)
+        [urn=urn:pulumi:demo::hw31-demo::aws:lb/targetGroupAttachment:TargetGroupAttachment::target]
+        [provider=urn:pulumi:demo::hw31-demo::pulumi:providers:aws::default_7_55_0::04da6b54-80e4-46f7-96ec-b56ff0331ba9]
+        region        : "eu-central-1"
+        targetGroupArn: [unknown]
+        targetId      : [unknown]
+    --outputs:--
+    albDns        : [unknown]
+    dbEndpoint    : [unknown]
+    dbIdentifier  : "hw31-db"
+    natGatewayId  : "none (hw31:withNat=false)"
+    targetGroupArn: [unknown]
+Resources:
+    + 11 to create

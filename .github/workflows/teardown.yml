@@ -1,0 +1,141 @@
+# Teardown of the AWS homework: pulumi destroy → stack export → the six emptiness
+# checks → the contract, printed into this log. The log is the proof: the numbers
+# stand next to the YAML that produced them, on a machine that is not mine.
+#
+# Fallback lane (LocalStack, see README "## AWS"). The runner cannot see my laptop's
+# LocalStack, so the job brings up its own — the same pinned 4.14.0 — raises the
+# stand on it (base, and as much of demo as the community edition serves), and then
+# tears it down. Without that step there would be nothing to destroy, and six zeros
+# over an empty emulator would prove nothing.
+#
+# No key, anywhere: not in the repo, not in GitHub Secrets. The job asks GitHub for
+# its OIDC token (id-token: write) and hands it to the SDKs through
+# AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN — the AWS CLI and the Pulumi provider
+# both trade it for short-lived credentials of hw31-teardown via
+# sts:AssumeRoleWithWebIdentity. Against real AWS the trust policy in infra/base
+# checks aud and sub; LocalStack checks nothing (evidence/localstack-iam.txt).
+name: teardown
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+# bash with pipefail: without an explicit shell a step runs `bash -e`, and a failed
+# `pulumi up | tail` would pass as green (it did, in the first run).
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: teardown
+  cancel-in-progress: false
+
+jobs:
+  teardown:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    services:
+      localstack:
+        image: localstack/localstack:4.14.0
+        ports:
+          - 23166:4566
+        env:
+          ENFORCE_IAM: '1'
+        # Lambda needs Docker: a function without it is `Failed` and cannot be deleted,
+        # and `pulumi destroy` retries it until the job times out (run 43907659119).
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+        options: >-
+          --health-cmd "curl -fsS http://localhost:4566/_localstack/health"
+          --health-interval 3s --health-timeout 3s --health-retries 40
+
+    env:
+      AWS_ENDPOINT_URL: http://127.0.0.1:23166
+      # The Pulumi provider resolves web-identity credentials through STS before it
+      # reads AWS_ENDPOINT_URL, and would ask real AWS STS (which rejects the token:
+      # no account trusts it). The CLI does not need this; the provider does.
+      AWS_ENDPOINT_URL_STS: http://127.0.0.1:23166
+      AWS_ROLE_ARN: arn:aws:iam::000000000000:role/hw31-teardown
+      AWS_ROLE_SESSION_NAME: teardown-${{ github.run_id }}
+      AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/hw31-oidc.jwt
+      # The stand lives and dies inside this job, so does its state: a file backend in
+      # the workspace. On the main lane this is Pulumi Cloud or an s3:// bucket.
+      PULUMI_BACKEND_URL: file://${{ github.workspace }}/.pulumi
+      PULUMI_SKIP_UPDATE_CHECK: 'true'
+      # The demo stack refuses to start without a master password; this one is born
+      # and destroyed in the job and guards nothing.
+      DB_PASSWORD: teardown-${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Pulumi CLI 3.276.0
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: 3.276.0
+
+      - name: Install the two programs
+        run: |
+          npm --prefix infra/base ci --no-audit --no-fund
+          npm --prefix infra/demo ci --no-audit --no-fund
+
+      - name: OIDC token → web identity (no access key)
+        run: |
+          curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+          # The claims the trust policy reads — never the token itself.
+          cut -d. -f2 "$AWS_WEB_IDENTITY_TOKEN_FILE" | tr '_-' '/+' | base64 -d 2>/dev/null \
+            | jq -c '{iss, aud, sub}' || true
+          aws sts get-caller-identity --region eu-central-1 --query Arn --output text
+
+      - name: State passphrase for this job only
+        run: |
+          p="$(openssl rand -hex 24)"
+          echo "::add-mask::$p"
+          echo "PULUMI_CONFIG_PASSPHRASE=$p" >> "$GITHUB_ENV"
+
+      - name: Stand — base, then demo (RDS and ELBv2 answer 501 here)
+        run: |
+          bash scripts/aws.sh base up | tail -n 4
+          bash scripts/aws.sh demo up 2>&1 | grep -E 'created|failed|StatusCode: 501' | head -n 20 || true
+          for s in base demo; do
+            n="$(cd infra/$s && pulumi stack export --stack $s \
+              | jq '[.deployment.resources[]? | select(.type | startswith("aws:"))] | length')"
+            echo "state-before[$s]=$n"
+          done
+          # Zeros after a destroy of nothing prove nothing: no base, no teardown.
+          [ "$(cd infra/base && pulumi stack export --stack base | jq '.deployment.resources | length')" -gt 1 ]
+
+      - name: pulumi destroy — demo, then base
+        timeout-minutes: 8 # a hang fails here, visibly, instead of eating the job
+        run: |
+          bash scripts/aws.sh demo destroy | tail -n 3
+          bash scripts/aws.sh base destroy | tail -n 3
+
+      # Before any `stack rm`: after --remove there is no state left to export.
+      - name: pulumi stack export
+        run: |
+          mkdir -p export
+          for s in demo base; do
+            (cd infra/$s && pulumi stack export --stack $s) > export/$s.json
+            echo "$s: $(jq '.deployment.resources | length' export/$s.json) resources in state"
+          done
+
+      - name: Six emptiness checks → contract
+        run: bash scripts/aws-checks.sh demo base
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: state-after-destroy
+          path: export/
