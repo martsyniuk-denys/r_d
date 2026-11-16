@@ -41,6 +41,9 @@ jobs:
     with:
       repository: ${{ needs.build.outputs.repository }}
       digest: ${{ needs.build.outputs.digest }}
+    # a reusable workflow reads its environment's secrets (STORE_KEY of `kind`) only
+    # when the caller passes them down
+    secrets: inherit
 
   evidence:
     name: pipeline-evidence
