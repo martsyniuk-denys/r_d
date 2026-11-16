@@ -1,0 +1,77 @@
+# The observability stand: metrics, traces and the dashboard that reads both.
+# Separate from ../docker-compose.yml on purpose — the API's own dependencies come
+# up with that one, and this one can be brought up, measured (docker stats) and
+# thrown away without touching the database.
+#
+#   bash scripts/with-secrets.sh dev docker compose -f observability/compose.yml up -d --wait
+#   (npm run obs:up — the Grafana credentials come from the store, see README → Observability)
+#
+# Every published port is in 22900–22999, bound to 127.0.0.1.
+name: marketplace-observability
+
+services:
+  # Scrapes the API's /metrics on the host. The demos start the API on 22910
+  # (OBS_APP_PORT), so the dashboard shows their traffic while they run.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: marketplace-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+    ports:
+      - '127.0.0.1:22901:9090'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # host.docker.internal exists on Docker Desktop by itself; on Linux it has to
+    # be mapped to the host gateway.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:9090/-/ready']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Traces: an OTLP receiver and the query API in one process, in-memory storage.
+  # 4318 is OTLP over HTTP (what the API exports to), 16686 the UI and /api/traces.
+  jaeger:
+    image: jaegertracing/jaeger:2.10.0
+    container_name: marketplace-jaeger
+    ports:
+      - '127.0.0.1:22918:4318'
+      - '127.0.0.1:22904:16686'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:13133/status']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: marketplace-grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+    environment:
+      # From the store through with-secrets.sh, or exported by the grader. No
+      # default for the password: a compose file with one is a password in git.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is not set - npm run obs:up takes it from the store, or export it}
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_NEWS_NEWS_FEED_ENABLED: 'false'
+    ports:
+      - '127.0.0.1:22903:3000'
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:3000/api/health']
+      interval: 2s
+      timeout: 3s
+      retries: 60

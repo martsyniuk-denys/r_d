@@ -1,4 +1,9 @@
+import { SpanStatusCode, trace } from '@opentelemetry/api';
 import { Request } from 'express';
+
+import { layerLogger } from '../observability/logger';
+
+const problemLog = layerLogger('http.problem');
 
 export const TYPE_BASE = 'https://marketplace.example/problems';
 
@@ -78,7 +83,14 @@ export function toProblem(err: unknown, req: Request): Problem {
   const detail = (e.detail as string) || (e.message as string) || 'Unexpected error.';
 
   if (status >= 500 && !(err instanceof ProblemError)) {
-    console.error('[problem]', status, detail);
+    // The active span here is Express's request handler span, a child of the
+    // server span. The server span turns ERROR by itself from the 5xx; this one
+    // gets the exception event and the ERROR status, so the reason sits on the
+    // span directly under the root in the trace view.
+    const span = trace.getActiveSpan();
+    span?.recordException(err instanceof Error ? err : String(err));
+    span?.setStatus({ code: SpanStatusCode.ERROR, message: detail });
+    problemLog.error({ err }, detail);
   }
 
   return { type, title, status, detail, instance: req.originalUrl };

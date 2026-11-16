@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Injectable, Module, OnApplicationShutdown } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 
 import { AuthController } from './auth/auth.controller';
@@ -17,6 +17,16 @@ import { OrderEventsService } from './realtime/order-events.service';
 import { OrdersGateway } from './realtime/orders.gateway';
 import { StorageModule } from './storage/storage.module';
 import { validate } from './config/env.schema';
+import { shutdownTracing } from './observability/tracing-shutdown';
+
+// Spans still batched in memory go out on shutdown, after the HTTP server has
+// stopped taking requests.
+@Injectable()
+class TelemetryShutdown implements OnApplicationShutdown {
+  onApplicationShutdown(): Promise<void> {
+    return shutdownTracing();
+  }
+}
 
 @Module({
   imports: [
@@ -39,6 +49,7 @@ import { validate } from './config/env.schema';
     OrderEventsService,
     OrdersGateway,
     FilesService,
+    TelemetryShutdown,
   ],
 })
 export class AppModule {}

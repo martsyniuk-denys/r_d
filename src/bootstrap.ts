@@ -8,6 +8,9 @@ import * as OpenApiValidator from 'express-openapi-validator';
 import { AppModule } from './app.module';
 import { ProblemFilter } from './common/problem.filter';
 import { toProblem } from './common/problem';
+import { requestContext } from './observability/context';
+import { NestPinoLogger } from './observability/nest-logger';
+import { metricsEndpoint, observeRequests } from './observability/request-log';
 
 export const API_SPEC = join(__dirname, '..', 'openapi', 'openapi.yaml');
 
@@ -17,6 +20,14 @@ export const API_SPEC = join(__dirname, '..', 'openapi', 'openapi.yaml');
 export async function configureApp(app: NestExpressApplication): Promise<NestExpressApplication> {
   app.disable('x-powered-by');
 
+  // Prometheus' scrape: registered before everything else, so it is neither
+  // counted, logged nor validated against the contract.
+  app.getHttpAdapter().getInstance().get('/metrics', metricsEndpoint);
+
+  // The order is the point: the request's store first, then the observer (so a
+  // 400 from the body parser is still counted and logged), then the parser.
+  app.use(requestContext());
+  app.use(observeRequests());
   app.use(express.json());
 
   app.use(
@@ -49,6 +60,7 @@ export async function createApp(): Promise<NestExpressApplication> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     bodyParser: false,
     abortOnError: false,
+    logger: new NestPinoLogger(),
   });
 
   return configureApp(app);

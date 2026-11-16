@@ -1,0 +1,13 @@
+# 5 s rather than the usual 15–60: the demos last about a minute, and the
+# dashboard uses rate(...[1m]), which needs at least two samples inside the window.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: marketplace-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:22910']
+        labels:
+          service: marketplace-api
