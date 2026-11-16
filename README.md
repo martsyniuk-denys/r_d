@@ -4199,7 +4199,7 @@ correct one.
 
 ## CI/CD
 
-pr-run: <filled in after the first green run>
+pr-run: https://github.com/martsyniuk-denys/r_d/pull/23 — the graded run is the latest green `pr` run on the PR head (first green: https://github.com/martsyniuk-denys/r_d/actions/runs/43934560195 — 243 468 requests, failed=0, rollout 24 s, built = deployed = registry digest)
 cost-gate-bypass-label: cost-approved
 
 **Paths for the criteria.** The workflows are in `.github/workflows/`. The trust condition is
