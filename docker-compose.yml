@@ -154,12 +154,15 @@ services:
       dockerfile: docker/Dockerfile
       target: runtime
     image: marketplace-api:compose
+    # The image is built here, never pulled: there is no such image in a registry.
+    pull_policy: build
     command: ['dist/compose-keys.js']
     volumes:
       - keys:/keys
 
   migrate:
     image: marketplace-api:compose
+    pull_policy: never
     command: ['dist/migrate.js']
     depends_on:
       pgbouncer:
@@ -174,6 +177,7 @@ services:
 
   api:
     image: marketplace-api:compose
+    pull_policy: never
     command: ['dist/main.js']
     depends_on:
       migrate:
@@ -225,6 +229,7 @@ services:
   # Outbox → broker. Several relays may run: rows are claimed with SKIP LOCKED.
   relay:
     image: marketplace-api:compose
+    pull_policy: never
     command: ['dist/relay.js']
     # A background process has no probe that would restart it: an error it cannot
     # survive (the database or the broker gone for good) ends it, and compose brings
@@ -244,6 +249,7 @@ services:
   # order.placed → fulfilment + pending→confirmed, in one transaction per message.
   consumer:
     image: marketplace-api:compose
+    pull_policy: never
     command: ['dist/consumer.js']
     restart: on-failure
     depends_on:
