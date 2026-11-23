@@ -101,6 +101,14 @@ if [ -n "${STORAGE_SECRET_KEY_FILE:-}" ]; then
   export STORAGE_SECRET_KEY
 fi
 
+# The broker password: the app reads it through BROKER_PASSWORD_FILE itself; it is
+# exported as BROKER_PASSWORD as well for the one reader without a file of its own —
+# the Pulumi program, which hands it to RabbitMQ and the pods in kind.
+if [ -n "${BROKER_PASSWORD_FILE:-}" ] && [ -f "$BROKER_PASSWORD_FILE" ]; then
+  BROKER_PASSWORD="$(tr -d '\r\n' < "$BROKER_PASSWORD_FILE")"
+  export BROKER_PASSWORD
+fi
+
 # The payment provider's webhook signing key: a file named by
 # PAYMENT_WEBHOOK_SECRET_FILE, exported as PAYMENT_WEBHOOK_SECRET.
 if [ -n "${PAYMENT_WEBHOOK_SECRET_FILE:-}" ]; then

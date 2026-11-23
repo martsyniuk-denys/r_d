@@ -26,7 +26,9 @@ KEEPALIVE="${LOAD_KEEPALIVE:-1}"
 # without keep-alive every request is a new host port; see scripts/load.mjs
 RATE="${LOAD_RATE:-$([ "$KEEPALIVE" = "0" ] && echo 300 || echo 0)}"
 MIN_REQUESTS="${MIN_REQUESTS:-5000}"
-URL="http://127.0.0.1:$NODE_PORT/"
+# A real route of the API, through Nest and the pool to Postgres — not a probe: a
+# draining pod still answers it, and that is what the drain is for.
+URL="http://127.0.0.1:$NODE_PORT${LOAD_PATH:-/products}"
 
 case "$PROFILE" in safe|broken) ;; *) echo "PROFILE must be safe or broken" >&2; exit 2 ;; esac
 

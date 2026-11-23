@@ -10,11 +10,15 @@
 #   3. preview       pulumi preview --json → plan.json, and the base branch's program
 #                    previewed the same way → base-plan.json
 #   4. cost gate     plan.json vs base-plan.json → src/mapping.ts → USD/month vs the budget
-#   5. pulumi up     the digest from the build job's outputs, never a tag
-#   6. manifest      the digest that went in == the digest that was built; the app
-#                    secret's value occurs 0 times in the Deployment
-#   7. demo:rollout  a new pod template under load; failed ≠ 0 fails the job
-#   8. manifest      read back once more: deployment.json is the state the run left
+#   5. pulumi up     the digest from the build job's outputs, never a tag: Postgres
+#                    and RabbitMQ (StatefulSets), the migrate Job, then the API, the
+#                    relay and the consumer — the whole contour, not a stub
+#   6. manifest      the digest that went in == the digest that was built; no value
+#                    of the store occurs in any workload the run created
+#   7. contour       demo/contour.mjs through the NodePort: checkout → consumer →
+#                    signed webhook → admin → final read + history; exit ≠ 0 fails
+#   8. demo:rollout  a new pod template under load on GET /products; failed ≠ 0 fails
+#   9. manifest      read back once more: deployment.json is the state the run left
 #
 # Two sets of secrets that never mix: the pipeline's (registry, cloud) do not exist —
 # GITHUB_TOKEN for the registry, the OIDC token for identity; the app's live in the
@@ -121,13 +125,22 @@ jobs:
           STORE_KEY: ${{ secrets.STORE_KEY }}
         run: npm run up
 
-      - name: The manifest that went in — digest and secret
+      - name: The manifest that went in — digest and secrets
         env:
           STORE_KEY: ${{ secrets.STORE_KEY }}
           BUILT_DIGEST: ${{ inputs.digest }}
         run: |
           kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "$OUT/deployment.json"
-          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" | tee "$OUT/manifest.txt"
+          kubectl --context kind-marketplace -n marketplace get deploy,statefulset,job,service -o json > "$OUT/workloads.json"
+          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" "$OUT/workloads.json" | tee "$OUT/manifest.txt"
+
+      # The webhook is signed with the store's PAYMENT_WEBHOOK_SECRET — the same value
+      # the pods read from their Secret, so a key that did not arrive fails here.
+      - name: Contour smoke — order to shipped through the API in kind
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+          BASE_URL: http://127.0.0.1:30080
+        run: bash scripts/with-secrets.sh ci node demo/contour.mjs 2>&1 | tee "$OUT/contour.txt"
 
       - name: demo:rollout — failed must be 0
         env:
@@ -143,13 +156,19 @@ jobs:
         run: |
           kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "$OUT/deployment.json"
           jq -r '"generation=\(.metadata.generation) observed=\(.status.observedGeneration) rev=\(.spec.template.spec.containers[0].env[] | select(.name=="REV") | .value)"' "$OUT/deployment.json"
-          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" | tee "$OUT/manifest.txt"
+          kubectl --context kind-marketplace -n marketplace get deploy,statefulset,job,service -o json > "$OUT/workloads.json"
+          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" "$OUT/workloads.json" | tee "$OUT/manifest.txt"
 
       - name: Cluster state on failure
         if: failure()
         run: |
-          kubectl --context kind-marketplace -n marketplace get deploy,rs,pods -o wide || true
-          kubectl --context kind-marketplace -n marketplace get events --sort-by=.lastTimestamp | tail -n 30 || true
+          kc() { kubectl --context kind-marketplace -n marketplace "$@"; }
+          kc get deploy,statefulset,job,rs,pods,pvc -o wide || true
+          kc get events --sort-by=.lastTimestamp | tail -n 40 || true
+          for target in deploy/marketplace-api deploy/marketplace-api-relay deploy/marketplace-api-consumer statefulset/postgres statefulset/rabbitmq; do
+            echo "--- $target"; kc logs "$target" --tail=40 || true
+          done
+          echo "--- migrate"; kc logs -l app=marketplace-api-migrate --tail=40 || true
 
       - name: Deploy evidence
         if: always()
@@ -165,4 +184,5 @@ jobs:
             out/plan.json
             out/base-plan.json
             out/rollout.txt
+            out/contour.txt
           if-no-files-found: ignore

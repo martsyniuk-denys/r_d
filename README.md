@@ -18,6 +18,7 @@ where an older homework is the evidence.
 - [Environment variables](#environment-variables)
 - [Security: OWASP Top 10:2025](#security-owasp-top-102025)
 - [Secrets and their rotation](#secrets-and-their-rotation)
+- [Kubernetes: the full contour](#kubernetes-the-full-contour) — API, workers, Postgres, RabbitMQ in kind via Pulumi
 - [Honest boundaries](#honest-boundaries) — what is not done, and where the edges are
 - [Running from source](#running-from-source) and [Commands](#commands)
 
@@ -425,7 +426,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | --- | --- | --- |
 | `docker compose up -d --wait` from a clean clone per README; no hidden steps; data survives a restart; waits for dependencies | `docker-compose.yml`, `scripts/acceptance.sh` | `evidence/acceptance.txt` (fresh clone, cold build, `failed steps and checks: 0`); [Quick start](#quick-start); `depends_on: service_healthy / service_completed_successfully` everywhere; `down && up -d --wait` keeps orders and keys |
 | Production image: multi-stage, no shell, non-root, no build secret, scanner threshold | `docker/Dockerfile`, `scripts/scan.sh` | `npm run demo:image` → `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `SCAN_MAX=-1 npm run scan` → `gate=fail`, exit 1. See [The image](#the-image), [The scan gate](#the-scan-gate) |
-| IaC deploy, rollout `failed=0`, two probes, SIGTERM | `infra/`, `k8s/`, `src/k8s-pod.ts`, `demo/rollout.sh` | `npm run demo:rollout` → `failed=0`; [Kubernetes](#kubernetes). The pod there is the stateless stub, see [Honest boundaries](#honest-boundaries) |
+| IaC deploy, rollout `failed=0`, two probes, SIGTERM | `infra/` (API, relay, consumer, Postgres, RabbitMQ, migrate Job), `k8s/`, `demo/rollout.sh` | `npm run up` → the whole contour in kind; `demo/contour.mjs` against it → `final=shipped`; `npm run demo:rollout` under load on `GET /products` → `failed=0`. See [Kubernetes: the full contour](#kubernetes-the-full-contour) |
 | Off-machine deploy: green deploy run by digest, or a teardown run | `.github/workflows/pr.yml`, `deploy.yml`, `teardown.yml` | green `pr` run on PR #23 (built = deployed = registry digest, `failed=0`), teardown run in [AWS](#aws) |
 
 ### 11.7 Operations and quality
@@ -498,12 +499,84 @@ through `rotate.sh` without a restart ([how](#rotating-the-database-password-wit
 the signing key through `scripts/jwt-keys.mjs rotate|retire` with the previous key still
 verifying during the overlap ([Auth](#auth-автентифікація-та-авторизація)).
 
+## Kubernetes: the full contour
+
+`npm run up` deploys the coursework API to the kind cluster with all of its contour, not the
+probe stub of homework 28. One Pulumi program (`infra/index.ts`, `infra/backing.ts`) creates
+15 resources:
+
+| Resource | What runs | Why this shape |
+| --- | --- | --- |
+| StatefulSet `postgres` + headless Service | `postgres:16-alpine`, 1 Gi PVC, `pg_isready` over TCP as readiness | the data outlives a pod restart; the readiness check skips initdb's socket-only server |
+| StatefulSet `rabbitmq` + headless Service | `rabbitmq:4.2-alpine`, 1 Gi PVC, `check_running` as readiness | a stable host name: the node is `rabbit@rabbitmq-0`, and its data directory is tied to that name |
+| Job `migrate-<hash>` | `dist/migrate.js`: migrations, then the idempotent seed | named per image: a Job's template cannot change, so a new digest means a new Job. `pulumi up` waits for it, and everything that reads the schema depends on it |
+| Deployment `marketplace-api` (3), Service NodePort 30080, PDB, HPA | `dist/main.js`, `/readyz` (pg) and `/healthz` as two probes, `SHUTDOWN_DRAIN_MS=5000` | the same rollout rules as homework 28, now on the real Nest app |
+| Deployments `marketplace-api-relay`, `marketplace-api-consumer` (1 each) | `dist/relay.js`, `dist/consumer.js`, `/metrics` on 9464 | the background half: outbox → broker, `order.placed` → `confirmed` |
+| Secret `marketplace-api-secrets`, Namespace | 8 store values | see below |
+
+**Secrets.** Each store value Pulumi reads (`DB_PASSWORD`, `BROKER_PASSWORD`, `STORAGE_SECRET_KEY`,
+`JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER`, `PAYMENT_WEBHOOK_SECRET`) goes
+into one Secret. The app pods mount that Secret as files under `/run/secrets/app` (mode 0440,
+group 65532) and read them through the same `NAME_FILE` variables compose uses. Postgres reads
+`POSTGRES_PASSWORD_FILE`, and RabbitMQ gets its password by `secretKeyRef`. No pod spec holds a
+value: `scripts/ci/manifest.sh` looks for every store value, plain and base64, in all Deployments,
+StatefulSets, Jobs and Services and finds 0. Given the Secret itself as a control, it finds 8.
+`infra/config.ts` checks every name before it declares any resource, so a missing one stops
+`pulumi preview` with that name.
+
+**What was measured** (kind v0.33.0, one node, local Docker, 2026-11-23):
+
+```
+npm run image:build && npm run cluster:up && npm run up      # 15 created, 53 s
+BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/contour.mjs
+  # created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4, exit 0
+BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/webhook.mjs
+  # accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1
+npm run demo:rollout                  # requests=30524 ok=30524 failed=0 rollout-seconds=21
+PROFILE=broken npm run demo:rollout   # requests=13626 failed=5664, exit 1 (no probes, no drain)
+npm run demo:pdb                      # healthy=3 evict-1=201 evict-2=429
+```
+
+`demo:rollout` now puts its load on `GET /products`, a real route through Nest and the pool to
+Postgres. It used to hit the stub's `/`. A probe would be the wrong target: `/readyz` is meant to
+go red while a pod drains, and a request during the drain must still be served.
+
+**Cost gate.** `src/mapping.ts` now charges a StatefulSet for its volume claims too. The stand is
+$11.86 a month at Fargate and EBS rates (API 5.65, RabbitMQ 2.17, Postgres 1.96, relay 1.04,
+consumer 1.04), against a base of about $5.04 for the stub. The delta fits the `max($10, 20 %)` budget.
+
+**In CI** (`deploy-kind.yml`) the same program runs on the digest the build job produced and the
+store `store/ci.enc`. After `pulumi up`, a step runs `demo/contour.mjs` through the NodePort with
+the store's webhook key, so a key that never reached the pods fails the job. `demo:rollout` and
+both manifest checks follow. `contour-final` and `contour-history` go into `deploy-evidence.txt`.
+`scripts/store-ci.sh fill` added the new values to the CI store under the same key, so the
+`STORE_KEY` of the `kind` environment did not change.
+
+**Without the store** (a grader), the variables are exported first, as in
+[the Kubernetes run](#kubernetes-the-rollout-homework):
+
+```bash
+export SKIP_VAULT=1 PULUMI_BACKEND_URL="file://$PWD/.pulumi" PULUMI_CONFIG_PASSPHRASE=grading
+export DB_PASSWORD="$(openssl rand -hex 16)" BROKER_PASSWORD="$(openssl rand -hex 16)"
+export STORAGE_SECRET_KEY="$(openssl rand -hex 16)" REFRESH_TOKEN_PEPPER="$(openssl rand -hex 16)"
+export PAYMENT_WEBHOOK_SECRET="$(openssl rand -hex 32)" JWT_KID=grading-1
+pem="$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256)"
+export JWT_PRIVATE_KEY="$(printf '%s\n' "$pem" | base64 | tr -d '\n')"
+export JWT_PUBLIC_KEY="$(printf '%s\n' "$pem" | openssl pkey -pubout | base64 | tr -d '\n')"
+npm --prefix infra ci && printf dummy > .npm_token
+npm run image:build && npm run cluster:up && npm run up
+BASE_URL=http://127.0.0.1:30080 node demo/contour.mjs     # final=shipped, exit 0
+npm run demo:rollout                                       # failed=0
+npm run destroy && npm run cluster:down
+```
+
 ## Honest boundaries
 
-- **Kubernetes runs a stub, not the full API.** The rollout homework deploys `src/k8s-pod.ts`
-  (probes, drain, the same image) to kind; the coursework API with Postgres and RabbitMQ is
-  not deployed there (phase 5 of the plan was optional and is not done). The probes and
-  the SIGTERM drain of the real API are shown in compose and in `probes.e2e.test.ts`.
+- **Kubernetes runs the contour, not everything.** kind gets the API, relay, consumer,
+  Postgres and RabbitMQ ([Kubernetes: the full contour](#kubernetes-the-full-contour)).
+  pgbouncer, Redis, object storage and the observability stand stay in compose: no route of the
+  contour needs them, and the file routes answer 5xx there. Postgres and RabbitMQ are single
+  replicas on kind's local-path volumes, which is a stand, not a production database.
 - **Redis is not in the contour.** Cache-aside, sessions and the shared rate limit live in
   their homework processes (`src/pod.ts`, the demos), not in the Nest API that compose runs.
 - **Products and files still use the in-memory `IdempotencyService`.** The orders contour
@@ -989,7 +1062,10 @@ the compose stack nor the root `npm ci`, because the demos use only Node built-i
 
 ```bash
 export SKIP_VAULT=1                                  # the grader has no access to the store
-export DB_PASSWORD=grader-secret                     # store variable → K8s Secret marketplace-api-db
+export DB_PASSWORD=grader-secret                     # store variable → K8s Secret marketplace-api-secrets
+# since the coursework the program also needs BROKER_PASSWORD, STORAGE_SECRET_KEY, JWT_PRIVATE_KEY,
+# JWT_PUBLIC_KEY, JWT_KID, REFRESH_TOKEN_PEPPER, PAYMENT_WEBHOOK_SECRET — the export lines are in
+# "Kubernetes: the full contour"
 export PULUMI_BACKEND_URL="file://$PWD/.pulumi"      # local file backend, no pulumi login
 export PULUMI_CONFIG_PASSPHRASE=hw28-grading         # store variable → encrypts the Pulumi state
 npm --prefix infra ci
@@ -1002,14 +1078,14 @@ kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptions
 npm run demo:image     # stages=4 shell-inside=0 runtime-uid=65532 token-in-history=0 token-in-config=0 token-in-layers=0
 SCAN_MAX=-1 npm run scan;    echo "exit=$?"     # gate=fail, exit=1
 SCAN_MAX=99999 npm run scan; echo "exit=$?"     # gate=pass, exit=0
-npm run demo:rollout   # profile=safe requests≈280000 ok=requests failed=0 rollout-seconds≈22, exit 0
+npm run demo:rollout   # profile=safe requests≈30000 ok=requests failed=0 rollout-seconds≈21, exit 0 (GET /products)
 npm run demo:pdb       # healthy=3 minAvailable=2 evict-1=201 evict-2=429
 
 npm run destroy && npm run cluster:down
 ```
 
 The names used by the criteria are namespace `marketplace`, Deployment, Service, PDB and HPA
-`marketplace-api`, and Secret `marketplace-api-db`. Criterion 5 runs `pulumi preview` inside
+`marketplace-api`, and Secret `marketplace-api-secrets`. Criterion 5 runs `pulumi preview` inside
 `infra/`; the stack `dev` is selected by `npm run up`. When Pulumi creates the stack it adds an
 `encryptionsalt:` line to `infra/Pulumi.dev.yaml`. That salt comes from the passphrase, so it is
 different for every person, and it is not committed.
@@ -3768,6 +3844,7 @@ by hand.
 docker/Dockerfile           4 stages; the last is gcr.io/distroless/nodejs22-debian12:nonroot, uid 65532
 k8s/kind-config.yaml        one kind node, NodePort 30080 mapped to 127.0.0.1:30080
 infra/                      Pulumi (TypeScript): Namespace, Secret, Deployment, Service, PDB, HPA
+                            (+ coursework: Postgres, RabbitMQ, migrate Job, relay, consumer)
 scripts/with-secrets.sh     the store from #11 → DB_PASSWORD, PULUMI_CONFIG_PASSPHRASE
 scripts/pulumi.sh           up | preview | destroy against a local file backend
 scripts/load.mjs            load generator: one status code per line, 000 for no response
@@ -3779,6 +3856,10 @@ demo/image.sh, rollout.sh, pdb.sh
 ## Kubernetes
 
 ### What runs in the pod
+
+*Since the coursework the Deployment runs `dist/main.js` with Postgres, RabbitMQ, the relay and
+the consumer next to it ([Kubernetes: the full contour](#kubernetes-the-full-contour)). This section
+describes homework 28's stub, which is still in the image as `dist/k8s-pod.js`.*
 
 The image is the whole application: `dist/main.js` and everything it needs are inside. The
 Deployment runs `dist/k8s-pod.js` from the same image. The full API needs Postgres, Redis, RabbitMQ
@@ -3818,7 +3899,8 @@ than 1800 MB.
 
 | Variable | Source | Purpose |
 | --- | --- | --- |
-| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password`, exported by `with-secrets.sh` | the database password; Pulumi puts it into the K8s Secret `marketplace-api-db`, and the pod reads it by `secretKeyRef` |
+| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password`, exported by `with-secrets.sh` | the database password; Pulumi puts it into the K8s Secret `marketplace-api-secrets`, and the pods read it as a file (`DB_PASSWORD_FILE`) |
+| `BROKER_PASSWORD`, `STORAGE_SECRET_KEY`, `JWT_*`, `REFRESH_TOKEN_PEPPER`, `PAYMENT_WEBHOOK_SECRET` | **сховище**: the same files the API reads locally, exported by `with-secrets.sh` | added by the coursework: the same Secret, the same file mount |
 | `PULUMI_CONFIG_PASSPHRASE` | **сховище** (#11): `secrets/pulumi_passphrase`, exported by `with-secrets.sh` | encrypts the Pulumi state, which holds the Secret's value |
 | `PULUMI_BACKEND_URL` | process environment; `scripts/pulumi.sh` defaults it to `file://<repo>/.pulumi` | a local file backend, never a `pulumi login` to an account |
 | `ROLLOUT_PROFILE` | process environment, set by `demo:rollout` | `safe` (default) or `broken` |
@@ -3829,8 +3911,8 @@ No new env file was added. The value travels this way:
 
 ```
 store (.env + secrets/db_password)  →  with-secrets.sh  →  DB_PASSWORD
-  →  Pulumi (pulumi.secret, Secret.data base64)  →  Secret marketplace-api-db
-  →  env[].valueFrom.secretKeyRef  →  process.env.DB_PASSWORD
+  →  Pulumi (pulumi.secret, Secret.data base64)  →  Secret marketplace-api-secrets
+  →  volume /run/secrets/app/DB_PASSWORD  →  DB_PASSWORD_FILE  (homework 28: secretKeyRef → env)
 ```
 
 The Deployment manifest carries only the reference, never the value. The first thing
@@ -4881,14 +4963,16 @@ own process, never to disk, exports the values and unsets `STORE_KEY` before it 
 The app and Pulumi never see the key. The values were generated for CI (`scripts/store-ci.sh init`)
 and protect only the stand the runner creates; none of them is a value from the dev store. The
 store reaches the pod in the same way as on #28: Pulumi writes a K8s Secret (`data`, base64), and
-the container reads it with `secretKeyRef`. `scripts/ci/manifest.sh` counts how many times the
-value appears in the Deployment, both as plain text and as base64, and the count must be 0.
+the containers read it as files (`NAME_FILE`). `scripts/ci/manifest.sh` counts how many times any
+store value appears in the workloads (Deployments, StatefulSets, Jobs, Services), both as plain text
+and as base64, and the count must be 0.
 Base64 is not encryption: putting the value in a Secret means it is not in git, not that it is
 encrypted.
 
 | Variable | Store | What it is for |
 | --- | --- | --- |
-| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password` locally, `store/ci.enc` in CI; exported by `with-secrets.sh` | the database password. It reaches the pod through the K8s Secret `marketplace-api-db` and `secretKeyRef` |
+| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password` locally, `store/ci.enc` in CI; exported by `with-secrets.sh` | the database password. It reaches the pods through the K8s Secret `marketplace-api-secrets`, mounted as files |
+| `BROKER_PASSWORD`, `STORAGE_SECRET_KEY`, `JWT_*`, `REFRESH_TOKEN_PEPPER`, `PAYMENT_WEBHOOK_SECRET` | `store/ci.enc` (added by `scripts/store-ci.sh fill`) | the rest of what the API, relay and consumer need in kind; the webhook key also signs the contour smoke |
 | `PULUMI_CONFIG_PASSPHRASE` | **сховище** (#11): `secrets/pulumi_passphrase` locally, `store/ci.enc` in CI | encrypts the Pulumi state, which holds the Secret's value |
 | `STORE_KEY` | the key **to** the store, not a value in it: `secrets/ci_store_key` locally, the `kind` environment's secret in CI | decrypts `store/ci.enc`, and is dropped before the wrapped command runs |
 
@@ -4991,11 +5075,12 @@ The `evidence` job runs with `if: always()`, so a red run has evidence too. It c
 
 | File | Contents |
 | --- | --- |
-| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source` (`oidc` only when `policy-allow=1`), `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secret-in-manifest`, `gate-scan-exit`, plus the cost lines |
+| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source` (`oidc` only when `policy-allow=1`), `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secrets-checked`, `secret-in-manifest`, `contour-final`, `contour-history`, `gate-scan-exit`, plus the cost lines |
 | `deployment.json` | `kubectl get deploy marketplace-api -o json` after `demo:rollout`, the state the run left (generation 2, `REV=2`); checked again for digest and secret |
 | `plan.json` | `pulumi preview --json`, the input to the cost gate |
 | `base-plan.json` | the same preview of the base commit's program, the cost gate's base |
 | `rollout.txt` | the raw output of `demo:rollout` |
+| `contour.txt` | the raw output of `demo/contour.mjs` against the API in kind |
 | `build.log` | one line per build in this run |
 
 None of the numbers is typed in by hand. `rollout-*` come from the file the load generator

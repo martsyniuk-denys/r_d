@@ -68,8 +68,15 @@ function podMonthlyUsd(podSpec: Obj | undefined): number {
 export function monthlyUsd(type: string, inputs: Obj = {}): number {
   switch (type) {
     case 'kubernetes:apps/v1:Deployment':
-    case 'kubernetes:apps/v1:StatefulSet':
       return (inputs.spec?.replicas ?? 1) * podMonthlyUsd(inputs.spec?.template?.spec);
+    // A StatefulSet bills its volumes too: one claim per template per replica.
+    case 'kubernetes:apps/v1:StatefulSet': {
+      const replicas = inputs.spec?.replicas ?? 1;
+      const volumesGib = ((inputs.spec?.volumeClaimTemplates ?? []) as Obj[])
+        .map((t) => gibibytes(t.spec?.resources?.requests?.storage))
+        .reduce((a, b) => a + b, 0);
+      return replicas * (podMonthlyUsd(inputs.spec?.template?.spec) + volumesGib * RATES.volumeGbMonthUsd);
+    }
     case 'kubernetes:core/v1:Service':
       return inputs.spec?.type === 'LoadBalancer' ? RATES.loadBalancerHourUsd * RATES.hoursPerMonth : 0;
     case 'kubernetes:core/v1:PersistentVolumeClaim':
