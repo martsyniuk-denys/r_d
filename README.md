@@ -552,6 +552,12 @@ both manifest checks follow. `contour-final` and `contour-history` go into `depl
 `scripts/store-ci.sh fill` added the new values to the CI store under the same key, so the
 `STORE_KEY` of the `kind` environment did not change.
 
+First green run with the full contour: https://github.com/martsyniuk-denys/r_d/actions/runs/45259552063
+(`contour-final=shipped`, `contour-history=4`, `secrets-checked=6`, `secret-in-manifest=0`, `cost-plan-usd=11.86`
+against a budget of 15.04, `rollout-requests=35999`, `rollout-failed=0`, `rollout-seconds=21`). In the run before it,
+the smoke started a second after `pulumi up`, before kube-proxy served the new pods on the NodePort, and its
+first request got `fetch failed`. The step now waits for `/readyz` through that same port.
+
 **Without the store** (a grader), the variables are exported first, as in
 [the Kubernetes run](#kubernetes-the-rollout-homework):
 
