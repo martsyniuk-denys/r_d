@@ -48,11 +48,16 @@ count() { # $1 = label, rest = aws command → prints a number
 
 tagged=0; rds=0; alb=0; nat=0; eip=0
 for r in $REGIONS; do
+  # The contract's query, verbatim. Stack=demo: base is allowed to outlive the session,
+  # and a live base must not turn this into a non-zero. :natgateway/ is excluded because
+  # a deleted NAT stays visible to the tagging API for about an hour; nat-left counts it.
   t="$(count "tagged@$r" aws resourcegroupstaggingapi get-resources --region "$r" \
-        --tag-filters Key=Project,Values=nodejs-pro-hw31 --query 'length(ResourceTagMappingList)')"
+        --tag-filters Key=Project,Values=nodejs-pro-hw31 Key=Stack,Values=demo \
+        --query "length(ResourceTagMappingList[?!contains(ResourceARN, ':natgateway/')])")"
   d="$(count "rds@$r" aws rds describe-db-instances --region "$r" --query 'length(DBInstances)')"
   l="$(count "alb@$r" aws elbv2 describe-load-balancers --region "$r" --query 'length(LoadBalancers)')"
-  n="$(count "nat@$r" aws ec2 describe-nat-gateways --region "$r" --filter Name=state,Values=available \
+  # A NAT in `pending` is already billed and becomes `available` after the check.
+  n="$(count "nat@$r" aws ec2 describe-nat-gateways --region "$r" --filter Name=state,Values=pending,available \
         --query 'length(NatGateways)')"
   e="$(count "eip@$r" aws ec2 describe-addresses --region "$r" --query 'length(Addresses)')"
   echo "  $r: tagged=$t rds=$d alb=$l nat=$n eip=$e"

@@ -122,8 +122,9 @@ jobs:
       - name: pulumi destroy — demo, then base
         timeout-minutes: 8 # a hang fails here, visibly, instead of eating the job
         run: |
-          bash scripts/aws.sh demo destroy | tail -n 3
-          bash scripts/aws.sh base destroy | tail -n 3
+          # From `Resources:` on: the log keeps the `N deleted` line, not just the epilogue.
+          bash scripts/aws.sh demo destroy | sed -n '/^Resources:/,$p'
+          bash scripts/aws.sh base destroy | sed -n '/^Resources:/,$p'
 
       # Before any `stack rm`: after --remove there is no state left to export.
       - name: pulumi stack export
