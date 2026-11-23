@@ -285,7 +285,7 @@ repository, the pool, the outbox, the broker or a checkout transaction
 | edge | `src/bootstrap.ts`, `openapi/openapi.yaml`, `src/common/problem.filter.ts` | validate against the spec, one error format (`application/problem+json`), raw body for the webhook, probes, `/metrics` |
 | controller | `src/orders/orders.controller.ts`, `src/payments/payments.controller.ts`, … | read the request, call one service method, map the result; guards: `AccessTokenGuard`, `RolesGuard` |
 | service | `src/orders/orders.service.ts`, `src/payments/payments.service.ts` | business rules: ownership, lifecycle, amount check, idempotency |
-| domain operations | `src/orders/place-order.ts`, `src/orders/lifecycle.ts`, `src/orders/place-order-once.ts`, `src/outbox/outbox.ts` | the transactions themselves; know SQL, not HTTP |
+| domain operations | `src/orders/place-order.ts`, `src/orders/lifecycle.ts`, `src/orders/place-order-once.ts`, `src/payments/apply-payment.ts`, `src/outbox/outbox.ts` | the transactions themselves; know SQL, not HTTP |
 | repository | `src/repositories/*.ts` | queries; no business decisions |
 | background | `src/relay.ts` + `src/outbox/relay.ts`, `src/consumer.ts` + `src/messaging/order-placed.consumer.ts`, `src/realtime/order-status.feed.ts` | outbox → broker; broker → effect; broker → realtime |
 | config | `src/config/env.schema.ts`, `src/config/secret-files.ts` | the only door to `process.env`; fail-fast |
@@ -387,7 +387,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | Full contour: create → background → status → final read by a separate request | `src/orders/*`, `src/messaging/order-placed.consumer.ts`, `src/payments/*` | *compose:* `docker compose run --rm demo demo/contour.mjs` → `created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4`, exit 0; e2e `runs the whole contour` |
 | 50 concurrent, no oversell or lost update; a shortage rolls everything back | `src/orders/place-order.ts`; `src/concurrency/checkout.ts` | e2e `sells exactly the stock under a parallel burst` (30 requests on stock 5 → 5 × 201, 25 × 409, stock 0) and `rolls the whole checkout back when one line is short`; *npm:* `npm run demo:race` (50 parallel on stock 10, see [Race](#race-npm-run-demorace)) |
 | Contract machine-checked: cursor pagination, `Idempotency-Key` required, problem+json 4xx | `openapi/openapi.yaml`, `src/bootstrap.ts`, `src/common/problem.filter.ts`, `src/common/cursor.ts` | `npm run check`; the curl step 5 above (400 problem+json without the key); e2e `keeps 400, 401, 403 and 422 apart`; Pact: `npm run test:contract && npm run verify:provider` |
-| A repeated irreversible operation has one effect; the key comes from the business entity | `src/orders/place-order-once.ts` (key `route:user:key` + request hash), `src/payments/payments.service.ts` (provider `event_id`), consumer inbox by event id | contour demo `idempotent replay` (same order, `Idempotency-Replay: true`); `demo/webhook.mjs` → `duplicates=1`; unit `checkout-request.test.ts` (same cart → same hash, other cart → 422) |
+| A repeated irreversible operation has one effect; the key comes from the business entity | `src/orders/place-order-once.ts` (key `route:user:key` + request hash), `src/payments/apply-payment.ts` (provider `event_id`), consumer inbox by event id | contour demo `idempotent replay` (same order, `Idempotency-Replay: true`); `demo/webhook.mjs` → `duplicates=1`; unit `checkout-request.test.ts` (same cart → same hash, other cart → 422) |
 
 ### 11.3 Data
 
@@ -435,7 +435,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | Liveness and readiness on different paths; readiness red on SIGTERM | `src/bootstrap.ts`, `src/health/readiness.service.ts`, `src/main.ts` | `curl localhost:3000/readyz` → `{"status":"ready","checks":{"database":"up","broker":"up"}}`; `docker compose kill -s SIGTERM api` → `/readyz` 503 at once, `/healthz` 200 through the 5 s drain, exit 0; e2e `probes.e2e.test.ts` |
 | Structured logs, one `trace_id`, no secrets | `src/observability/logger.ts`, `request-log.ts`, `amqp-trace.ts` | `docker compose logs --no-log-prefix api relay consumer \| grep <checkout_trace>` → lines from all three processes; `npm run demo:logs` → `secret-in-logs=0` |
 | RED metrics, OTel continues `traceparent`, dashboard as a file | `src/observability/metrics.ts`, `observability/grafana/dashboards/marketplace-red.json` | `demo/contour-trace.mjs` → 5 hops, 0 orphans; Grafana row *Main contour*; `npm run demo:metrics`, `demo:trace` |
-| Tests: integration against a real DB, twice green; e2e of the contour; business logic without HTTP | `test/integration`, `test/e2e/orders.e2e.test.ts`, `test/unit/lifecycle.test.ts` | `npm run test:integration` (run it twice), `npm run test:e2e`, `npm run test:unit` |
+| Tests: integration against a real DB, twice green; e2e of the contour; business logic without HTTP | `test/integration` (orders, products, `order-history.test.ts`, `payments.test.ts`), `test/e2e/orders.e2e.test.ts`, `test/unit/lifecycle.test.ts` | `npm run test:integration` (run it twice), `npm run test:e2e`, `npm run test:unit` |
 | A pipeline in which every gate can say no | `.github/workflows/*`, `demo/gates.sh` | `npm run demo:gates` → `<step>-ok=0`, `<step>-broken=1` for each gate; [CI/CD](#cicd) |
 
 ## Environment variables
@@ -1183,7 +1183,7 @@ compose stack does not have to be up, because `@testcontainers/postgresql` start
 database from inside the run:
 
 ```bash
-npm run test:integration            # 8 tests, two repositories, real Postgres
+npm run test:integration            # 25 tests: repositories, status history, payments; real Postgres
 npm run test:integration            # again: still green, nothing cleaned by hand
 npm run test:e2e                    # 4 tests: create → read, 404 and 400
 npm run test:contract               # writes pacts/marketplace-web-marketplace-api.json
@@ -1844,7 +1844,7 @@ thing it is supposed to be testing.
 
 | Command | What runs | Against what |
 | --- | --- | --- |
-| `npm run test:integration` | repositories, 8 tests | a real Postgres started by the test run |
+| `npm run test:integration` | repositories, status history, payment webhooks — 25 tests | a real Postgres started by the test run |
 | `npm run test:e2e` | the whole HTTP application, 4 tests | the real module graph, the real database |
 | `npm run test:contract` | the consumer side of the contract | Pact's mock provider → `pacts/*.json` |
 | `npm run verify:provider` | the real application answering the contract | the local pact file, or the broker |
@@ -1887,6 +1887,10 @@ rather than a `Pool` of their own: in production they are handed the pool, in te
 client the transaction is open on, and inside `checkout()` the connection the TypeORM
 transaction already owns.
 
+One test does need two real connections: the race of two transitions out of one status in
+`order-history.test.ts`. A single rolled-back transaction cannot race itself, so that test
+commits its order and deletes it (and its outbox rows) in `afterAll`.
+
 ```bash
 npm run test:integration && npm run test:integration   # both green, nothing cleaned by hand
 ```
@@ -1921,6 +1925,26 @@ homework writes its order and its line through the second.
 | same product twice in one order → `23505` | `order_items_order_product_unique` |
 | revenue per seller | three-table `JOIN`, two aggregates, a `GROUP BY` and a status filter |
 | deleting an order | `ON DELETE CASCADE` takes the lines with it |
+
+The coursework added the order's lifecycle and its payments: `transition()` and
+`recordStatus()` in `src/orders/lifecycle.ts`, `applyPayment()` in
+`src/payments/apply-payment.ts` — plain SQL on whatever connection the caller's transaction
+is open on, so the tests hand them the rolled-back one.
+
+| Test (`order-history.test.ts`, `payments.test.ts`) | Why a mock would have missed it |
+| --- | --- |
+| transition writes row + history + outbox event | three tables in one transaction; the event carries the history row's id |
+| a transition the table forbids | the refusal is the `UPDATE … WHERE old.status = ANY(…)` matching nothing — no history, no outbox |
+| replay after a `Last-Event-ID` | `id > $2 ORDER BY id` over an identity column |
+| two concurrent transitions out of one status | the row lock in the sub-select: exactly one wins, the loser reads the winner's status |
+| history goes with a deleted order | `ON DELETE CASCADE` |
+| webhook pays a confirmed or a pending order | intent, journal, status and history change together |
+| redelivery of the same event | `ON CONFLICT (provider_event_id) DO NOTHING` — the state after the second call equals the state after the first |
+| wrong amount, wrong currency | compared with `payment_intents`, frozen at checkout; journaled, order unmoved |
+| failed payment, then a retry | intent `failed`, then `succeeded`; the order stays payable in between |
+| money for a cancelled order | journaled as `ignored`, the order does not move |
+| deleting an order with payment events → `23503` | `ON DELETE RESTRICT` keeps the journal |
+| an unknown verdict → `23514` | `payment_events_verdict_known` |
 
 ## End to end
 
