@@ -371,6 +371,18 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 *compose* run against the [Quick start](#quick-start) stack; *npm* ones need
 [Running from source](#running-from-source).
 
+### Block → path → what replaced the course tool, and why
+
+| Block | Path | Tool here | Replaced, and why |
+| --- | --- | --- | --- |
+| 11.1 Design | course | ДЗ0 note in this README; Nest controller → service → repository, `layer` field in logs (ДЗ 20); one zod schema, fail-fast (ДЗ 7); OpenAPI (ДЗ 6) | — |
+| 11.2 Contour | course | atomic conditional `UPDATE` in one transaction (ДЗ 10); `Idempotency-Key` in Postgres (ДЗ 15); runtime spec validator + Pact (ДЗ 6, 12) | — |
+| 11.3 Data | course | Postgres + TypeORM migrations (ДЗ 8, 9); PgBouncer transaction mode, `pg_dump` + restore drill (ДЗ 11); two Redis (ДЗ 16) | object storage: **RustFS** instead of MinIO — MinIO no longer publishes images; the S3 API is the same. CDN: an edge cache process (`src/edge.ts`), no cloud CDN account |
+| 11.4 Security | course + own | ES256 tokens with rotated refresh (ДЗ 17); webhook HMAC, dedup, amount (ДЗ 15); Redis sliding-window limit (ДЗ 16) | secret store: **own** — git-ignored files + `NAME_FILE` locally, AES-encrypted `store/ci.enc` in CI, instead of Infisical — no external account needed by a reviewer; dev ≠ prod values and live rotation are shown the same way ([Secrets and their rotation](#secrets-and-their-rotation)) |
+| 11.5 Asynchrony | course | RabbitMQ with confirms and DLQ (ДЗ 14); outbox + inbox (ДЗ 15); SKIP LOCKED workers, retry on `40001`/`40P01` (ДЗ 10); WS + SSE (ДЗ 13) | — |
+| 11.6 Delivery | course | compose `up -d --wait` (ДЗ 2, 7–10); distroless image (ДЗ 19); Pulumi on kind (ДЗ 19); GitHub Actions deploy to kind by digest (ДЗ 22) | AWS (ДЗ 21): **LocalStack** as the fallback lane — no paid AWS account; the teardown check is the same script |
+| 11.7 Operations | course | `/healthz` + `/readyz` (ДЗ 19); pino JSON logs with `trace_id` (ДЗ 20); Prometheus, OpenTelemetry → Jaeger, Grafana dashboard as a file (ДЗ 20); Jest + supertest + Pact (ДЗ 12); GitHub Actions gates (ДЗ 22) | — |
+
 ### 11.1 Design and architecture
 
 | Criterion | Where | Check |
