@@ -2,6 +2,7 @@
 // `npm start`, or the cluster — chosen by BASE_URL. Nothing here reaches into the
 // database: what the demos prove, they prove through the public API.
 import { createHmac, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 export const BASE_URL = (process.env.BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '');
 
@@ -56,10 +57,16 @@ export function webhook(secret, payload, { signWith = secret } = {}) {
   return call('POST', '/payments/webhook', { raw, headers: { 'x-signature': signature } });
 }
 
+// The provider's copy of the signing key: the environment (npm scripts, through the
+// store), or a file — the compose `demo` service mounts the keys volume read-only.
 export function webhookSecret() {
-  const secret = process.env.PAYMENT_WEBHOOK_SECRET;
+  const file = process.env.PAYMENT_WEBHOOK_SECRET_FILE;
+  const secret = process.env.PAYMENT_WEBHOOK_SECRET || (file ? readFileSync(file, 'utf8').trim() : '');
   if (!secret) {
-    throw new Error('PAYMENT_WEBHOOK_SECRET is not set — run through npm (scripts/with-secrets.sh), or export it with SKIP_VAULT=1');
+    throw new Error(
+      'PAYMENT_WEBHOOK_SECRET is not set — run through npm (scripts/with-secrets.sh), export it with SKIP_VAULT=1, ' +
+        'or use the compose demo service (docker compose run --rm demo demo/webhook.mjs)',
+    );
   }
   return secret;
 }

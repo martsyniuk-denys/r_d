@@ -138,6 +138,124 @@ services:
       timeout: 3s
       retries: 30
 
+  # --- The application -----------------------------------------------------------
+  # One image (docker/Dockerfile, the production one: distroless, no shell, uid 65532),
+  # five roles. `docker compose up -d --wait` builds it, writes the keys, migrates and
+  # seeds, and returns when the API answers its readiness probe.
+  #
+  # Credentials: the passwords of postgres/rabbitmq/rustfs are the dev values this file
+  # already hands those servers, passed to the app as files (compose secrets from the
+  # committed secrets/*.example), never as environment values. The app's own secrets —
+  # the JWT signing key, the refresh pepper, the payment webhook key — are not in git
+  # at all: the `keys` one-shot generates them into the keys volume on the first `up`.
+  keys:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: marketplace-api:compose
+    command: ['dist/compose-keys.js']
+    volumes:
+      - keys:/keys
+
+  migrate:
+    image: marketplace-api:compose
+    command: ['dist/migrate.js']
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      keys:
+        condition: service_completed_successfully
+    environment:
+      DB_URL: postgres://marketplace@pgbouncer:6432/marketplace
+      DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+
+  api:
+    image: marketplace-api:compose
+    command: ['dist/main.js']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    ports:
+      - '3000:3000'
+    environment: &app-env
+      PORT: '3000'
+      DB_URL: postgres://marketplace@pgbouncer:6432/marketplace
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      BROKER_URL: amqp://marketplace@rabbitmq:5672
+      BROKER_PASSWORD_FILE: /run/secrets/broker_password
+      STORAGE_ENDPOINT: http://storage:9000
+      STORAGE_BUCKET: marketplace-files
+      STORAGE_ACCESS_KEY: marketplace
+      STORAGE_SECRET_KEY_FILE: /run/secrets/storage_secret_key
+      JWT_PRIVATE_KEY_FILE: /keys/JWT_PRIVATE_KEY
+      JWT_PUBLIC_KEY_FILE: /keys/JWT_PUBLIC_KEY
+      JWT_KID_FILE: /keys/JWT_KID
+      REFRESH_TOKEN_PEPPER_FILE: /keys/REFRESH_TOKEN_PEPPER
+      PAYMENT_WEBHOOK_SECRET_FILE: /keys/PAYMENT_WEBHOOK_SECRET
+    volumes:
+      - keys:/keys:ro
+    secrets: &app-secrets
+      - db_password
+      - broker_password
+      - storage_secret_key
+    healthcheck:
+      # No shell and no curl in the image: the probe is the image's own node.
+      test: ['CMD', '/nodejs/bin/node', '-e', "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # Outbox → broker. Several relays may run: rows are claimed with SKIP LOCKED.
+  relay:
+    image: marketplace-api:compose
+    command: ['dist/relay.js']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    environment: *app-env
+    secrets: *app-secrets
+
+  # order.placed → fulfilment + pending→confirmed, in one transaction per message.
+  consumer:
+    image: marketplace-api:compose
+    command: ['dist/consumer.js']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    environment: *app-env
+    secrets: *app-secrets
+
+  # The contour demos, run against the API above by name — no node on the host needed:
+  #   docker compose run --rm demo demo/contour.mjs
+  #   docker compose run --rm demo demo/webhook.mjs
+  # The provider simulator signs with the webhook key from the keys volume (read-only).
+  demo:
+    image: node:22-alpine
+    profiles: [demo]
+    entrypoint: ['node']
+    working_dir: /work
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://api:3000
+      PAYMENT_WEBHOOK_SECRET_FILE: /keys/PAYMENT_WEBHOOK_SECRET
+    volumes:
+      - ./demo:/work/demo:ro
+      - keys:/keys:ro
+
   pact-broker-db:
     image: postgres:16-alpine
     container_name: marketplace-pact-broker-db
@@ -183,7 +301,16 @@ services:
       retries: 30
       start_period: 20s
 
+secrets:
+  db_password:
+    file: ./secrets/db_password.example
+  broker_password:
+    file: ./secrets/broker_password.example
+  storage_secret_key:
+    file: ./secrets/storage_secret_key.example
+
 volumes:
+  keys:
   pgdata:
   pactbrokerdata:
   rabbitmqdata:

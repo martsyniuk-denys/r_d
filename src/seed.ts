@@ -370,7 +370,7 @@ async function seedOrders(
   }
 }
 
-async function main(): Promise<void> {
+export async function seed(): Promise<void> {
   const dataSource = await AppDataSource.initialize();
 
   try {
@@ -397,7 +397,7 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((error: unknown) => {
+  seed().catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);
   });

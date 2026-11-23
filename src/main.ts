@@ -6,6 +6,7 @@ import type { ConfigService as ConfigServiceType } from '@nestjs/config';
 
 import { validate } from './config/env.schema';
 import type { Env } from './config/env.schema';
+import { loadSecretFiles } from './config/secret-files';
 import { layerLogger } from './observability/logger';
 import { shutdownTracing } from './observability/tracing-shutdown';
 
@@ -26,6 +27,7 @@ function loadEnvFile(): void {
 
 async function main(): Promise<void> {
   loadEnvFile();
+  loadSecretFiles();
   validate(process.env);
 
   const { ConfigService } = await import('@nestjs/config');
