@@ -76,6 +76,10 @@ amount-mismatch=1
 duplicates=1
 ```
 
+All of this section, the curl walk-through below and the checks of the grading table were
+run from a fresh clone by `scripts/acceptance.sh`; its output, with every command and exit
+code, is [`evidence/acceptance.txt`](evidence/acceptance.txt).
+
 **Observability** is a profile of the same file: Prometheus, Jaeger and Grafana with the
 dashboard provisioned from `observability/grafana/dashboards/marketplace-red.json`.
 
@@ -419,7 +423,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 
 | Criterion | Where | Check |
 | --- | --- | --- |
-| `docker compose up -d --wait` from a clean clone per README; no hidden steps; data survives a restart; waits for dependencies | `docker-compose.yml` | [Quick start](#quick-start); `depends_on: service_healthy / service_completed_successfully` everywhere; `down && up -d --wait` keeps orders and keys |
+| `docker compose up -d --wait` from a clean clone per README; no hidden steps; data survives a restart; waits for dependencies | `docker-compose.yml`, `scripts/acceptance.sh` | `evidence/acceptance.txt` (fresh clone, cold build, `failed steps and checks: 0`); [Quick start](#quick-start); `depends_on: service_healthy / service_completed_successfully` everywhere; `down && up -d --wait` keeps orders and keys |
 | Production image: multi-stage, no shell, non-root, no build secret, scanner threshold | `docker/Dockerfile`, `scripts/scan.sh` | `npm run demo:image` → `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `SCAN_MAX=-1 npm run scan` → `gate=fail`, exit 1. See [The image](#the-image), [The scan gate](#the-scan-gate) |
 | IaC deploy, rollout `failed=0`, two probes, SIGTERM | `infra/`, `k8s/`, `src/k8s-pod.ts`, `demo/rollout.sh` | `npm run demo:rollout` → `failed=0`; [Kubernetes](#kubernetes). The pod there is the stateless stub, see [Honest boundaries](#honest-boundaries) |
 | Off-machine deploy: green deploy run by digest, or a teardown run | `.github/workflows/pr.yml`, `deploy.yml`, `teardown.yml` | green `pr` run on PR #23 (built = deployed = registry digest, `failed=0`), teardown run in [AWS](#aws) |
