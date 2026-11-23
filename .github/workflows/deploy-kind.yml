@@ -140,7 +140,15 @@ jobs:
         env:
           STORE_KEY: ${{ secrets.STORE_KEY }}
           BASE_URL: http://127.0.0.1:30080
-        run: bash scripts/with-secrets.sh ci node demo/contour.mjs 2>&1 | tee "$OUT/contour.txt"
+        # `pulumi up` returns when the pods are ready; the NodePort serves them only once
+        # kube-proxy has the endpoints, a moment later — so the smoke waits for /readyz
+        # through the same port it is about to use, 60 s at most.
+        run: |
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null "$BASE_URL/readyz" && break
+            sleep 1
+          done
+          bash scripts/with-secrets.sh ci node demo/contour.mjs 2>&1 | tee "$OUT/contour.txt"
 
       - name: demo:rollout — failed must be 0
         env:
