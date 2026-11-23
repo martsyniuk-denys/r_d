@@ -79,6 +79,27 @@ describe('payment webhooks against a real Postgres', () => {
     await expect(stateOf(order.id)).resolves.toEqual(once);
   });
 
+  // The key is the order, not what the sender chose: a second success under another
+  // event id (another provider retry policy, a double click on the payment page) is a
+  // second message about the same order, and the order can be paid once.
+  it('pays an order once even when a second success arrives under another event id', async () => {
+    const order = await anOrderAwaitingPayment();
+    const first = webhook(order);
+    const second = webhook(order);
+    await applyPayment(ctx.db(), order.id, first);
+
+    await expect(applyPayment(ctx.db(), order.id, second)).resolves.toMatchObject({ verdict: 'ignored', order_status: 'paid' });
+    await expect(stateOf(order.id)).resolves.toEqual({
+      order: 'paid',
+      intent: 'succeeded',
+      journal: [
+        [first.event_id, 'applied'],
+        [second.event_id, 'ignored'],
+      ],
+      history: [['confirmed', 'paid', 'payment-webhook']],
+    });
+  });
+
   it('journals an amount that differs from the frozen one and leaves the order where it was', async () => {
     const order = await anOrderAwaitingPayment('confirmed', 54_900);
     const short = webhook(order, { amount_cents: 100 });

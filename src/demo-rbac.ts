@@ -45,6 +45,10 @@ runDemo(async () => {
       body: product('Auth demo: buyer product'),
     });
 
+    // A product created through the API has no stock, and checkout reserves stock: put
+    // one unit on the shelf, the way a seller's restock would, so the order can exist.
+    await dataSource.query(`UPDATE products SET stock = 1 WHERE id = $1`, [roleAllowed.body.id.replace(/^p_/, '')]);
+
     const order = await api.call<{ id: string; buyer_id: string }>('POST', '/orders', {
       token: ownerToken,
       headers: key(),

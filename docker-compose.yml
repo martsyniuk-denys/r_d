@@ -314,6 +314,9 @@ services:
     image: jaegertracing/jaeger:2.10.0
     profiles: [obs]
     ports:
+      # OTLP on the standalone stand's port too, so the npm demos run from source
+      # (demo:trace, demo:logs) export here as well as the containers do.
+      - '127.0.0.1:22918:4318'
       - '127.0.0.1:22904:16686'
     healthcheck:
       test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:13133/status']

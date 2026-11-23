@@ -31,7 +31,7 @@ If the laptop cannot run Docker on the day, everything below is also recorded:
 | 5 | 1 min | RED metrics and the transitions counter on a dashboard that lives in git. | Grafana, row *Main contour* | request rate, errors, p95; `order_status_transitions_total` |
 | 6 | 1.5 min | Readiness goes red before the process stops, so no request lands on a closing API. | `docker compose kill -s SIGTERM api`; `curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/readyz` and `/healthz` within 5 s; `docker compose up -d --wait api` | `/readyz` 503, `/healthz` 200, container exits 0 |
 | 7 | 1 min | The same image, the same contour in Kubernetes, deployed by CI by digest. | the CI run, job *deploy*, artifact `deploy-evidence` | `contour-final=shipped`, `rollout-failed=0`, `secret-in-manifest=0` |
-| 8 | 1 min | Every gate can say no. | `npm run demo:gates` | `<gate>-ok=0`, `<gate>-broken=1` for each |
+| 8 | 1 min | Every gate can say no. | `npm run demo:gates` | `<gate>-ok=0` and `<gate>-broken` ≠ 0 for each (arch prints `arch-broken=2`: two planted violations) |
 
 If time is short, keep 2, 3 and 6: the contour, the money, and the shutdown.
 
@@ -126,12 +126,60 @@ If time is short, keep 2, 3 and 6: the contour, the money, and the shutdown.
   twice, a two-connection race included), e2e of the contour; a mutation check broke the status
   guard and the amount check, and 5 tests went red.
 
+### 11.8 The three questions the ТЗ gives as examples
+
+- **Why is the ack after the effect?** An ack tells RabbitMQ to forget the message. Acked before
+  the transaction commits, a crash in between loses the work for good. Acked after, a crash means
+  one more delivery, which the inbox (`processed_messages`, same transaction as the effect)
+  turns into a no-op. At-least-once plus an idempotent effect gives exactly one effect; the
+  other order gives at-most-once (`src/messaging/order-placed.consumer.ts`, `demo:crash-relay`).
+- **Why can't publish and `UPDATE published_at` swap places?** Marked first and then the
+  process dies before the publish: the row says "sent", nothing was sent, and nothing will ever
+  retry it — the event is lost. Published first, waited for the broker's confirm, then marked: a
+  crash in between publishes the row once more, and the consumer's dedup absorbs it
+  (`src/outbox/relay.ts`: SELECT … SKIP LOCKED → publish + confirm → UPDATE).
+- **What breaks with realtime on two instances?** A buyer's socket sits on one instance, the
+  status change can happen on another (or in the consumer). An in-memory emitter would only reach
+  sockets of the process that changed it. Here each API instance binds its own exclusive queue to
+  `order.status_changed`, so every instance hears every change and pushes it to the owner's
+  sockets it holds; SSE replays from `order_status_history` by `Last-Event-ID`, so a reconnect to
+  the other instance loses nothing (`src/realtime/order-status.feed.ts`).
+
+### Walkthrough: the feature the lecturer picks → the command
+
+Every row of README → *Block → path* is "yes". The command for each, with what it prints:
+
+| Feature | Command | Prints |
+| --- | --- | --- |
+| 50 concurrent, no oversell | `npm run demo:race` | `no oversell`, balances match, exit 0 |
+| Idempotent repeat | `npm run demo:outbox` | `outbox=1 published=1 deliveries=1 effect=1` |
+| N+1 | `npm run demo:nplus1` | `33 queries` naive → `1 query` with relations |
+| Restore drill | `bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh` | `MATCH`, RTO 3.3 s |
+| Cache, single-flight | `npm run demo:cache` | `concurrent=50 db-calls=1` |
+| Session survives a restart | `npm run demo:session` | `survived-restart=1` |
+| Files, closed bucket, CDN | `npm run demo:upload`, `demo:cdn` | `put-offline=200`, `direct=403 cache-hit=1` |
+| Logout, refresh reuse | `npm run demo:auth`, `demo:reuse` | `after-logout=401`, `r1-reuse=401 r2-after-reuse=401 reuse-logged=1` |
+| 401 vs 403 | `npm run demo:rbac` | `anon=401 own=200 foreign=403 role-denied=403 tampered=401` |
+| Rate limit | `npm run demo:ratelimit` | `status=429 retry-after=1`, two instances, one shared window |
+| Secrets dev ≠ prod | `node scripts/jwt-keys.mjs fingerprint dev` / `prod` | two different kids and fingerprints |
+| Outbox crash | `npm run demo:crash-write`, `demo:crash-relay` | `outbox=0 deliveries=0`; `acked=2 effect=1` |
+| Prefetch, DLQ, workers | `npm run demo:publish`, `demo:dlq`, `demo:workers` | `prefetch=32`; `work=0 dlq=1`; every job once |
+| Realtime owner only | `npm run demo:realtime`, `:same-room` | `A_RECEIVED=1 B_RECEIVED=0`; same room `B_RECEIVED=1` |
+| Image | `npm run demo:image`; `SCAN_MAX=-1 npm run scan` | `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `gate=fail` exit 1 |
+| Rollout | `npm run demo:rollout` (kind up) | `failed=0` |
+| Logs | `npm run demo:logs` | `layers=3 distinct-trace-ids=1 burst-uneven=0 secret-in-logs=0` |
+| Metrics, trace | `npm run demo:metrics`, `demo:trace` | `errors-delta=8`; `trace-matches-log=1` |
+| Tests | `npm run test:integration` twice, `test:e2e`, `test:unit` | 26, 26, 16, 20 passed |
+
+The outbox and queue demos run their own relay and consumer: `docker compose stop relay consumer`
+first, `docker compose start relay consumer` after (README → *Running from source*).
+
 ## Weak points, and the honest answer
 
 | If asked | Answer |
 | --- | --- |
-| Is Redis in the contour? | Not yet in the API that compose runs: cache-aside, sessions and the rate limit are shown in their own processes (`npm run demo:cache`, `demo:session`, `demo:ratelimit`). |
-| Is `POST /orders` rate-limited? | The shared-store limiter exists (`src/ratelimit/sliding-window.ts`) but guards the edge process, not the Nest API. |
+| Is Redis in the contour? | No: cache-aside, sessions and the rate limit run in their own processes, which is the evidence the ТЗ names (`demo:cache`, `demo:session`, `demo:ratelimit`). The Nest API of the contour does not use Redis. |
+| Is `POST /orders` rate-limited? | Not in the Nest API: the shared-store limiter (`src/ratelimit/sliding-window.ts`) guards the edge process. |
 | Products and files idempotency? | Still the in-memory one; the orders contour uses Postgres. |
 | The contract gate is red on the PR. | On purpose: the status enum changed. The PR carries `breaking-approved`; the gate still prints `gate=fail`, the label only stops it from blocking. |
 | Is the payment provider real? | Simulated: the demos sign like a provider would. |

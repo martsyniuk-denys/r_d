@@ -373,15 +373,15 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 
 ### Block → path → what replaced the course tool, and why
 
-| Block | Path | Tool here | Replaced, and why |
-| --- | --- | --- | --- |
-| 11.1 Design | course | ДЗ0 note in this README; Nest controller → service → repository, `layer` field in logs (ДЗ 20); one zod schema, fail-fast (ДЗ 7); OpenAPI (ДЗ 6) | — |
-| 11.2 Contour | course | atomic conditional `UPDATE` in one transaction (ДЗ 10); `Idempotency-Key` in Postgres (ДЗ 15); runtime spec validator + Pact (ДЗ 6, 12) | — |
-| 11.3 Data | course | Postgres + TypeORM migrations (ДЗ 8, 9); PgBouncer transaction mode, `pg_dump` + restore drill (ДЗ 11); two Redis (ДЗ 16) | object storage: **RustFS** instead of MinIO — MinIO no longer publishes images; the S3 API is the same. CDN: an edge cache process (`src/edge.ts`), no cloud CDN account |
-| 11.4 Security | course + own | ES256 tokens with rotated refresh (ДЗ 17); webhook HMAC, dedup, amount (ДЗ 15); Redis sliding-window limit (ДЗ 16) | secret store: **own** — git-ignored files + `NAME_FILE` locally, AES-encrypted `store/ci.enc` in CI, instead of Infisical — no external account needed by a reviewer; dev ≠ prod values and live rotation are shown the same way ([Secrets and their rotation](#secrets-and-their-rotation)) |
-| 11.5 Asynchrony | course | RabbitMQ with confirms and DLQ (ДЗ 14); outbox + inbox (ДЗ 15); SKIP LOCKED workers, retry on `40001`/`40P01` (ДЗ 10); WS + SSE (ДЗ 13) | — |
-| 11.6 Delivery | course | compose `up -d --wait` (ДЗ 2, 7–10); distroless image (ДЗ 19); Pulumi on kind (ДЗ 19); GitHub Actions deploy to kind by digest (ДЗ 22) | AWS (ДЗ 21): **LocalStack** as the fallback lane — no paid AWS account; the teardown check is the same script |
-| 11.7 Operations | course | `/healthz` + `/readyz` (ДЗ 19); pino JSON logs with `trace_id` (ДЗ 20); Prometheus, OpenTelemetry → Jaeger, Grafana dashboard as a file (ДЗ 20); Jest + supertest + Pact (ДЗ 12); GitHub Actions gates (ДЗ 22) | — |
+| Block | Implemented | Path | Tool here | Replaced, and why |
+| --- | --- | --- | --- | --- |
+| 11.1 Design | yes, every row | course | ДЗ0 note in this README; Nest controller → service → repository, `layer` field in logs (ДЗ 20); one zod schema, fail-fast (ДЗ 7); OpenAPI (ДЗ 6) | — |
+| 11.2 Contour | yes, every row | course | atomic conditional `UPDATE` in one transaction (ДЗ 10); `Idempotency-Key` in Postgres (ДЗ 15); runtime spec validator + Pact (ДЗ 6, 12) | — |
+| 11.3 Data | yes, every row | course | Postgres + TypeORM migrations (ДЗ 8, 9); PgBouncer transaction mode, `pg_dump` + restore drill (ДЗ 11); two Redis (ДЗ 16) | object storage: **RustFS** instead of MinIO — MinIO no longer publishes images; the S3 API is the same. CDN: an edge cache process (`src/edge.ts`), no cloud CDN account |
+| 11.4 Security | yes, every row | course + own | ES256 tokens with rotated refresh (ДЗ 17); webhook HMAC, dedup, amount (ДЗ 15); Redis sliding-window limit (ДЗ 16) | secret store: **own** — git-ignored files + `NAME_FILE` locally, AES-encrypted `store/ci.enc` in CI, instead of Infisical — no external account needed by a reviewer; dev ≠ prod values and live rotation are shown the same way ([Secrets and their rotation](#secrets-and-their-rotation)) |
+| 11.5 Asynchrony | yes, every row | course | RabbitMQ with confirms and DLQ (ДЗ 14); outbox + inbox (ДЗ 15); SKIP LOCKED workers, retry on `40001`/`40P01` (ДЗ 10); WS + SSE (ДЗ 13) | — |
+| 11.6 Delivery | yes, every row | course | compose `up -d --wait` (ДЗ 2, 7–10); distroless image (ДЗ 19); Pulumi on kind (ДЗ 19); GitHub Actions deploy to kind by digest (ДЗ 22) | AWS (ДЗ 21): **LocalStack** as the fallback lane — no paid AWS account; the teardown check is the same script |
+| 11.7 Operations | yes, every row | course | `/healthz` + `/readyz` (ДЗ 19); pino JSON logs with `trace_id` (ДЗ 20); Prometheus, OpenTelemetry → Jaeger, Grafana dashboard as a file (ДЗ 20); Jest + supertest + Pact (ДЗ 12); GitHub Actions gates (ДЗ 22) | — |
 
 ### 11.1 Design and architecture
 
@@ -400,7 +400,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | Full contour: create → background → status → final read by a separate request | `src/orders/*`, `src/messaging/order-placed.consumer.ts`, `src/payments/*` | *compose:* `docker compose run --rm demo demo/contour.mjs` → `created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4`, exit 0; e2e `runs the whole contour` |
 | 50 concurrent, no oversell or lost update; a shortage rolls everything back | `src/orders/place-order.ts`; `src/concurrency/checkout.ts` | e2e `sells exactly the stock under a parallel burst` (30 requests on stock 5 → 5 × 201, 25 × 409, stock 0) and `rolls the whole checkout back when one line is short`; *npm:* `npm run demo:race` (50 parallel on stock 10, see [Race](#race-npm-run-demorace)) |
 | Contract machine-checked: cursor pagination, `Idempotency-Key` required, problem+json 4xx | `openapi/openapi.yaml`, `src/bootstrap.ts`, `src/common/problem.filter.ts`, `src/common/cursor.ts` | `npm run check`; the curl step 5 above (400 problem+json without the key); e2e `keeps 400, 401, 403 and 422 apart`; Pact: `npm run test:contract && npm run verify:provider` |
-| A repeated irreversible operation has one effect; the key comes from the business entity | `src/orders/place-order-once.ts` (key `route:user:key` + request hash), `src/payments/apply-payment.ts` (provider `event_id`), consumer inbox by event id | contour demo `idempotent replay` (same order, `Idempotency-Replay: true`); `demo/webhook.mjs` → `duplicates=1`; unit `checkout-request.test.ts` (same cart → same hash, other cart → 422) |
+| A repeated irreversible operation has one effect; the key comes from the business entity | `src/orders/place-order-once.ts` (key `route:user:key` + request hash), `src/payments/apply-payment.ts` (provider `event_id`), consumer inbox by event id | contour demo `idempotent replay` (same order, `Idempotency-Replay: true`); `demo/webhook.mjs` → `duplicates=1`; `npm run demo:outbox` → `outbox=1 deliveries=1 effect=1`; a second success for the same order under another event id → `ignored`, one payment (`payments.test.ts`); unit `checkout-request.test.ts` (same cart → same hash, other cart → 422) |
 
 ### 11.3 Data
 
@@ -499,9 +499,23 @@ in the environment wins.
 
 ## Secrets and their rotation
 
-Nothing secret is in git, in the image or in an environment value of a container. Locally
-the values come from an encrypted store per environment (`store/*.enc`, opened by
-`scripts/with-secrets.sh dev` with a key outside git), so dev and CI never share a value. In
+Nothing secret is in git, in the image or in an environment value of a container. The store
+has one slug per environment, read by `scripts/with-secrets.sh <slug>`: `dev` is git-ignored
+files (`.env`, `secrets/*`, `secrets/jwt/dev`), `prod` has its own signing key
+(`secrets/jwt/prod`), and `ci` is `store/ci.enc`, AES-encrypted in git and opened by a key that
+lives outside it. No two slugs share a value. Fingerprints only, never the values:
+
+```bash
+node scripts/jwt-keys.mjs fingerprint dev    # dev: kid=dev-2026-10-30-debb2e sha256:b9548fe8a7668fcfa294a5abb563bf0a
+node scripts/jwt-keys.mjs fingerprint prod   # prod: kid=prod-2026-10-30-3cf2bf sha256:4d4c68f2bc109021152e629a077b7da7
+for slug in dev ci; do STORE_KEY="$(cat secrets/ci_store_key)" bash scripts/with-secrets.sh $slug \
+  sh -c 'printf "%s DB_PASSWORD fp=" "$0"; printf %s "$DB_PASSWORD" | shasum -a 256 | cut -c1-16' $slug; done
+# dev DB_PASSWORD fp=15cbb6cbe6e2c6c3
+# ci DB_PASSWORD fp=520cf598dc51748f
+```
+
+`node scripts/jwt-keys.mjs rotate dev` changes the dev fingerprint, and the API logs the new
+one at start (`ES256 keys: <kid> (signing) sha256:…`, the previous kid as `verify only`). In
 compose, the infrastructure passwords are the committed dev values from
 `secrets/*.example`, mounted as compose secrets, and the application's own secrets — the
 JWT signing pair, the refresh pepper, the webhook key — are generated by the `keys` one-shot
@@ -600,7 +614,9 @@ npm run destroy && npm run cluster:down
 - **Products and files still use the in-memory `IdempotencyService`.** The orders contour
   uses the Postgres one; the others were not migrated.
 - **The contract gate flags the status enum** (`created` → `pending`, `confirmed` added) as
-  a breaking change against the base branch — expected for this PR.
+  a breaking change against the base branch. That is correct, and PR #24 carries the label
+  `breaking-approved`: the gate still prints `gate=fail` and then `bypass=breaking-approved`, and
+  does not block. Remove the label to see it block ([CI/CD](#cicd)).
 - **The payment provider is simulated** by the demos (`demo/lib/api-client.mjs` signs like a
   provider would); there is no real payment integration.
 
@@ -622,6 +638,17 @@ npm run test:unit && npm run test:integration && npm run test:e2e
 
 `npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode, so the
 fail-fast exit code can be tested. Watch mode is `npm run start:dev`.
+
+**The outbox and queue demos run their own relay and consumer** (`demo:outbox`,
+`demo:crash-relay`, `demo:duplicate`, `demo:publish`, `demo:dlq`) and count what *those*
+processes did. A compose relay or consumer on the same queue takes half the deliveries and the
+demo waits for an event that went elsewhere. Stop them for these demos and bring them back:
+
+```bash
+docker compose stop relay consumer
+npm run demo:outbox && npm run demo:crash-relay && npm run demo:duplicate
+docker compose start relay consumer
+```
 
 ## Commands
 
@@ -1277,7 +1304,7 @@ compose stack does not have to be up, because `@testcontainers/postgresql` start
 database from inside the run:
 
 ```bash
-npm run test:integration            # 25 tests: repositories, status history, payments; real Postgres
+npm run test:integration            # 26 tests: repositories, status history, payments; real Postgres
 npm run test:integration            # again: still green, nothing cleaned by hand
 npm run test:e2e                    # 4 tests: create → read, 404 and 400
 npm run test:contract               # writes pacts/marketplace-web-marketplace-api.json
@@ -1938,7 +1965,7 @@ thing it is supposed to be testing.
 
 | Command | What runs | Against what |
 | --- | --- | --- |
-| `npm run test:integration` | repositories, status history, payment webhooks — 25 tests | a real Postgres started by the test run |
+| `npm run test:integration` | repositories, status history, payment webhooks — 26 tests | a real Postgres started by the test run |
 | `npm run test:e2e` | the whole HTTP application, 4 tests | the real module graph, the real database |
 | `npm run test:contract` | the consumer side of the contract | Pact's mock provider → `pacts/*.json` |
 | `npm run verify:provider` | the real application answering the contract | the local pact file, or the broker |

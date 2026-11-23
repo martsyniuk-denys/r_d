@@ -6,17 +6,20 @@ import { FULFILMENT_CONSUMER } from '../messaging/order-placed.consumer';
 // What the three outbox demos count, all scoped to the demo's own buyer or event:
 // the dev database may hold other orders (demo:race leaves ten, each with a
 // pending outbox row the relay will publish alongside), and they are not ours.
+// Only order.placed is counted: since the coursework the consumer's pending →
+// confirmed writes an order.status_changed row of its own, which is a second event,
+// not a second copy of the first.
 
 export const ordersOf = (ds: DataSource, buyerId: string): Promise<number> =>
   countOf(ds, `SELECT count(*) FROM orders WHERE buyer_id = $1`, [buyerId]);
 
 export const outboxOf = (ds: DataSource, buyerId: string): Promise<number> =>
-  countOf(ds, `SELECT count(*) FROM outbox WHERE payload->'data'->>'buyerId' = $1`, [buyerId]);
+  countOf(ds, `SELECT count(*) FROM outbox WHERE type = 'order.placed' AND payload->'data'->>'buyerId' = $1`, [buyerId]);
 
 export const publishedOf = (ds: DataSource, buyerId: string): Promise<number> =>
   countOf(
     ds,
-    `SELECT count(*) FROM outbox WHERE payload->'data'->>'buyerId' = $1 AND published_at IS NOT NULL`,
+    `SELECT count(*) FROM outbox WHERE type = 'order.placed' AND payload->'data'->>'buyerId' = $1 AND published_at IS NOT NULL`,
     [buyerId],
   );
 

@@ -4,8 +4,9 @@ import { Pool, PoolClient } from 'pg';
 
 import { Currency } from '../entities/product.entity';
 import { ORDER_AGGREGATE, toOrderPlacedEvent } from '../messaging/events';
+import { injectedFault } from '../observability/context';
 import { appendToOutboxIn } from '../outbox/outbox';
-import { OrdersRepository } from '../repositories';
+import { OrdersRepository, SLOW_FAULT_SECONDS } from '../repositories';
 import { recordStatus } from './lifecycle';
 
 // The checkout of the API: several lines, paid later through the provider's
@@ -112,6 +113,13 @@ async function placeInTransaction(
     }
     return { kind: 'replayed', orderId: rows[0].order_id };
   }
+
+  // Demo faults (FAULT_INJECTION=1 only, the x-fault header of demo:metrics and
+  // demo:trace): a real slow round trip, or a real error raised by Postgres, inside
+  // the checkout transaction — which then rolls back like any other failure.
+  const fault = injectedFault();
+  if (fault === 'slow') await db.query('SELECT pg_sleep($1)', [SLOW_FAULT_SECONDS]);
+  if (fault === 'error') await db.query('SELECT 1 / 0 AS division_by_zero');
 
   // Lines in product-id order: two carts sharing products lock them in the same
   // order, so they queue instead of deadlocking.
