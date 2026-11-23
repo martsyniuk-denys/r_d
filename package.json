@@ -41,6 +41,7 @@
     "demo:cdn": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/demo-cdn.js",
     "demo:contour": "bash scripts/with-secrets.sh dev node demo/contour.mjs",
     "demo:webhook": "bash scripts/with-secrets.sh dev node demo/webhook.mjs",
+    "demo:contour-trace": "bash scripts/with-secrets.sh dev node demo/contour-trace.mjs",
     "edge": "bash scripts/with-secrets.sh dev node dist/edge.js",
     "jwt:keys": "node scripts/jwt-keys.mjs",
     "pod": "bash scripts/with-secrets.sh dev node dist/pod.js",

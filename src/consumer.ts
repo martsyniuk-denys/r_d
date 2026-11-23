@@ -1,3 +1,5 @@
+// Before anything else, as in main.ts: OpenTelemetry patches pg as it is required.
+import './observability/tracing';
 import 'reflect-metadata';
 
 import { DataSource } from 'typeorm';
@@ -5,6 +7,9 @@ import { DataSource } from 'typeorm';
 import { dataSourceOptions } from './data-source';
 import { brokerAddress, connectBroker } from './messaging/broker';
 import { ConsumerEvent, consumeOrderPlaced } from './messaging/order-placed.consumer';
+import { activeTraceId } from './observability/amqp-trace';
+import { startMetricsServer } from './observability/metrics-server';
+import { shutdownTracing } from './observability/tracing-shutdown';
 
 // The order.placed consumer as a process of its own:
 //
@@ -18,11 +23,15 @@ import { ConsumerEvent, consumeOrderPlaced } from './messaging/order-placed.cons
 const HOLD_ACK = process.argv.includes('--hold-ack-after-effect');
 const NAME = `fulfilment-${process.pid}`;
 
+// Lines written while a delivery is handled carry its trace id: the one the
+// request that placed the order started, so `grep <trace_id>` finds this process too.
 const emit = (event: ConsumerEvent | { kind: string; [key: string]: unknown }): void => {
-  process.stdout.write(`${JSON.stringify(event)}\n`);
+  const traceId = activeTraceId();
+  process.stdout.write(`${JSON.stringify(traceId === undefined ? event : { ...event, trace_id: traceId })}\n`);
 };
 
 async function main(): Promise<void> {
+  startMetricsServer(NAME);
   const dataSource = new DataSource({ ...dataSourceOptions, logging: ['error'] });
   await dataSource.initialize();
 
@@ -63,6 +72,7 @@ async function main(): Promise<void> {
     await channel.close();
     await connection.close();
     await dataSource.destroy();
+    await shutdownTracing();
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown());

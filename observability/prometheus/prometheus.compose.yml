@@ -1,0 +1,27 @@
+# The same stand inside ../../docker-compose.yml (profile obs): Prometheus sits on
+# the application's network and scrapes the three processes by service name. Job
+# names match the dashboard's queries; prometheus.yml is the host variant the
+# demos use (API on 22910).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: marketplace-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['api:3000']
+        labels:
+          service: marketplace-api
+  - job_name: marketplace-relay
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['relay:9464']
+        labels:
+          service: marketplace-relay
+  - job_name: marketplace-consumer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['consumer:9464']
+        labels:
+          service: marketplace-consumer

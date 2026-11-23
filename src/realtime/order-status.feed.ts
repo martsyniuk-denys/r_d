@@ -5,11 +5,14 @@ import { OrderStatus } from '../entities/order.entity';
 import { brokerAddress, connectBroker } from '../messaging/broker';
 import { EVENTS_EXCHANGE, ORDER_STATUS_CHANGED, OrderStatusChangedEvent } from '../messaging/events';
 import { declareTopology } from '../messaging/topology';
+import { inConsumeSpan } from '../observability/amqp-trace';
 import { layerLogger } from '../observability/logger';
 import { OrderEventsService } from './order-events.service';
 
 const log = layerLogger('realtime.feed');
 const RECONNECT_MS = 5000;
+// The span name for this instance's queue, whose own name the broker generates.
+const FEED = 'api.realtime';
 
 // The bridge from the broker to this instance's realtime bus. Each API instance
 // declares its own exclusive, auto-delete queue bound to order.status_changed, so
@@ -78,8 +81,22 @@ export class OrderStatusFeed implements OnModuleInit, OnApplicationShutdown {
     this.timer.unref();
   }
 
+  // In a CONSUMER span under the trace the event carries: the push to the owner's
+  // SSE/WebSocket is the last hop of the request (or webhook) that changed the order.
   private handle(message: ConsumeMessage | null): void {
     if (message === null) return;
+    void inConsumeSpan(
+      {
+        queue: FEED,
+        routingKey: message.fields.routingKey,
+        messageId: typeof message.properties.messageId === 'string' ? message.properties.messageId : null,
+        headers: message.properties.headers,
+      },
+      async () => this.deliver(message),
+    );
+  }
+
+  private deliver(message: ConsumeMessage): void {
     try {
       const event = JSON.parse(message.content.toString('utf8')) as OrderStatusChangedEvent;
       this.events.publish({

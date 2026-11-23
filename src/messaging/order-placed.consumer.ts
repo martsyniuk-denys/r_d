@@ -3,6 +3,8 @@ import { performance } from 'node:perf_hooks';
 import { Channel, ConsumeMessage } from 'amqplib';
 import { DataSource } from 'typeorm';
 
+import { inConsumeSpan } from '../observability/amqp-trace';
+import { messageDuration, messagesConsumed } from '../observability/metrics';
 import { transition } from '../orders/lifecycle';
 import { fromEntityManager } from '../repositories/queryable';
 import { OrderPlacedEvent, UnprocessableEvent, parseOrderPlaced } from './events';
@@ -142,7 +144,8 @@ export async function consumeOrderPlaced(
     eventId: string | null,
     action: Settlement,
     reason?: string,
-  ): void => {
+  ): Settlement => {
+    messagesConsumed.inc({ queue: FULFILMENT_QUEUE, outcome: action });
     if (action === 'ack') channel.ack(message);
     // requeue = false: the queue's x-dead-letter-exchange takes it, reason "rejected".
     else if (action === 'dead-letter') channel.nack(message, false, false);
@@ -151,9 +154,28 @@ export async function consumeOrderPlaced(
     // (On the 4.2.9 in compose both count — measured, see the README.)
     else channel.reject(message, true);
     observe({ kind: 'settled', eventId, action, reason });
+    return action;
   };
 
-  const handle = async (message: ConsumeMessage): Promise<void> => {
+  // One CONSUMER span per delivery, under the trace the relay put in the headers:
+  // the transaction below, the observe() lines and the order.status_changed row it
+  // writes all belong to the request that placed the order.
+  const handle = (message: ConsumeMessage): Promise<void> => {
+    const stopTimer = messageDuration.startTimer({ queue: FULFILMENT_QUEUE });
+    return inConsumeSpan(
+      {
+        queue: FULFILMENT_QUEUE,
+        routingKey: message.fields.routingKey,
+        messageId: eventIdOf(message),
+        headers: message.properties.headers,
+      },
+      async () => {
+        stopTimer({ outcome: await handleDelivery(message) });
+      },
+    );
+  };
+
+  const handleDelivery = async (message: ConsumeMessage): Promise<Settlement> => {
     const eventIdHint = eventIdOf(message);
     const deliveryCount = deliveryCountOf(message);
     observe({
@@ -168,8 +190,7 @@ export async function consumeOrderPlaced(
       event = parseOrderPlaced(message.content);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      settle(message, eventIdHint, 'dead-letter', reason);
-      return;
+      return settle(message, eventIdHint, 'dead-letter', reason);
     }
 
     try {
@@ -186,14 +207,13 @@ export async function consumeOrderPlaced(
 
       // After the effect, never before: an ack is "do not give this to anyone
       // again", and that is only true once the effect is in the database.
-      settle(message, event.eventId, 'ack');
+      return settle(message, event.eventId, 'ack');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       if (isPermanent(error) || deliveryCount >= DELIVERY_LIMIT) {
-        settle(message, event.eventId, 'dead-letter', reason);
-      } else {
-        settle(message, event.eventId, 'requeue', reason);
+        return settle(message, event.eventId, 'dead-letter', reason);
       }
+      return settle(message, event.eventId, 'requeue', reason);
     }
   };
 

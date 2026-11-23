@@ -199,6 +199,11 @@ services:
       JWT_KID_FILE: /keys/JWT_KID
       REFRESH_TOKEN_PEPPER_FILE: /keys/REFRESH_TOKEN_PEPPER
       PAYMENT_WEBHOOK_SECRET_FILE: /keys/PAYMENT_WEBHOOK_SECRET
+      # Spans go to the jaeger service of the obs profile. Without that profile the
+      # name does not resolve and the exporter drops them quietly; the trace ids in
+      # the logs are there either way. The service name comes from the entrypoint
+      # (marketplace-api / -relay / -consumer, see observability/tracing.ts).
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     volumes:
       - keys:/keys:ro
     secrets: &app-secrets
@@ -226,7 +231,10 @@ services:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # /metrics of a process without an API: published events, transitions.
+      METRICS_PORT: '9464'
     secrets: *app-secrets
 
   # order.placed → fulfilment + pending→confirmed, in one transaction per message.
@@ -238,12 +246,16 @@ services:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # /metrics: deliveries settled by outcome, processing time.
+      METRICS_PORT: '9464'
     secrets: *app-secrets
 
   # The contour demos, run against the API above by name — no node on the host needed:
   #   docker compose run --rm demo demo/contour.mjs
   #   docker compose run --rm demo demo/webhook.mjs
+  #   docker compose run --rm demo demo/contour-trace.mjs   (with --profile obs up)
   # The provider simulator signs with the webhook key from the keys volume (read-only).
   demo:
     image: node:22-alpine
@@ -256,9 +268,74 @@ services:
     environment:
       BASE_URL: http://api:3000
       PAYMENT_WEBHOOK_SECRET_FILE: /keys/PAYMENT_WEBHOOK_SECRET
+      # demo/contour-trace.mjs reads the traces back (profile obs).
+      TRACE_API_URL: http://jaeger:16686
     volumes:
       - ./demo:/work/demo:ro
       - keys:/keys:ro
+
+  # --- Observability (profile obs) ------------------------------------------------
+  #   docker compose --profile obs up -d --wait
+  # Prometheus scrapes api/relay/consumer by name, Jaeger takes their spans over
+  # OTLP, Grafana opens the provisioned dashboard (observability/grafana). The same
+  # ports as the standalone stand (observability/compose.yml), so the dashboard's
+  # links work for both — run one or the other, not both. Grafana's admin password
+  # is a file, like the other dev credentials here; no value in the environment.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [obs]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    ports:
+      - '127.0.0.1:22901:9090'
+    volumes:
+      - ./observability/prometheus/prometheus.compose.yml:/etc/prometheus/prometheus.yml:ro
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:9090/-/ready']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  jaeger:
+    image: jaegertracing/jaeger:2.10.0
+    profiles: [obs]
+    ports:
+      - '127.0.0.1:22904:16686'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:13133/status']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: [obs]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_NEWS_NEWS_FEED_ENABLED: 'false'
+    ports:
+      - '127.0.0.1:22903:3000'
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    secrets:
+      - grafana_admin_password
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:3000/api/health']
+      interval: 2s
+      timeout: 3s
+      retries: 60
 
   pact-broker-db:
     image: postgres:16-alpine
@@ -312,6 +389,8 @@ secrets:
     file: ./secrets/broker_password.example
   storage_secret_key:
     file: ./secrets/storage_secret_key.example
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.example
 
 volumes:
   keys:

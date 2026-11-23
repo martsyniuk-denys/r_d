@@ -36,3 +36,43 @@ export const httpDuration = new Histogram({
   buckets: DURATION_BUCKETS,
   registers: [registry],
 });
+
+// The background half of the contour, from the two processes that do it. Each
+// serves its own /metrics (metrics-server.ts); Prometheus tells them apart by job.
+//
+// Transitions are counted by the relay, when it publishes order.status_changed:
+// that event exists only for a transition that committed (it is written in the
+// same transaction), so a rolled-back one is never counted — which a counter
+// next to the UPDATE could not promise. A relay that dies between publish and
+// mark publishes the row again and counts it twice; that is the at-least-once
+// the consumers already absorb, and a counter may be off by the same one.
+// from/to are order statuses — a closed set of six.
+export const orderTransitions = new Counter({
+  name: 'order_status_transitions_total',
+  help: 'Committed order status transitions, counted when the relay publishes order.status_changed.',
+  labelNames: ['from', 'to'] as const,
+  registers: [registry],
+});
+
+export const outboxPublished = new Counter({
+  name: 'outbox_events_published_total',
+  help: 'Outbox rows the broker confirmed, by event type.',
+  labelNames: ['type'] as const,
+  registers: [registry],
+});
+
+// outcome: ack | dead-letter | requeue — the three ways a delivery is settled.
+export const messagesConsumed = new Counter({
+  name: 'messages_consumed_total',
+  help: 'Deliveries settled by a consumer, by queue and outcome.',
+  labelNames: ['queue', 'outcome'] as const,
+  registers: [registry],
+});
+
+export const messageDuration = new Histogram({
+  name: 'message_processing_duration_seconds',
+  help: 'Time from a delivery reaching the consumer to its settlement, in seconds.',
+  labelNames: ['queue', 'outcome'] as const,
+  buckets: DURATION_BUCKETS,
+  registers: [registry],
+});

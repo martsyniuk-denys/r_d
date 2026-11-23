@@ -34,4 +34,9 @@ export class OutboxMessage {
 
   @Column('integer', { default: 0 })
   attempts!: number;
+
+  // The W3C trace context ({ traceparent, tracestate? }) active when the row was
+  // written; the relay publishes it as AMQP headers (observability/amqp-trace.ts).
+  @Column('jsonb', { name: 'trace_context', nullable: true })
+  traceContext!: Record<string, string> | null;
 }

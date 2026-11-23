@@ -46,15 +46,15 @@ export async function productsInStock(count) {
   return items.slice(0, count).map((p) => p.id);
 }
 
-export function placeOrder(token, items, key = randomUUID()) {
-  return call('POST', '/orders', { token, body: { items }, headers: { 'idempotency-key': key } });
+export function placeOrder(token, items, key = randomUUID(), headers = {}) {
+  return call('POST', '/orders', { token, body: { items }, headers: { 'idempotency-key': key, ...headers } });
 }
 
 // What the provider sends: a signed body. The signature is over these exact bytes.
-export function webhook(secret, payload, { signWith = secret } = {}) {
+export function webhook(secret, payload, { signWith = secret, headers = {} } = {}) {
   const raw = JSON.stringify(payload);
   const signature = 'sha256=' + createHmac('sha256', signWith).update(raw).digest('hex');
-  return call('POST', '/payments/webhook', { raw, headers: { 'x-signature': signature } });
+  return call('POST', '/payments/webhook', { raw, headers: { 'x-signature': signature, ...headers } });
 }
 
 // The provider's copy of the signing key: the environment (npm scripts, through the
