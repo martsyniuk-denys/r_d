@@ -178,37 +178,46 @@ TOKEN=$(curl -s $B/auth/login -H 'content-type: application/json' \
   | node -pe 'JSON.parse(require("fs").readFileSync(0)).access_token')
 
 # 1. checkout — Idempotency-Key is required by the contract
-curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -H "idempotency-key: $(uuidgen)" -d '{"items":[{"product_id":"p_1","qty":1}]}'
-# {"id":"o_95","status":"pending","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,…}
+CREATED=$(curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -H "idempotency-key: $(uuidgen)" -d '{"items":[{"product_id":"p_1","qty":1}]}')
+echo "$CREATED"
+# {"id":"o_13","status":"pending","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,…}
+ORDER=$(echo "$CREATED" | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
+TOTAL=$(echo "$CREATED" | node -pe 'JSON.parse(require("fs").readFileSync(0)).total_cents')
 
 # 2. a separate read, a moment later — the consumer has been there
-curl -s $B/orders/o_95 -H "authorization: Bearer $TOKEN"
-# {"id":"o_95","status":"confirmed",…}
+sleep 1
+curl -s $B/orders/$ORDER -H "authorization: Bearer $TOKEN"; echo
+# {"id":"o_13","status":"confirmed",…}
 
 # 3. the provider's webhook: HMAC-SHA256 over the exact raw body with the key from the keys volume
 SECRET=$(docker compose run --rm -T --no-deps --entrypoint cat demo /keys/PAYMENT_WEBHOOK_SECRET)
-BODY='{"event_id":"evt_readme_95","order_id":"o_95","amount_cents":249900,"currency":"UAH","outcome":"succeeded"}'
+BODY="{\"event_id\":\"evt_$ORDER\",\"order_id\":\"$ORDER\",\"amount_cents\":$TOTAL,\"currency\":\"UAH\",\"outcome\":\"succeeded\"}"
 SIG=sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
-curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"
-# {"event_id":"evt_readme_95","order_id":"o_95","verdict":"applied","order_status":"paid"}
-curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"
-# {"event_id":"evt_readme_95","order_id":"o_95","verdict":"duplicate","order_status":"paid"}
+curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"; echo
+# {"event_id":"evt_o_13","order_id":"o_13","verdict":"applied","order_status":"paid"}
+curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"; echo
+# {"event_id":"evt_o_13","order_id":"o_13","verdict":"duplicate","order_status":"paid"}
 
 # 4. the final state, and how it got there
-curl -s $B/orders/o_95/history -H "authorization: Bearer $TOKEN"
-# {"items":[{"id":49,"status":"pending","previous_status":null,"changed_by":"checkout",…},
-#           {"id":50,"status":"confirmed","previous_status":"pending","changed_by":"fulfilment",…},
-#           {"id":51,"status":"paid","previous_status":"confirmed","changed_by":"payment-webhook",…}]}
+curl -s $B/orders/$ORDER/history -H "authorization: Bearer $TOKEN"; echo
+# {"items":[{"id":7,"status":"pending","previous_status":null,"changed_by":"checkout",…},
+#           {"id":8,"status":"confirmed","previous_status":"pending","changed_by":"fulfilment",…},
+#           {"id":9,"status":"paid","previous_status":"confirmed","changed_by":"payment-webhook",…}]}
 
 # 5. the edge: no Idempotency-Key → 400 problem+json, before a controller runs
 curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"items":[{"product_id":"p_1","qty":1}]}'
+  -d '{"items":[{"product_id":"p_1","qty":1}]}'; echo
 # {"type":"https://marketplace.example/problems/validation-error","title":"Bad Request","status":400,
 #  "detail":"request/headers must have required property 'idempotency-key'","instance":"/orders"}
 
-# 6. live status events for the owner (another terminal, then repeat 1–3)
-curl -sN $B/orders/o_95/events -H "authorization: Bearer $TOKEN"
+# 6. the owner's SSE stream; Last-Event-ID: 0 replays every change from the history, then it
+#    stays open for live ones (-m 3 closes it after 3 s; drop -m to keep listening)
+curl -sN -m 3 $B/orders/$ORDER/events -H "authorization: Bearer $TOKEN" -H 'last-event-id: 0'
+# id: 7
+# event: order.status
+# data: {"id":7,"order_id":"o_13","status":"pending","previous_status":null,…}
+# …
 ```
 
 | Method and path | Who | What |
