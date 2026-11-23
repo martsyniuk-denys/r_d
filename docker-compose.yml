@@ -154,8 +154,10 @@ services:
       dockerfile: docker/Dockerfile
       target: runtime
     image: marketplace-api:compose
-    # The image is built here, never pulled: there is no such image in a registry.
-    pull_policy: build
+    # Built here when it is missing, never pulled: there is no such image in a
+    # registry. An existing image is reused as is, so a change in the code needs
+    # `docker compose up -d --wait --build` (README → Restart and teardown).
+    pull_policy: never
     command: ['dist/compose-keys.js']
     volumes:
       - keys:/keys

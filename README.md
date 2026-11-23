@@ -118,6 +118,9 @@ may have no network: `docker compose --profile obs up -d --wait --force-recreate
 **Restart and teardown.** `docker compose down && docker compose up -d --wait` keeps the
 data (named volumes) and the generated keys, so a token issued before the restart still
 works after it. `docker compose --profile obs --profile demo down -v` removes everything.
+The image `marketplace-api:compose` is built only when it is missing (it is never pulled:
+it exists in no registry), so after a `git pull` or a change in the code, rebuild it with
+`docker compose up -d --wait --build`.
 
 ## The main contour
 
