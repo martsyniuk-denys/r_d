@@ -1,0 +1,267 @@
+# Acceptance: README.md from a fresh clone
+
+- date: 2026-11-23T19:30:01Z
+- commit: 92eb856d401ba14c535a5067a5f0a62b858930f7 (feature/homework_31)
+- clone: tracked files only — no .env, no node_modules, no dist, nothing in secrets/ besides *.example (0 of those present)
+- host: Darwin arm64, Docker 29.1.3, Compose 2.40.3-desktop.1
+- before: image marketplace-api:compose present: 0, volumes of this project: 0
+- the dev stack of the working copy was stopped first (fixed container names and host ports, see README → Before you run it)
+- cloned from the local repository at the commit above (the branch was not on GitHub yet), so `git clone https://github.com/…` is the one README line not exercised
+
+## Cold build of the image, no layer cache (not a README step: proves the Dockerfile builds from the clone alone)
+```
+$ docker compose build --no-cache keys
+ marketplace-api:compose  Built
+```
+exit=0, expected 0, 40 s
+
+## Quick start: one command
+```
+$ docker compose up -d --wait
+```
+exit=0, expected 0, 14 s
+
+## state after up
+```
+$ docker compose ps -a --format '{{.Service}}: {{.Status}}'
+pact-broker: Up 10 seconds (healthy)
+pact-broker-db: Up 12 seconds (healthy)
+pgbouncer: Up 9 seconds (healthy)
+postgres: Up 12 seconds (healthy)
+rabbitmq: Up 12 seconds (healthy)
+redis-cache: Up 12 seconds (healthy)
+redis-queue: Up 12 seconds (healthy)
+storage: Up 12 seconds (healthy)
+api: Up 5 seconds (healthy)
+consumer: Up 5 seconds
+keys: Exited (0) 12 seconds ago
+migrate: Exited (0) 6 seconds ago
+relay: Up 5 seconds
+```
+exit=0, expected 0, 0 s
+
+## Quick start: the contour
+```
+$ docker compose run --rm demo demo/contour.mjs
+contour against http://api:3000
+  ok    create: HTTP 201, o_11 pending, total 1029700
+  ok    idempotent replay: same key → o_11, Idempotency-Replay: true
+  ok    access and validation: other buyer 403, no token 401, qty 0 → 400 application/problem+json; charset=utf-8
+  ok    background: consumer confirmed it: status confirmed
+  ok    payment webhook: HTTP 200, verdict applied
+  ok    operator ships: admin → 200 shipped; buyer → 403
+  ok    final read: GET /orders/o_11 → shipped
+  ok    history: pending(checkout) → confirmed(fulfilment) → paid(payment-webhook) → shipped(admin:9)
+order=o_11
+created=1
+replayed=1
+confirmed=1
+paid=1
+final=shipped
+history=4
+```
+exit=0, expected 0, 4 s
+
+## Quick start: the webhook
+```
+$ docker compose run --rm demo demo/webhook.mjs
+webhook against http://api:3000
+  ok    forged signature: HTTP 401, order still pending
+  ok    amount mismatch: HTTP 422 https://marketplace.example/problems/amount-mismatch, order still pending
+  ok    accepted: HTTP 200, applied → paid
+  ok    duplicate: HTTP 200, verdict duplicate, 'paid' in history 1×
+accepted=1
+rejected-signature=1
+amount-mismatch=1
+duplicates=1
+```
+exit=0, expected 0, 3 s
+
+## The contour by hand — README.md 'By hand, with curl', run verbatim (46 lines)
+```
+{"id":"o_13","status":"pending","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,"created_at":"2026-11-23T19:31:03.029Z"}
+{"id":"o_13","status":"confirmed","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,"created_at":"2026-11-23T19:31:03.029Z"}
+{"event_id":"evt_o_13","order_id":"o_13","verdict":"applied","order_status":"paid"}
+{"event_id":"evt_o_13","order_id":"o_13","verdict":"duplicate","order_status":"paid"}
+{"items":[{"id":8,"status":"pending","previous_status":null,"changed_by":"checkout","changed_at":"2026-11-23T19:31:03.029Z"},{"id":9,"status":"confirmed","previous_status":"pending","changed_by":"fulfilment","changed_at":"2026-11-23T19:31:03.039Z"},{"id":10,"status":"paid","previous_status":"confirmed","changed_by":"payment-webhook","changed_at":"2026-11-23T19:31:04.826Z"}]}
+{"type":"https://marketplace.example/problems/validation-error","title":"Bad Request","status":400,"detail":"request/headers must have required property 'idempotency-key'","instance":"/orders"}
+retry: 1000
+id: 8
+event: order.status
+data: {"id":8,"order_id":"o_13","status":"pending","previous_status":null,"changed_at":"2026-11-23T19:31:03.029Z"}
+id: 9
+event: order.status
+data: {"id":9,"order_id":"o_13","status":"confirmed","previous_status":"pending","changed_at":"2026-11-23T19:31:03.039Z"}
+id: 10
+event: order.status
+data: {"id":10,"order_id":"o_13","status":"paid","previous_status":"confirmed","changed_at":"2026-11-23T19:31:04.826Z"}
+```
+check: 1. checkout answered pending — ok
+check: 2. the separate read saw confirmed — ok
+check: 3. webhook applied, then duplicate — ok
+check: 3. webhook applied, then duplicate — ok
+check: 4. history has 3 steps ending in paid — ok
+check: 5. no key → 400 problem+json — ok
+check: 6. SSE replayed 3 events — ok
+
+## Observability: the obs profile
+```
+$ docker compose --profile obs up -d --wait
+```
+exit=0, expected 0, 9 s
+
+## Observability: one trace across three processes
+```
+$ docker compose run --rm demo demo/contour-trace.mjs | tee .trace
+contour trace against http://api:3000, traces from http://jaeger:16686
+  ok    create: POST /orders → 201 o_14
+  ok    consumer confirmed it: status confirmed
+  ok    webhook: POST /payments/webhook → 200 paid
+checkout: trace 82acde6a37736eea643f6b37207324fc, 33 spans from marketplace-api, marketplace-consumer, marketplace-relay
+    ok   marketplace-api       POST /orders                         ← caller (traceparent header)
+    ok   marketplace-relay     order.placed publish                 ← marketplace-api orders.place
+    ok   marketplace-consumer  fulfilment.order-placed process      ← marketplace-relay order.placed publish
+    ok   marketplace-relay     order.status_changed publish         ← marketplace-consumer fulfilment.order-placed process
+    ok   marketplace-api       api.realtime process                 ← marketplace-relay order.status_changed publish
+  ok    checkout: every hop in one trace: 5 hops found
+  ok    checkout: no orphan spans: 0 spans whose parent is not in the trace
+payment: trace c4339b3c8cd64e86a5ddea44c43b5dbd, 13 spans from marketplace-api, marketplace-relay
+    ok   marketplace-api       POST /payments/webhook               ← caller (traceparent header)
+    ok   marketplace-relay     order.status_changed publish         ← marketplace-api request handler - /payments/webhook
+    ok   marketplace-api       api.realtime process                 ← marketplace-relay order.status_changed publish
+  ok    payment: every hop in one trace: 3 hops found
+  ok    payment: no orphan spans: 0 spans whose parent is not in the trace
+order=o_14
+checkout_trace=82acde6a37736eea643f6b37207324fc
+checkout_services=3
+payment_trace=c4339b3c8cd64e86a5ddea44c43b5dbd
+payment_services=2
+ui=http://127.0.0.1:22904/trace/82acde6a37736eea643f6b37207324fc
+```
+exit=0, expected 0, 4 s
+
+## 11.7 that trace_id in the logs of all three processes (lines per process)
+```
+$ docker compose logs --no-log-prefix api relay consumer | grep "$TRACE" | node -e 'const seen={};require("readline").createInterface({input:process.stdin}).on("line",l=>{const j=JSON.parse(l);const k=j.service??(j.kind==="published"?"marketplace-relay":"marketplace-consumer");seen[k]=(seen[k]??0)+1}).on("close",()=>{console.log(seen);process.exit(Object.keys(seen).length===3?0:1)})'
+{
+  'marketplace-consumer': 3,
+  'marketplace-api': 5,
+  'marketplace-relay': 2
+}
+```
+exit=0, expected 0, 1 s
+
+## 11.7 Prometheus scrapes api, relay, consumer
+```
+$ curl -s 'http://127.0.0.1:22901/api/v1/targets?state=active' | node -pe 'JSON.parse(require("fs").readFileSync(0)).data.activeTargets.map(t=>t.labels.job+"="+t.health).join(" ")'
+marketplace-api=up marketplace-consumer=up marketplace-relay=up
+```
+exit=0, expected 0, 0 s
+
+## 11.7 transitions: the relay's counter, and Prometheus agreeing with it (waits up to 20 s for a scrape)
+```
+$ bash .transitions.sh
+pending→confirmed=4 confirmed→paid=4 paid→shipped=1
+relay /metrics: 9, Prometheus: 9
+```
+exit=0, expected 0, 3 s
+
+## Grafana: the dashboard is provisioned from the file
+```
+$ curl -s -u admin:$(cat secrets/grafana_admin_password.example) http://127.0.0.1:22903/api/dashboards/uid/marketplace-red | node -pe 'const d=JSON.parse(require("fs").readFileSync(0)).dashboard; const all=d.panels.flatMap(p=>[p,...(p.panels??[])]); d.title+": "+all.filter(p=>p.type!=="row").length+" panels, rows: "+all.filter(p=>p.type==="row").map(p=>p.title).join(", ")'
+Marketplace — RED and the main contour: 9 panels, rows: Main contour — checkout → consumer → payment webhook
+```
+exit=0, expected 0, 0 s
+
+## 11.7 probes
+```
+$ curl -s -w ' HTTP %{http_code}\n' localhost:3000/healthz; curl -s -w ' HTTP %{http_code}\n' localhost:3000/readyz
+{"status":"alive","uptime_seconds":34.795} HTTP 200
+{"status":"ready","checks":{"database":"up","broker":"up"}} HTTP 200
+```
+exit=0, expected 0, 0 s
+
+## 11.1 fail-fast: the broken variable is named, the value is not, exit 1
+```
+$ docker compose run --rm --no-deps -e PAYMENT_WEBHOOK_SECRET_FILE= -e PAYMENT_WEBHOOK_SECRET=short api
+Startup aborted.
+Invalid environment configuration — 1 problem(s):
+  - PAYMENT_WEBHOOK_SECRET: must be at least 32 characters (set, value withheld)
+Every variable is documented in .env.example. Secrets (JWT_*, REFRESH_TOKEN_PEPPER) come from the
+store: npm run start:vault, or export them yourself with SKIP_VAULT=1. Fix the values above and start again.
+```
+exit=1, nonzero, 1 s
+
+## 11.4 the API container's environment: paths and password-less URLs, no secret value
+```
+$ docker inspect $(docker compose ps -a -q api) --format '{{range .Config.Env}}{{println .}}{{end}}' | sort
+BROKER_PASSWORD_FILE=/run/secrets/broker_password
+BROKER_URL=amqp://marketplace@rabbitmq:5672
+DB_PASSWORD_FILE=/run/secrets/db_password
+DB_URL=postgres://marketplace@pgbouncer:6432/marketplace
+JWT_KID_FILE=/keys/JWT_KID
+JWT_PRIVATE_KEY_FILE=/keys/JWT_PRIVATE_KEY
+JWT_PUBLIC_KEY_FILE=/keys/JWT_PUBLIC_KEY
+NODE_ENV=production
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PAYMENT_WEBHOOK_SECRET_FILE=/keys/PAYMENT_WEBHOOK_SECRET
+PORT=3000
+REFRESH_TOKEN_PEPPER_FILE=/keys/REFRESH_TOKEN_PEPPER
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+STORAGE_ACCESS_KEY=marketplace
+STORAGE_BUCKET=marketplace-files
+STORAGE_ENDPOINT=http://storage:9000
+STORAGE_SECRET_KEY_FILE=/run/secrets/storage_secret_key
+```
+exit=0, expected 0, 0 s
+
+## 11.7 SIGTERM: readiness red at once, liveness green through the drain, exit 0
+```
+$ docker compose kill -s SIGTERM api >/dev/null 2>&1
+for i in 1 2 3; do echo "readyz $(curl -s -o /dev/null -w '%{http_code}' localhost:3000/readyz)  healthz $(curl -s -o /dev/null -w '%{http_code}' localhost:3000/healthz)"; sleep 1; done
+sleep 6; docker inspect $(docker compose ps -a -q api) --format 'api: {{.State.Status}}, exit code {{.State.ExitCode}}'
+readyz 503  healthz 200
+readyz 503  healthz 200
+readyz 503  healthz 200
+api: exited, exit code 0
+```
+exit=0, expected 0, 10 s
+
+## api back
+```
+$ docker compose up -d --wait api
+```
+exit=0, expected 0, 7 s
+
+## 11.6 restart (README → Restart and teardown)
+```
+$ docker compose down && docker compose up -d --wait
+```
+exit=0, expected 0, 20 s
+
+## 11.6 after the restart: the token issued before it still works, the order is still paid
+```
+$ curl -s localhost:3000/orders/$ORDER -H "authorization: Bearer $TOKEN"; echo
+{"id":"o_13","status":"paid","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,"created_at":"2026-11-23T19:31:03.029Z"}
+```
+exit=0, expected 0, 0 s
+check: the order read after the restart is paid — ok
+
+## Teardown
+```
+$ docker compose --profile obs --profile demo down -v
+```
+exit=0, expected 0, 14 s
+
+## nothing left of this project: containers, volumes
+```
+$ docker compose ps -a -q | wc -l | tr -d ' '; docker volume ls -q --filter label=com.docker.compose.project=r_d-acceptance | wc -l | tr -d ' '
+0
+0
+```
+exit=0, expected 0, 0 s
+
+## Verdict
+
+failed steps and checks: 0
