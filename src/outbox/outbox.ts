@@ -1,6 +1,7 @@
 import { EntityManager } from 'typeorm';
 
 import { DomainEvent } from '../messaging/events';
+import { Queryable, fromEntityManager } from '../repositories/queryable';
 
 export interface Aggregate {
   type: string;
@@ -21,7 +22,13 @@ export async function appendToOutbox(
     throw new Error('appendToOutbox() must be called inside the business transaction');
   }
 
-  await manager.query(
+  await appendToOutboxIn(fromEntityManager(manager), aggregate, event);
+}
+
+// The same row through any connection that is already inside the business
+// transaction — a pg PoolClient between BEGIN and COMMIT, or fromEntityManager().
+export async function appendToOutboxIn(db: Queryable, aggregate: Aggregate, event: DomainEvent): Promise<void> {
+  await db.query(
     `INSERT INTO outbox (id, aggregate_type, aggregate_id, type, payload, created_at)
      VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
     [event.eventId, aggregate.type, aggregate.id, event.type, JSON.stringify(event), event.occurredAt],

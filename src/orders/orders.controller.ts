@@ -1,9 +1,8 @@
 import { Body, Controller, Get, Headers, Param, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 
-import { AccessTokenGuard, CurrentPrincipal } from '../auth/guards';
+import { AccessTokenGuard, CurrentPrincipal, Roles, RolesGuard } from '../auth/guards';
 import { Principal } from '../auth/principal';
-import { IdempotencyService } from '../common/idempotency.service';
 import { Page } from '../common/cursor';
 import { ProblemError, forbidden, notFound, unauthorized } from '../common/problem';
 import { layerLogger } from '../observability/logger';
@@ -14,9 +13,7 @@ import {
   OrderStatus,
   OrderStatusEvent,
 } from '../realtime/order-events.service';
-import { CreateOrderLine, Order, OrdersService } from './orders.service';
-
-const ROUTE = 'POST /orders';
+import { CreateOrderLine, Order, OrderHistoryEntry, OrdersService } from './orders.service';
 
 const log = layerLogger('orders.controller');
 const SSE_RETRY_MS = 1000;
@@ -38,7 +35,6 @@ interface UpdateStatusBody {
 export class OrdersController {
   constructor(
     private readonly orders: OrdersService,
-    private readonly idempotency: IdempotencyService,
     private readonly events: OrderEventsService,
   ) {}
 
@@ -47,12 +43,14 @@ export class OrdersController {
     @CurrentPrincipal() principal: Principal,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
-  ): Page<Order> {
+  ): Promise<Page<Order>> {
     return this.orders.listFor(principal, Number(limit ?? 20), cursor);
   }
 
   // The buyer is the subject of the verified token — there is no header or body
-  // field through which a caller could name somebody else.
+  // field through which a caller could name somebody else. The Idempotency-Key is
+  // scoped to that buyer and stored with the order in one transaction, so a retry
+  // after a timeout, a restart or on another replica replays the same order.
   @Post()
   async create(
     @Headers('idempotency-key') key: string,
@@ -61,46 +59,53 @@ export class OrdersController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<Order> {
     log.info({ lines: body.items.length }, 'checkout requested');
-    const result = await this.idempotency.run(`${ROUTE}:${principal.userId}`, key, body, () =>
-      this.orders.create(body.items, principal.userId),
-    );
-    if (result.replayed) res.setHeader('Idempotency-Replay', 'true');
-    log.info({ orderId: result.body.id, replayed: result.replayed }, 'checkout answered');
-    return result.body;
+    const { order, replayed } = await this.orders.create(key, body.items, principal.userId);
+    if (replayed) res.setHeader('Idempotency-Replay', 'true');
+    log.info({ orderId: order.id, replayed }, 'checkout answered');
+    return order;
   }
 
   @Get(':orderId')
-  get(@Param('orderId') orderId: string, @CurrentPrincipal() principal: Principal): Order {
-    const allowed = access(orderId, this.orders.get(orderId), principal);
-    if (!allowed.ok) throw asProblem(allowed.denial);
-    return allowed.order;
+  async get(@Param('orderId') orderId: string, @CurrentPrincipal() principal: Principal): Promise<Order> {
+    return this.owned(orderId, principal);
   }
 
+  // The order's life as the database recorded it: every transition, who made it
+  // and when — the separate read that shows what the background part did.
+  @Get(':orderId/history')
+  async history(
+    @Param('orderId') orderId: string,
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<{ items: OrderHistoryEntry[] }> {
+    return { items: await this.orders.history(await this.owned(orderId, principal)) };
+  }
+
+  // Role by the guard, existence by the read. Buyers move their orders only through
+  // checkout and payment; a status written by hand is an operator's action.
   @Patch(':orderId/status')
-  updateStatus(
+  @UseGuards(RolesGuard)
+  @Roles('admin')
+  async updateStatus(
     @Param('orderId') orderId: string,
     @CurrentPrincipal() principal: Principal,
     @Body() body: UpdateStatusBody,
-  ): Order {
-    const allowed = access(orderId, this.orders.get(orderId), principal);
-    if (!allowed.ok) throw asProblem(allowed.denial);
-
-    return this.orders.setStatus(allowed.order, body.status);
+  ): Promise<Order> {
+    const order = await this.owned(orderId, principal);
+    return this.orders.setStatus(order, body.status, principal);
   }
 
   // Raw @Res(): the response is a stream this method writes to over minutes, not
   // a value Nest serialises once. The same events the gateway pushes into the
   // room are written here as SSE frames, off the same bus.
   @Get(':orderId/events')
-  streamEvents(
+  async streamEvents(
     @Param('orderId') orderId: string,
     @Headers('last-event-id') lastEventId: string | undefined,
     @CurrentPrincipal() principal: Principal,
     @Req() req: Request,
     @Res() res: Response,
-  ): void {
-    const allowed = access(orderId, this.orders.get(orderId), principal);
-    if (!allowed.ok) throw asProblem(allowed.denial);
+  ): Promise<void> {
+    await this.owned(orderId, principal);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -113,10 +118,18 @@ export class OrdersController {
 
     const subscription = this.events
       .since(orderId, parseLastEventId(lastEventId))
-      .subscribe((event: OrderStatusEvent) => {
-        res.write(`id: ${event.id}\n`);
-        res.write(`event: ${ORDER_STATUS_EVENT}\n`);
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      .subscribe({
+        next: (event: OrderStatusEvent) => {
+          res.write(`id: ${event.id}\n`);
+          res.write(`event: ${ORDER_STATUS_EVENT}\n`);
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        },
+        // The replay could not be read: end the stream; the client reconnects with
+        // its Last-Event-ID after `retry`.
+        error: (err: unknown) => {
+          log.warn({ err, orderId }, 'order event stream failed');
+          res.end();
+        },
       });
 
     const keepalive = setInterval(() => res.write(': keepalive\n\n'), SSE_KEEPALIVE_MS);
@@ -126,6 +139,12 @@ export class OrdersController {
       subscription.unsubscribe();
       res.end();
     });
+  }
+
+  private async owned(orderId: string, principal: Principal): Promise<Order> {
+    const allowed = access(orderId, await this.orders.find(orderId), principal);
+    if (!allowed.ok) throw asProblem(allowed.denial);
+    return allowed.order;
   }
 }
 

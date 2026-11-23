@@ -54,6 +54,7 @@ export const STORE_VARIABLES = [
   'JWT_PREVIOUS_PUBLIC_KEY',
   'JWT_PREVIOUS_KID',
   'STORAGE_SECRET_KEY',
+  'PAYMENT_WEBHOOK_SECRET',
 ] as const;
 
 export const envSchema = z.object({
@@ -132,6 +133,20 @@ export const envSchema = z.object({
 
   // Read and write on every file of the bucket: from the store, no default.
   STORAGE_SECRET_KEY: z.string().min(8, { message: 'must be at least 8 characters' }),
+
+  // The HMAC key the payment provider signs its webhooks with: from the store, no
+  // default. 32 characters is the floor for an HMAC-SHA256 key worth the name.
+  PAYMENT_WEBHOOK_SECRET: z.string().min(32, { message: 'must be at least 32 characters' }),
+
+  // The broker the API listens on for order.status_changed (realtime fan-out). Unset
+  // means no live events — the API still serves, and SSE still replays from the
+  // history table. The password: inside the URL, or BROKER_PASSWORD_FILE.
+  BROKER_URL: z
+    .string()
+    .regex(/^amqps?:\/\//, { message: 'must be an amqp:// or amqps:// URL' })
+    .optional(),
+
+  BROKER_PASSWORD_FILE: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

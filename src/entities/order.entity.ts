@@ -13,7 +13,7 @@ import { Currency } from './product.entity';
 import { OrderItem } from './order-item.entity';
 import { User } from './user.entity';
 
-export const ORDER_STATUSES = ['pending', 'paid', 'shipped', 'cancelled', 'refunded'] as const;
+export const ORDER_STATUSES = ['pending', 'confirmed', 'paid', 'shipped', 'cancelled', 'refunded'] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 @Entity('orders')
@@ -23,7 +23,7 @@ export type OrderStatus = (typeof ORDER_STATUSES)[number];
 @Check('orders_currency_known', "currency IN ('UAH', 'USD', 'EUR')")
 @Check(
   'orders_status_known',
-  "status IN ('pending', 'paid', 'shipped', 'cancelled', 'refunded')",
+  "status IN ('pending', 'confirmed', 'paid', 'shipped', 'cancelled', 'refunded')",
 )
 export class Order {
   @PrimaryGeneratedColumn('identity', { type: 'bigint', generatedIdentity: 'ALWAYS' })

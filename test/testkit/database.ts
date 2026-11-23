@@ -64,4 +64,9 @@ export function appEnvFromContainer(): void {
   process.env.STORAGE_BUCKET = 'test-files';
   process.env.STORAGE_ACCESS_KEY = 'test';
   process.env.STORAGE_SECRET_KEY = randomBytes(24).toString('base64url');
+
+  // The suites sign their own webhooks with this key; no broker: the realtime
+  // feed stays off, and nothing in the suites listens for live events.
+  process.env.PAYMENT_WEBHOOK_SECRET = randomBytes(32).toString('hex');
+  process.env.BROKER_URL = '';
 }

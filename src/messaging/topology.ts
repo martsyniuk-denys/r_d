@@ -1,6 +1,6 @@
 import { Channel } from 'amqplib';
 
-import { EVENTS_EXCHANGE, ORDER_PLACED } from './events';
+import { EVENTS_EXCHANGE, ORDER_PLACED, ORDER_STATUS_CHANGED } from './events';
 
 // Declared by the consuming side (the consumer on start, the demos as a bootstrap
 // step before they purge), never by the producer: a publisher that asserted the
@@ -16,6 +16,12 @@ export const FULFILMENT_DLQ = 'fulfilment.order-placed.dlq';
 // dead-letters it with reason delivery_limit — the bound on a message that fails
 // for a reason nobody classified as permanent.
 export const DELIVERY_LIMIT = 5;
+
+// Every order.status_changed also lands here: a bounded audit trail, and the queue
+// that keeps the routing key routable while no API instance is listening — the
+// relay publishes with mandatory: true, and an unroutable event is a failed publish.
+export const ORDER_STATUS_AUDIT_QUEUE = 'audit.order-status';
+const AUDIT_MAX_LENGTH = 10_000;
 
 export async function declareTopology(channel: Channel): Promise<void> {
   await channel.assertExchange(EVENTS_EXCHANGE, 'topic', { durable: true });
@@ -44,4 +50,10 @@ export async function declareTopology(channel: Channel): Promise<void> {
   // Without this binding a publish to order.placed is confirmed by the broker and
   // then dropped: nothing matched, so there was nothing to deliver to.
   await channel.bindQueue(FULFILMENT_QUEUE, EVENTS_EXCHANGE, ORDER_PLACED);
+
+  await channel.assertQueue(ORDER_STATUS_AUDIT_QUEUE, {
+    durable: true,
+    arguments: { 'x-queue-type': 'quorum', 'x-max-length': AUDIT_MAX_LENGTH, 'x-overflow': 'drop-head' },
+  });
+  await channel.bindQueue(ORDER_STATUS_AUDIT_QUEUE, EVENTS_EXCHANGE, ORDER_STATUS_CHANGED);
 }

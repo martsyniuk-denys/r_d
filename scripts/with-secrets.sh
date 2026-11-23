@@ -65,10 +65,11 @@ if [ ! -f "$CREDS" ]; then
   echo "               (redis: uncomment REDIS_URL/REDIS_QUEUE_URL in .env, cp secrets/redis_password.example secrets/redis_password)" >&2
   echo "               (tokens: node scripts/jwt-keys.mjs generate $ENV_SLUG)" >&2
   echo "               (files: STORAGE_* in .env, cp secrets/storage_secret_key.example secrets/storage_secret_key)" >&2
+  echo "               (payments: openssl rand -hex 32 > secrets/payment_webhook_secret)" >&2
   echo "               (cluster: openssl rand -hex 24 > secrets/pulumi_passphrase)" >&2
   echo "               (aws: AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_KEY_FILE in .env, cp secrets/aws_secret_access_key.example secrets/aws_secret_access_key)" >&2
   echo "               (observability: OTEL_EXPORTER_OTLP_ENDPOINT, PROMETHEUS_URL, TRACE_API_URL, GRAFANA_* in .env, openssl rand -hex 16 > secrets/grafana_admin_password)" >&2
-  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* OTEL_EXPORTER_OTLP_ENDPOINT PROMETHEUS_URL TRACE_API_URL GRAFANA_* SKIP_VAULT=1" >&2
+  echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* PAYMENT_WEBHOOK_SECRET OTEL_EXPORTER_OTLP_ENDPOINT PROMETHEUS_URL TRACE_API_URL GRAFANA_* SKIP_VAULT=1" >&2
   exit 1
 fi
 
@@ -98,6 +99,18 @@ if [ -n "${STORAGE_SECRET_KEY_FILE:-}" ]; then
   fi
   STORAGE_SECRET_KEY="$(tr -d '\r\n' < "$STORAGE_SECRET_KEY_FILE")"
   export STORAGE_SECRET_KEY
+fi
+
+# The payment provider's webhook signing key: a file named by
+# PAYMENT_WEBHOOK_SECRET_FILE, exported as PAYMENT_WEBHOOK_SECRET.
+if [ -n "${PAYMENT_WEBHOOK_SECRET_FILE:-}" ]; then
+  if [ ! -f "$PAYMENT_WEBHOOK_SECRET_FILE" ]; then
+    echo "with-secrets: $CREDS points at $PAYMENT_WEBHOOK_SECRET_FILE, which is missing." >&2
+    echo "  openssl rand -hex 32 > secrets/payment_webhook_secret" >&2
+    exit 1
+  fi
+  PAYMENT_WEBHOOK_SECRET="$(tr -d '\r\n' < "$PAYMENT_WEBHOOK_SECRET_FILE")"
+  export PAYMENT_WEBHOOK_SECRET
 fi
 
 # The AWS secret key of the stand (the fallback lane: LocalStack's `test`) lives in a

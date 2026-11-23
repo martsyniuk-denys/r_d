@@ -3,6 +3,8 @@ import { performance } from 'node:perf_hooks';
 import { Channel, ConsumeMessage } from 'amqplib';
 import { DataSource } from 'typeorm';
 
+import { transition } from '../orders/lifecycle';
+import { fromEntityManager } from '../repositories/queryable';
 import { OrderPlacedEvent, UnprocessableEvent, parseOrderPlaced } from './events';
 import { DELIVERY_LIMIT, FULFILMENT_QUEUE, declareTopology } from './topology';
 
@@ -89,7 +91,18 @@ export async function applyFulfilment(
         handledBy,
       ],
     );
-    return rows.length === 1;
+    if (rows.length === 0) return false;
+
+    // The effect the buyer can see: the order is confirmed, in the same COMMIT as
+    // the inbox mark and the fulfilment row. Refused (already paid or cancelled) is
+    // not an error — the fulfilment stands, the status is not this consumer's to undo.
+    await transition(fromEntityManager(manager), {
+      orderId: event.data.orderId,
+      to: 'confirmed',
+      from: ['pending'],
+      changedBy: 'fulfilment',
+    });
+    return true;
   });
 }
 

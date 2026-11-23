@@ -61,7 +61,7 @@ export class OrdersGateway implements OnModuleInit, OnModuleDestroy {
       return { ok: false, reason: 'bad_request', detail: "join needs a string 'orderId'." };
     }
 
-    const allowed = access(orderId, this.orders.get(orderId), await this.principalOf(client));
+    const allowed = access(orderId, await this.orders.find(orderId), await this.principalOf(client));
     if (!allowed.ok) {
       const { reason, detail } = allowed.denial;
       this.logger.warn(`join refused (${reason}): ${detail}`);

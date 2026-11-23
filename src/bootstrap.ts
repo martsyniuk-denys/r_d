@@ -28,7 +28,15 @@ export async function configureApp(app: NestExpressApplication): Promise<NestExp
   // 400 from the body parser is still counted and logged), then the parser.
   app.use(requestContext());
   app.use(observeRequests());
-  app.use(express.json());
+  // The raw bytes are kept for the one route that must see them: a webhook's HMAC
+  // is over the body as sent, and JSON.stringify(req.body) is not those bytes.
+  app.use(
+    express.json({
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: Buffer }).rawBody = buf;
+      },
+    }),
+  );
 
   app.use(
     OpenApiValidator.middleware({
