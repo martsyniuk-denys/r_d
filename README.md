@@ -4085,7 +4085,13 @@ every RDS and ELBv2 call with 501, so no instance can exist there. The script co
 and says so in a line of its own (`rds@eu-central-1: 501, API not emulated …`). Any other error
 fails the job, because an unreadable check is not a zero. **`state-resources-left`** counts `aws:*`
 resources in the state of both stacks. `tagged-resources-left` asks the tagging API, which is the
-second source of truth: a resource created by hand outside Pulumi shows up only there.
+second source of truth: a resource created by hand outside Pulumi shows up only there. Its query
+is the contract's, verbatim: `Key=Project,Values=nodejs-pro-hw31 Key=Stack,Values=demo`, ARNs
+with `:natgateway/` excluded. Without `Stack=demo` a live `base` (which on the main lane stays
+after the session) would count; without the exclusion a NAT already `deleted`, which the tagging
+API keeps listing for about an hour, would. `nat-left` counts NATs in `pending` **and**
+`available`: a NAT still being created is billed already. Every change to a filter here changes
+what a zero means, so none of them is mine to choose.
 
 The emptiness checks run locally as well: `npm run destroy:base` writes the same six keys into
 `evidence/demos.txt`. That file is written by my machine, so it is a floor, not a proof. The
