@@ -49,6 +49,7 @@ jobs:
       repository: ${{ needs.build.outputs.repository }}
       digest: ${{ needs.build.outputs.digest }}
       cost-bypass-label: ${{ contains(github.event.pull_request.labels.*.name, 'cost-approved') && 'cost-approved' || '' }}
+      base-sha: ${{ github.event.pull_request.base.sha || '' }}
     # a reusable workflow reads its environment's secrets (STORE_KEY of `kind`) only
     # when the caller passes them down
     secrets: inherit

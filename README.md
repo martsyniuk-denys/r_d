@@ -4218,7 +4218,8 @@ are in the root `package.json`.
 
 ```
 pr.yml (pull_request, workflow_dispatch)        deploy.yml (push to main, workflow_dispatch)
-  │                                                │  same four jobs, same reusable workflows
+  │                                                │  same jobs, except build → promote:
+  │                                                │  the digest of the PR's green run
   ├─ gates ── gates.yml ───────────────┐
   │    ├─ workflows   actionlint                   │
   │    ├─ types       tsc --noEmit + eslint        │
@@ -4230,14 +4231,15 @@ pr.yml (pull_request, workflow_dispatch)        deploy.yml (push to main, workfl
   │    → demo:image → npm run scan (step 4 of the ladder)
   ├─ deploy ─ deploy-kind.yml  needs: [gates, build], environment: kind
   │    OIDC gate → kind + crictl pull <repo>@<digest> → pulumi preview --json
-  │    → gate:cost → pulumi up → manifest check → demo:rollout (failed must be 0)
+  │    (+ the base branch's) → gate:cost → pulumi up → manifest check
+  │    → demo:rollout (failed must be 0) → manifest check again
   └─ evidence  needs: all three, if: always() → artifact pipeline-evidence
 ```
 
 | Workflow | Triggers | What it is |
 | --- | --- | --- |
 | `pr.yml` | `pull_request`, `workflow_dispatch` | gates, a single build, preview, cost gate, deploy to kind, rollout, evidence |
-| `deploy.yml` | `push` to `main`, `workflow_dispatch` | the same chain for the main branch: `pulumi up` runs only after every gate is green |
+| `deploy.yml` | `push` to `main`, `workflow_dispatch` | the same chain for the main branch, without a build: it deploys the digest the PR's green run verified; `pulumi up` runs only after every gate is green |
 | `gates.yml`, `build.yml`, `deploy-kind.yml` | `workflow_call` | the reusable parts the two workflows share |
 | `contract.yml` | `workflow_call`, `workflow_dispatch` | Pact (#16), called by `gates.yml` |
 | `teardown.yml` | `schedule` + `workflow_dispatch` | #31's teardown; manual dispatch is there because a scheduled run can come late |
@@ -4261,6 +4263,16 @@ names. `kind load` of an image from the host would repack it under a different d
 `pulumi up`, `scripts/ci/manifest.sh` reads the Deployment back from the cluster and fails if
 its digest differs from the built digest. The GHCR package is public, so the grader can compare
 the digest with the registry.
+
+**main promotes, it does not rebuild.** `deploy.yml` has no `build` job. Its `promote` job
+(`scripts/ci/promote.sh`) finds the merged PR of the pushed commit, then the green `pr` runs on
+that PR's head, and takes the first one whose tested commit (the merge commit GitHub built for
+the PR, the tag of its `image-ref`) has the same git tree as the pushed commit. From that run's
+`pipeline-evidence` it takes `built-digest`, and only if `deployed-digest` equals it. A run that
+tested the PR against an older base checked different code, so it does not count; then `promote`
+fails and main does not deploy until the PR is updated and green again. The main run's
+`evidence.txt` has `build-invocations=0` and `promote-pr`, `promote-from-run`,
+`promote-tested-sha`, `promote-digest`.
 
 ### Where it deploys, and what the environments are called
 
@@ -4407,8 +4419,13 @@ gate        pass when plan-usd <= budget-usd; fail exits 1
 
 The default budget follows the change, not the total. An absolute limit would break on the first
 expensive resource and keep every later PR red. In CI the stack is created fresh in each run, so
-`base-usd` is 0 and the default budget is $10 a month. One replica costs $1.68, so going from 3
-replicas to 5 passes ($8.40) and going to 6 fails ($10.08).
+the `oldState` of `plan.json` is always empty. The base therefore comes from a second preview:
+`scripts/ci/base-plan.sh` checks out the PR's base commit (`base.sha`; on main, `event.before`)
+as a worktree and previews its own `infra/` into an empty stack with its own backend. That gives
+`base-plan.json`, and `base-usd` is what it leads to (`BASE_PLAN_JSON`, `base-source=base-plan`).
+A base without a Pulumi program has an empty plan and `base-usd=0`. Today base and head are both
+3 replicas: `base-usd=5.04`, `delta-usd=0.00`, budget $15.04. One replica costs $1.68, so going
+from 3 replicas to 8 passes (+$8.40) and going to 9 fails (+$10.08).
 
 **Bypass.** If the PR has the label `cost-approved`, the gate still prints `gate=fail` with
 `bypass=cost-approved` on the next line and exits 0. The verdict is still recorded in the log;
@@ -4437,9 +4454,10 @@ The `evidence` job runs with `if: always()`, so a red run has evidence too. It c
 
 | File | Contents |
 | --- | --- |
-| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source`, `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secret-in-manifest`, `gate-scan-exit`, plus the cost lines |
-| `deployment.json` | `kubectl get deploy marketplace-api -o json` after `pulumi up` |
+| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source` (`oidc` only when `policy-allow=1`), `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secret-in-manifest`, `gate-scan-exit`, plus the cost lines |
+| `deployment.json` | `kubectl get deploy marketplace-api -o json` after `demo:rollout`, the state the run left (generation 2, `REV=2`); checked again for digest and secret |
 | `plan.json` | `pulumi preview --json`, the input to the cost gate |
+| `base-plan.json` | the same preview of the base commit's program, the cost gate's base |
 | `rollout.txt` | the raw output of `demo:rollout` |
 | `build.log` | one line per build in this run |
 

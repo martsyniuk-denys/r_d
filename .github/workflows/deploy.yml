@@ -1,12 +1,18 @@
-# The deploy pipeline: a push to main (or a manual run) goes through the same gates
-# and the same single build, then the same digest goes to the `kind` environment —
-# pulumi up only after every gate is green.
+# The deploy pipeline: a push to main (or a manual run) goes through the same gates,
+# but builds nothing. The digest it deploys is the one the PR's green `pr` run built,
+# scanned and rolled out (scripts/ci/promote.sh) — promoted, not rebuilt; pulumi up
+# only after every gate is green.
 name: deploy
 
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: the PR whose verified digest to deploy (default — the PR the commit was merged from)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -25,29 +31,53 @@ jobs:
       PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
       PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
 
-  build:
-    uses: ./.github/workflows/build.yml
+  promote:
+    name: promote — the digest of the PR's green run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # reads other runs and their artifacts; writes nothing, pushes nothing
     permissions:
       contents: read
-      packages: write
+      actions: read
+      pull-requests: read
+    outputs:
+      repository: ${{ steps.promote.outputs.repository }}
+      image-ref: ${{ steps.promote.outputs.image-ref }}
+      digest: ${{ steps.promote.outputs.digest }}
+      scan-exit: ${{ steps.promote.outputs.scan-exit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The PR's green run → its digest
+        id: promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          PR: ${{ inputs.pr }}
+        run: bash scripts/ci/promote.sh promote
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: promote-log
+          path: promote/promote.txt
 
   deploy:
-    needs: [gates, build]
+    needs: [gates, promote]
     uses: ./.github/workflows/deploy-kind.yml
     permissions:
       contents: read
       id-token: write
       packages: read
     with:
-      repository: ${{ needs.build.outputs.repository }}
-      digest: ${{ needs.build.outputs.digest }}
+      repository: ${{ needs.promote.outputs.repository }}
+      digest: ${{ needs.promote.outputs.digest }}
+      base-sha: ${{ github.event.before != '0000000000000000000000000000000000000000' && github.event.before || '' }}
     # a reusable workflow reads its environment's secrets (STORE_KEY of `kind`) only
     # when the caller passes them down
     secrets: inherit
 
   evidence:
     name: pipeline-evidence
-    needs: [gates, build, deploy]
+    needs: [gates, promote, deploy]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -56,6 +86,6 @@ jobs:
       - uses: ./.github/actions/evidence
         with:
           head-sha: ${{ github.sha }}
-          image-ref: ${{ needs.build.outputs.image-ref }}
-          built-digest: ${{ needs.build.outputs.digest }}
-          scan-exit: ${{ needs.build.outputs.scan-exit }}
+          image-ref: ${{ needs.promote.outputs.image-ref }}
+          built-digest: ${{ needs.promote.outputs.digest }}
+          scan-exit: ${{ needs.promote.outputs.scan-exit }}

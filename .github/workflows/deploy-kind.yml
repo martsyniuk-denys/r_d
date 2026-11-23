@@ -7,12 +7,14 @@
 #   1. OIDC gate     GitHub's ID token, signature checked against the issuer's JWKS,
 #                    iss/aud/sub against oidc/policy.json — or nothing below runs
 #   2. kind          the cluster, and the image pulled into its node BY DIGEST
-#   3. preview       pulumi preview --json → plan.json
-#   4. cost gate     plan.json → src/mapping.ts → USD/month vs the budget
+#   3. preview       pulumi preview --json → plan.json, and the base branch's program
+#                    previewed the same way → base-plan.json
+#   4. cost gate     plan.json vs base-plan.json → src/mapping.ts → USD/month vs the budget
 #   5. pulumi up     the digest from the build job's outputs, never a tag
 #   6. manifest      the digest that went in == the digest that was built; the app
 #                    secret's value occurs 0 times in the Deployment
 #   7. demo:rollout  a new pod template under load; failed ≠ 0 fails the job
+#   8. manifest      read back once more: deployment.json is the state the run left
 #
 # Two sets of secrets that never mix: the pipeline's (registry, cloud) do not exist —
 # GITHUB_TOKEN for the registry, the OIDC token for identity; the app's live in the
@@ -31,6 +33,10 @@ on:
         required: true
       cost-bypass-label:
         description: the bypass label when the PR carries it, empty otherwise
+        type: string
+        default: ''
+      base-sha:
+        description: the commit the change is measured against (the PR's base); empty = no base plan
         type: string
         default: ''
 
@@ -94,9 +100,19 @@ jobs:
           STORE_KEY: ${{ secrets.STORE_KEY }}
         run: npm run --silent plan > "$OUT/plan.json"
 
+      # The stack above is fresh, so plan.json starts from nothing; the base is what the
+      # base branch's own program leads to.
+      - name: pulumi preview --json of the base branch → base-plan.json
+        if: inputs.base-sha != ''
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+          BASE_SHA: ${{ inputs.base-sha }}
+        run: bash scripts/with-secrets.sh ci bash scripts/ci/base-plan.sh "$BASE_SHA" "$OUT/base-plan.json"
+
       - name: Cost gate
         env:
           PLAN_JSON: ${{ env.OUT }}/plan.json
+          BASE_PLAN_JSON: ${{ inputs.base-sha != '' && format('{0}/base-plan.json', env.OUT) || '' }}
           COST_BYPASS_LABEL: ${{ inputs.cost-bypass-label }}
         run: npm run --silent gate:cost | tee "$OUT/cost.txt"
 
@@ -118,6 +134,17 @@ jobs:
           STORE_KEY: ${{ secrets.STORE_KEY }}
         run: npm run demo:rollout 2>&1 | tee "$OUT/rollout.txt"
 
+      # The snapshot above is from before the rollout (generation 1); the artifact keeps
+      # the Deployment as the run left it, checked again for digest and secret.
+      - name: The manifest after demo:rollout
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+          BUILT_DIGEST: ${{ inputs.digest }}
+        run: |
+          kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "$OUT/deployment.json"
+          jq -r '"generation=\(.metadata.generation) observed=\(.status.observedGeneration) rev=\(.spec.template.spec.containers[0].env[] | select(.name=="REV") | .value)"' "$OUT/deployment.json"
+          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" | tee "$OUT/manifest.txt"
+
       - name: Cluster state on failure
         if: failure()
         run: |
@@ -136,5 +163,6 @@ jobs:
             out/deploy-evidence.txt
             out/deployment.json
             out/plan.json
+            out/base-plan.json
             out/rollout.txt
           if-no-files-found: ignore

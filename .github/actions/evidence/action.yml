@@ -1,7 +1,8 @@
 name: evidence
 description: >
-  Collects build-log and deploy-evidence of this run into the pipeline-evidence
-  artifact — evidence.txt, deployment.json, plan.json, rollout.txt, build.log.
+  Collects build-log (or promote-log) and deploy-evidence of this run into the
+  pipeline-evidence artifact — evidence.txt, deployment.json, plan.json,
+  base-plan.json, rollout.txt, build.log.
   Called from a job with `if: always()`, so a red run has its evidence too.
 inputs:
   head-sha:
@@ -30,6 +31,12 @@ runs:
       with:
         name: deploy-evidence
         path: pipeline-evidence
+    # deploy.yml only: the PR run the digest was promoted from
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      continue-on-error: true
+      with:
+        name: promote-log
+        path: pipeline-evidence
     - name: evidence.txt
       shell: bash
       env:
@@ -48,6 +55,7 @@ runs:
           pipeline-evidence/evidence.txt
           pipeline-evidence/deployment.json
           pipeline-evidence/plan.json
+          pipeline-evidence/base-plan.json
           pipeline-evidence/rollout.txt
           pipeline-evidence/build.log
         if-no-files-found: warn
