@@ -27,6 +27,21 @@ module.exports = {
       from: { path: '(?:^|/)src/(entities|observability)/' },
       to: { path: '(?:^|/)src/', pathNot: '(?:^|/)src/$1/' },
     },
+    {
+      name: 'controllers-stay-thin',
+      comment:
+        'A controller reads the request and calls its service. SQL, transactions and the outbox live ' +
+        'below it (service → domain operation → repository), so no business rule can hide in a route.',
+      severity: 'error',
+      from: { path: '(^|/)src/[^/]+/[^/]+\\.controller\\.ts$' },
+      to: {
+        path: [
+          '(^|/)src/(repositories|db|outbox|concurrency|messaging)/',
+          '(^|/)src/orders/(place-order|place-order-once|lifecycle)\\.ts$',
+          '(^|/)node_modules/(pg|typeorm)/',
+        ],
+      },
+    },
   ],
   options: {
     doNotFollow: { path: 'node_modules' },

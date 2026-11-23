@@ -1,36 +1,520 @@
-# Marketplace API — Homework 09: contract first
+# Marketplace API — coursework (Node.js PRO)
 
-Chosen contract option: **B — runtime validation at the boundary**
-(NestJS + `express-openapi-validator`).
+A marketplace backend in NestJS on Postgres, built homework by homework and finished
+as the coursework: one order goes from the buyer's `POST /orders` through a
+transactional outbox, RabbitMQ and a background consumer to a signed payment webhook,
+and every step is read back by a separate request. One `docker compose up -d --wait`
+brings all of it up from a clean clone.
 
-`openapi/openapi.yaml` is not documentation sitting next to the code — it is the
-source of truth the validator checks **both requests and responses** against.
-Anything that contradicts the spec does not cross the boundary: an invalid request
-is rejected before it reaches a controller (400), and a response that has drifted
-away from its schema never reaches the client (500 instead of silent drift).
+The coursework is the part of this file down to [the appendix](#appendix-the-homeworks-one-by-one).
+The appendix is the record of every homework, and the grading table below points into it
+where an older homework is the evidence.
+
+- [Quick start](#quick-start) — clone, one command, three demos
+- [The main contour](#the-main-contour) — the sequence, by hand with curl
+- [Architecture](#architecture) — processes, layers, where the code is
+- [Domain note (ДЗ0)](#domain-note-дз0) — the domain, trade-offs, decision log
+- [Grading, block by block](#grading-block-by-block) — 11.1–11.7: where it is, how to check it
+- [Environment variables](#environment-variables)
+- [Security: OWASP Top 10:2025](#security-owasp-top-102025)
+- [Secrets and their rotation](#secrets-and-their-rotation)
+- [Honest boundaries](#honest-boundaries) — what is not done, and where the edges are
+- [Running from source](#running-from-source) and [Commands](#commands)
 
 ## Quick start
 
+Needs Docker with Compose v2 and nothing else: no Node on the host, no `.env`, no npm
+token, no access to the secret store.
+
 ```bash
-npm install
-cp .env.example .env                 # real values live here; .env is git-ignored
-cp secrets/db_password.example secrets/db_password
-cp secrets/redis_password.example secrets/redis_password
-cp secrets/storage_secret_key.example secrets/storage_secret_key   # + the STORAGE_* lines of .env.example in .env
-node scripts/jwt-keys.mjs generate dev    # ES256 signing key + refresh pepper into secrets/jwt/dev/
-docker compose up -d --wait          # PgBouncer 56432, Postgres behind it, RabbitMQ 5672, Redis 56379/56380, RustFS 59000, Pact broker 9292
-npm run build                        # migrations and scripts run from dist/
-npm run migrate && npm run seed      # schema from src/migrations + fixture rows
-npm run start:vault                  # http://localhost:3000 — bare `npm start` refuses to run without the keys
+git clone https://github.com/martsyniuk-denys/r_d && cd r_d && git checkout feature/homework_31
+docker compose up -d --wait                       # build, keys, migrate + seed, api/relay/consumer; returns when /readyz is 200
+docker compose run --rm demo demo/contour.mjs     # the whole contour, exit 0
+docker compose run --rm demo demo/webhook.mjs     # signature, amount, duplicate: each = 1, exit 0
 ```
 
-The database schema comes from the TypeORM migrations — `npm run db:schema` and
-`npm run db:seed` are the raw-SQL path of the data-layer homework and belong to the
-`EXPLAIN` exercise below, not to running the app.
+`up --wait` builds `docker/Dockerfile` (the production image) once, then runs it in five
+roles, in order: `keys` generates the application's own secrets into a volume (once, kept
+on later runs), `migrate` applies the TypeORM migrations and the idempotent seed, and
+`api`, `relay` and `consumer` start after it. The API's healthcheck is `/readyz`, so the
+command returns when the API can actually serve.
 
-`npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode.
-A watcher never exits, so it can never report a non-zero exit code, and the
-fail-fast criterion below would be untestable. Watch mode lives in `npm run start:dev`.
+The contour demo prints each step and a summary, and its exit code is the verdict:
+
+```
+contour against http://api:3000
+
+  ok    create: HTTP 201, o_92 pending, total 1029700
+  ok    idempotent replay: same key → o_92, Idempotency-Replay: true
+  ok    access and validation: other buyer 403, no token 401, qty 0 → 400 application/problem+json; charset=utf-8
+  ok    background: consumer confirmed it: status confirmed
+  ok    payment webhook: HTTP 200, verdict applied
+  ok    operator ships: admin → 200 shipped; buyer → 403
+  ok    final read: GET /orders/o_92 → shipped
+  ok    history: pending(checkout) → confirmed(fulfilment) → paid(payment-webhook) → shipped(admin:131)
+
+order=o_92
+created=1
+replayed=1
+confirmed=1
+paid=1
+final=shipped
+history=4
+```
+
+```
+webhook against http://api:3000
+
+  ok    forged signature: HTTP 401, order still pending
+  ok    amount mismatch: HTTP 422 https://marketplace.example/problems/amount-mismatch, order still confirmed
+  ok    accepted: HTTP 200, applied → paid
+  ok    duplicate: HTTP 200, verdict duplicate, 'paid' in history 1×
+
+accepted=1
+rejected-signature=1
+amount-mismatch=1
+duplicates=1
+```
+
+**Observability** is a profile of the same file: Prometheus, Jaeger and Grafana with the
+dashboard provisioned from `observability/grafana/dashboards/marketplace-red.json`.
+
+```bash
+docker compose --profile obs up -d --wait
+docker compose run --rm demo demo/contour-trace.mjs   # one trace across api → relay → consumer, read back from Jaeger
+```
+
+```
+checkout: trace f812f14e6a7d581a634d57d6303c4b58, 32 spans from marketplace-api, marketplace-consumer, marketplace-relay
+    ok   marketplace-api       POST /orders                         ← caller (traceparent header)
+    ok   marketplace-relay     order.placed publish                 ← marketplace-api orders.place
+    ok   marketplace-consumer  fulfilment.order-placed process      ← marketplace-relay order.placed publish
+    ok   marketplace-relay     order.status_changed publish         ← marketplace-consumer fulfilment.order-placed process
+    ok   marketplace-api       api.realtime process                 ← marketplace-relay order.status_changed publish
+  ok    checkout: every hop in one trace: 5 hops found
+  ok    checkout: no orphan spans: 0 spans whose parent is not in the trace
+```
+
+| What | Where | Login |
+| --- | --- | --- |
+| API | `http://localhost:3000` (spec: `openapi/openapi.yaml`) | seed users below |
+| Grafana, dashboard | `http://127.0.0.1:22903/d/marketplace-red` | `admin` / `secrets/grafana_admin_password.example` |
+| Jaeger | `http://127.0.0.1:22904` | — |
+| Prometheus | `http://127.0.0.1:22901` | — |
+| RabbitMQ management | `http://localhost:15672` | `marketplace` / `marketplace_dev_password` |
+
+Seed users, all with the password `marketplace-dev-password`: buyers
+`olena.kovalenko@example.com` and `andrii.shevchenko@example.com`, the operator
+`ops.admin@example.com` (role `admin`), seller `leader.shoes@example.com`.
+
+**Before you run it.** The infrastructure containers have fixed names
+(`marketplace-postgres` and so on) and fixed host ports: 3000, 5672, 15672, 9292, 55432,
+56432, 56379, 56380, 59000, and with `obs` 22901, 22903, 22904. If another copy of this
+stack is running, stop it first (`docker compose down` in that directory). The `obs`
+profile and the standalone stand (`npm run obs:up`) use the same ports, so run one of
+them, not both. If an `up` failed half-way on a taken port, the containers it left behind
+may have no network: `docker compose --profile obs up -d --wait --force-recreate`.
+
+**Restart and teardown.** `docker compose down && docker compose up -d --wait` keeps the
+data (named volumes) and the generated keys, so a token issued before the restart still
+works after it. `docker compose --profile obs --profile demo down -v` removes everything.
+
+## The main contour
+
+An order is placed by a buyer, confirmed by a background consumer, paid by a signed
+provider webhook and read back by separate requests. The buyer hears about every status
+change over SSE or WebSocket.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Buyer
+    participant API as API (Nest)
+    participant DB as Postgres (via PgBouncer)
+    participant Relay
+    participant MQ as RabbitMQ
+    participant Consumer
+    actor Provider as Payment provider
+
+    Buyer->>API: POST /orders + Idempotency-Key
+    API->>DB: BEGIN, reserve stock per line, order 'pending',<br/>payment intent (frozen amount), outbox order.placed, COMMIT
+    API-->>Buyer: 201 {status: pending}
+    Relay->>DB: SELECT … FROM outbox FOR UPDATE SKIP LOCKED
+    Relay->>MQ: publish order.placed (traceparent header), wait for confirm
+    Relay->>DB: UPDATE outbox SET published_at
+    MQ->>Consumer: deliver (prefetch 32, manual ack)
+    Consumer->>DB: BEGIN, inbox mark, fulfilment, pending→confirmed,<br/>history, outbox order.status_changed, COMMIT
+    Consumer->>MQ: ack
+    Relay->>MQ: publish order.status_changed
+    MQ->>API: realtime feed → SSE/WS event to the owner only
+    Provider->>API: POST /payments/webhook, X-Signature: sha256=HMAC(raw body)
+    API->>DB: BEGIN, payment_events (UNIQUE provider event id),<br/>amount == frozen? confirmed→paid, history, outbox, COMMIT
+    API-->>Provider: 200 {verdict: applied}
+    Buyer->>API: GET /orders/{id}, GET /orders/{id}/history
+    API-->>Buyer: paid, and every step with who made it
+```
+
+The lifecycle is one table in `src/orders/lifecycle.ts`, enforced by the SQL rather than
+only by the map: a transition is `UPDATE … WHERE status = ANY(<allowed sources>)`, so two
+concurrent transitions out of one status cannot both win. Every change writes the order
+row, an `order_status_history` row and an `order.status_changed` outbox row in one
+transaction.
+
+```
+pending ──consumer──► confirmed ──webhook──► paid ──admin──► shipped
+   │  └──────────────webhook─────────────────►┘│                │
+   └──────► cancelled ◄──┘                    └──► refunded ◄──┘
+```
+
+### By hand, with curl
+
+Against the compose stack from [Quick start](#quick-start). Needs `curl`, `node` (only to
+pull a field out of JSON) and `openssl` (to sign the webhook like the provider does).
+
+```bash
+B=http://localhost:3000
+TOKEN=$(curl -s $B/auth/login -H 'content-type: application/json' \
+  -d '{"email":"olena.kovalenko@example.com","password":"marketplace-dev-password"}' \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).access_token')
+
+# 1. checkout — Idempotency-Key is required by the contract
+curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -H "idempotency-key: $(uuidgen)" -d '{"items":[{"product_id":"p_1","qty":1}]}'
+# {"id":"o_95","status":"pending","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,…}
+
+# 2. a separate read, a moment later — the consumer has been there
+curl -s $B/orders/o_95 -H "authorization: Bearer $TOKEN"
+# {"id":"o_95","status":"confirmed",…}
+
+# 3. the provider's webhook: HMAC-SHA256 over the exact raw body with the key from the keys volume
+SECRET=$(docker compose run --rm -T --no-deps --entrypoint cat demo /keys/PAYMENT_WEBHOOK_SECRET)
+BODY='{"event_id":"evt_readme_95","order_id":"o_95","amount_cents":249900,"currency":"UAH","outcome":"succeeded"}'
+SIG=sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
+curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"
+# {"event_id":"evt_readme_95","order_id":"o_95","verdict":"applied","order_status":"paid"}
+curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"
+# {"event_id":"evt_readme_95","order_id":"o_95","verdict":"duplicate","order_status":"paid"}
+
+# 4. the final state, and how it got there
+curl -s $B/orders/o_95/history -H "authorization: Bearer $TOKEN"
+# {"items":[{"id":49,"status":"pending","previous_status":null,"changed_by":"checkout",…},
+#           {"id":50,"status":"confirmed","previous_status":"pending","changed_by":"fulfilment",…},
+#           {"id":51,"status":"paid","previous_status":"confirmed","changed_by":"payment-webhook",…}]}
+
+# 5. the edge: no Idempotency-Key → 400 problem+json, before a controller runs
+curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"items":[{"product_id":"p_1","qty":1}]}'
+# {"type":"https://marketplace.example/problems/validation-error","title":"Bad Request","status":400,
+#  "detail":"request/headers must have required property 'idempotency-key'","instance":"/orders"}
+
+# 6. live status events for the owner (another terminal, then repeat 1–3)
+curl -sN $B/orders/o_95/events -H "authorization: Bearer $TOKEN"
+```
+
+| Method and path | Who | What |
+| --- | --- | --- |
+| `POST /orders` | buyer | checkout; `Idempotency-Key` required; 201, 409 on shortage (all lines roll back) |
+| `GET /orders?cursor=` | buyer: own, admin: all | cursor pagination |
+| `GET /orders/{id}` | owner or admin | 403 for another buyer, 404 for none |
+| `GET /orders/{id}/history` | owner or admin | every transition, who made it |
+| `GET /orders/{id}/events` | owner or admin | SSE, `Last-Event-ID` replays from the history |
+| `PATCH /orders/{id}/status` | admin (`RolesGuard`) | along the lifecycle only; 409 otherwise |
+| `POST /payments/webhook` | the provider (signature) | 401 bad signature, 422 amount mismatch, 200 duplicate with no effect |
+| `GET /healthz`, `GET /readyz` | probes | liveness; readiness (Postgres, 503 on SIGTERM) |
+| `GET /metrics` | Prometheus | RED + contour metrics |
+
+The full contract, with every schema and error, is `openapi/openapi.yaml`; the
+validator checks requests and responses against it at runtime.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([Buyer / admin]) -->|HTTP, WS, SSE| api
+    provider([Payment provider]) -->|signed webhook| api
+
+    subgraph app[One image, three processes]
+        api[api<br/>dist/main.js<br/>controller → service → repository]
+        relay[relay<br/>dist/relay.js]
+        consumer[consumer<br/>dist/consumer.js]
+    end
+
+    api -->|one COMMIT: order + outbox| pgb[(PgBouncer<br/>transaction mode)]
+    relay -->|SKIP LOCKED| pgb
+    consumer -->|one tx per message| pgb
+    pgb --> pg[(Postgres 16)]
+
+    relay -->|publish + confirm| mq{{RabbitMQ}}
+    mq -->|order.placed| consumer
+    mq -->|order.status_changed| api
+    mq -. delivery limit .-> dlq[(DLQ)]
+
+    api -->|presigned URLs| s3[(RustFS / S3, private)]
+
+    api & relay & consumer -. OTLP .-> jaeger[Jaeger]
+    prom[Prometheus] -. scrape /metrics .-> api & relay & consumer
+    grafana[Grafana] --> prom & jaeger
+```
+
+The API is layered, and the layers are enforced, not only drawn: `npm run gate:arch`
+(dependency-cruiser, `.dependency-cruiser.cjs`) fails the build when a controller imports a
+repository, the pool, the outbox, the broker or a checkout transaction
+(`controllers-stay-thin`), or when the catalog reaches into the order flow
+(`catalog-does-not-know-orders`). `test/gates/arch` holds one planted violation of each, and
+`npm run demo:gates` shows the gate saying no to them. Every log line carries `layer`
+(`http`, `orders.controller`, `orders.service`, …), so the layers are visible at run time too.
+
+| Layer | Where | What it may do |
+| --- | --- | --- |
+| edge | `src/bootstrap.ts`, `openapi/openapi.yaml`, `src/common/problem.filter.ts` | validate against the spec, one error format (`application/problem+json`), raw body for the webhook, probes, `/metrics` |
+| controller | `src/orders/orders.controller.ts`, `src/payments/payments.controller.ts`, … | read the request, call one service method, map the result; guards: `AccessTokenGuard`, `RolesGuard` |
+| service | `src/orders/orders.service.ts`, `src/payments/payments.service.ts` | business rules: ownership, lifecycle, amount check, idempotency |
+| domain operations | `src/orders/place-order.ts`, `src/orders/lifecycle.ts`, `src/orders/place-order-once.ts`, `src/outbox/outbox.ts` | the transactions themselves; know SQL, not HTTP |
+| repository | `src/repositories/*.ts` | queries; no business decisions |
+| background | `src/relay.ts` + `src/outbox/relay.ts`, `src/consumer.ts` + `src/messaging/order-placed.consumer.ts`, `src/realtime/order-status.feed.ts` | outbox → broker; broker → effect; broker → realtime |
+| config | `src/config/env.schema.ts`, `src/config/secret-files.ts` | the only door to `process.env`; fail-fast |
+
+| Directory | What is in it |
+| --- | --- |
+| `src/orders`, `src/payments` | the contour: checkout, lifecycle, webhook |
+| `src/outbox`, `src/messaging` | outbox table and relay; topology, publisher with confirms, consumer |
+| `src/realtime` | WebSocket gateway, SSE, owner check, the cross-process feed |
+| `src/auth`, `src/health`, `src/observability` | tokens and guards; probes and drain; logs, metrics, tracing |
+| `src/migrations`, `src/entities`, `src/seed.ts`, `src/migrate.ts` | schema of record; the compose one-shot |
+| `src/cache`, `src/sessions`, `src/ratelimit`, `src/queue`, `src/files`, `src/storage` | Redis and file homeworks (see [Honest boundaries](#honest-boundaries)) |
+| `test/unit`, `test/integration`, `test/e2e`, `test/contract`, `test/gates` | the test levels |
+| `docker/Dockerfile`, `docker-compose.yml`, `infra/`, `k8s/`, `.github/workflows/` | image, local stand, Pulumi, kind, pipeline |
+| `demo/`, `scripts/` | measured demos; operational scripts |
+
+## Domain note (ДЗ0)
+
+| | |
+| --- | --- |
+| **Domain and actors** | A marketplace of goods. Buyers order, sellers list products, an operator (`admin`) moves orders after payment, and an external payment provider reports payments by webhook. |
+| **Main entity** | The order: lines with prices frozen at checkout, a total in minor units, an owner, and a status with a recorded history. |
+| **Main scenario** | Checkout (`pending`) → fulfilment by a background consumer (`confirmed`) → payment webhook (`paid`) → operator (`shipped`); read back by `GET /orders/{id}` and `/history`, pushed live to the owner. |
+| **Invariants** | Stock never goes below zero and is never sold twice. The paid amount equals the total frozen at checkout. A status moves only along the lifecycle table and never back. An order is visible only to its owner and the operator. |
+| **Irreversible operations and their keys** | Placing an order — the `Idempotency-Key` header, scoped to route and user, stored with the request hash in Postgres. Applying a payment — the provider's `event_id` (`UNIQUE`). Fulfilment — the event id derived from the order (`processed_messages`). |
+| **Background work** | The relay (outbox → RabbitMQ), the consumer (fulfilment + confirmation), the API's realtime feed. All are at-least-once with an idempotent effect. |
+| **Load and failure expectations** | Bursts on one product (50 parallel checkouts on one SKU must sell exactly the stock). The broker may be down without stopping checkout. A process may die between any two steps. Data survives a restart; RTO 15 min committed (1.7 s measured), RPO 24 h. |
+
+### Trade-offs
+
+- **Transactional outbox, not publish-after-commit**, because the order and the event must
+  be one fact: a crash between `COMMIT` and `publish` loses the event, and a publish before
+  `COMMIT` announces an order that may roll back. Otherwise: a dual write with a
+  reconciliation job. The price is latency of one relay poll and at-least-once delivery.
+- **Atomic `UPDATE … SET stock = stock - n WHERE stock >= n`, not `SELECT … FOR UPDATE`**,
+  because the check and the write are one statement and hold the row lock for the shortest
+  time; lines are reserved in product-id order, so two carts cannot deadlock. Otherwise:
+  `SERIALIZABLE` + retry on `40001` (kept, for the wallet checkout).
+- **Idempotency keys in Postgres, not Redis**, because the key must commit together with
+  the order it protects: a key in Redis can survive a rolled-back order or vanish under
+  one that committed. Otherwise: Redis `SET NX` with a TTL, and the window that comes with it.
+- **Webhook deduplication by a `UNIQUE` provider event id in an append-only table**, because
+  the provider retries and its id is the business identity of the payment. A rejected
+  (422) delivery is journaled too. Otherwise: a check-then-insert, which two retries race.
+- **The broker is reported in `/readyz`, not gating it**, because with the outbox the API
+  takes orders without RabbitMQ — gating would turn a broker outage into a full outage.
+  Otherwise: a readiness that fails with any dependency.
+- **`prefetch = 32`**, because one message is one short transaction and the pool has 10
+  connections: `prefetch = 1` leaves the pool idle across every network round trip, and
+  `32 ×` processing time stays far below RabbitMQ's 30 min consumer timeout.
+- **PgBouncer in transaction mode**, because the API, relay and consumer each want a pool
+  and Postgres pays for every connection. Cost: no session state, so no `LISTEN/NOTIFY` —
+  which is why the realtime feed goes through RabbitMQ.
+- **Runtime validation against the spec (option B), not codegen**, because a response that
+  drifts from the spec becomes a 500 at the boundary instead of a silent contract break.
+- **ES256 with an algorithm allowlist, not HS256**, because the verifying side never holds
+  a key that can sign, and the token cannot choose its own algorithm.
+- **Application secrets as files (`NAME_FILE`), not environment values**, because a file
+  can be rotated without a restart and does not show up in `docker inspect`.
+
+### Decision log
+
+| Date | Decision | Why |
+| --- | --- | --- |
+| 2026-09-01 | Contract first: `openapi/openapi.yaml` is validated at runtime, both ways | the spec cannot drift from the code |
+| 2026-09-01 | Config through one zod schema, fail-fast with every broken variable named | a misconfigured process must not half-start |
+| 2026-09-15 | Money as integer minor units; schema only through migrations (`synchronize: false`) | no rounding; every schema change is read before it runs |
+| 2026-09-15 | Checkout as atomic conditional `UPDATE`s in one transaction | no oversell without long locks |
+| 2026-09-30 | PgBouncer in transaction mode; nightly `pg_dump`; restore drill with `MATCH` | connections are scarce; a backup is only a backup once restored |
+| 2026-10-01 | RabbitMQ with publisher confirms, manual ack after the effect, DLQ by delivery limit | at-least-once, and a poisoned message stops looping |
+| 2026-10-22 | Transactional outbox + inbox; `Idempotency-Key` in Postgres | one commit for the fact and its event |
+| 2026-10-30 | ES256 access + rotated refresh with family revocation; logout = refresh revoke + access denylist | a stolen refresh token is detected on its first reuse |
+| 2026-11-16 | Distroless non-root image, Pulumi on kind, PDB; one build promoted by digest through CI gates | what was tested is what runs |
+| 2026-11-23 | The contour on Postgres: lifecycle table enforced in SQL, payment by signed webhook, history per change | the order's life is auditable and race-free |
+| 2026-11-23 | The app in compose with one-shot `keys` and `migrate`; secrets as files | a clean clone comes up with one command |
+| 2026-11-23 | `/healthz` vs `/readyz`; readiness red on SIGTERM, then drain | no request lands on a closing process |
+| 2026-11-23 | Trace context stored in the outbox row and carried in AMQP headers | one trace across three processes, though the relay runs later |
+
+## Grading, block by block
+
+Each row: where it is, the command that shows it, and what it prints. Commands marked
+*compose* run against the [Quick start](#quick-start) stack; *npm* ones need
+[Running from source](#running-from-source).
+
+### 11.1 Design and architecture
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| ДЗ0 note: domain table, trade-offs, decision log | [Domain note (ДЗ0)](#domain-note-дз0) | — |
+| ≥ 3 layers, logic outside controllers | [Architecture](#architecture); `scripts/gates/arch.sh` | `npm run gate:arch` → exit 0; `demo/gates.sh` shows it failing on a planted violation (`arch-broken=1`) |
+| Config fail-fast, exit ≠ 0, names the variable | `src/config/env.schema.ts`, `src/main.ts` | *compose:* `docker compose run --rm --no-deps -e PAYMENT_WEBHOOK_SECRET_FILE= -e PAYMENT_WEBHOOK_SECRET=short api; echo $?` → `PAYMENT_WEBHOOK_SECRET: must be at least 32 characters (set, value withheld)`, `1`. More in [Fail-fast](#fail-fast-on-a-broken-variable) |
+| Architecture diagram, API description, runbook | [Architecture](#architecture), `openapi/openapi.yaml`, [Quick start](#quick-start) | `npm run lint` → valid spec |
+| Bonus: OWASP Top 10:2025 | [Security](#security-owasp-top-102025) | — |
+
+### 11.2 Main contour and correctness
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Full contour: create → background → status → final read by a separate request | `src/orders/*`, `src/messaging/order-placed.consumer.ts`, `src/payments/*` | *compose:* `docker compose run --rm demo demo/contour.mjs` → `created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4`, exit 0; e2e `runs the whole contour` |
+| 50 concurrent, no oversell or lost update; a shortage rolls everything back | `src/orders/place-order.ts`; `src/concurrency/checkout.ts` | e2e `sells exactly the stock under a parallel burst` (30 requests on stock 5 → 5 × 201, 25 × 409, stock 0) and `rolls the whole checkout back when one line is short`; *npm:* `npm run demo:race` (50 parallel on stock 10, see [Race](#race-npm-run-demorace)) |
+| Contract machine-checked: cursor pagination, `Idempotency-Key` required, problem+json 4xx | `openapi/openapi.yaml`, `src/bootstrap.ts`, `src/common/problem.filter.ts`, `src/common/cursor.ts` | `npm run check`; the curl step 5 above (400 problem+json without the key); e2e `keeps 400, 401, 403 and 422 apart`; Pact: `npm run test:contract && npm run verify:provider` |
+| A repeated irreversible operation has one effect; the key comes from the business entity | `src/orders/place-order-once.ts` (key `route:user:key` + request hash), `src/payments/payments.service.ts` (provider `event_id`), consumer inbox by event id | contour demo `idempotent replay` (same order, `Idempotency-Replay: true`); `demo/webhook.mjs` → `duplicates=1`; unit `checkout-request.test.ts` (same cart → same hash, other cart → 422) |
+
+### 11.3 Data
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Persistent, constraints, migrations with a working revert, idempotent seed | `src/migrations/*` (8), `src/seed.ts` | *compose:* `down && up -d --wait`, the order is still there; *npm:* `npm run migrate:revert && npm run migrate` both exit 0; `npm run seed` twice → same rows. See [Migrations](#migrations-and-what-was-corrected-by-hand), [Seed](#seed) |
+| `EXPLAIN` / N+1 | `db/OPTIMIZATIONS.md`, `src/demo-nplus1.ts` | [Data layer](#data-layer); `npm run demo:nplus1` (query count of each way) |
+| PgBouncer transaction mode; restore drill `MATCH`; RTO/RPO | `pgbouncer/pgbouncer.ini`, `scripts/restore-drill.sh`, `RESTORE-DRILL.md` | `bash scripts/restore-drill.sh` → `MATCH`; RTO 1.7 s measured / 15 min committed, RPO 24 h |
+| Cache-aside + jitter + single-flight; session survives restart; two Redis | `src/cache/*`, `src/sessions/*`, `docker-compose.yml` (`redis-cache`, `redis-queue`) | `npm run demo:cache` (50 reads of an expired key → 1 query), `npm run demo:session` (survives `kill -9`); [Redis](#redis-cache-sessions-limits-queue-redis-кеш-сесії-ліміти-черга) |
+| Presigned files, closed bucket, CDN | `src/files/*`, `src/edge.ts` | `npm run demo:upload`, `npm run demo:cdn` (bucket 403, edge MISS → HIT); [Files](#files-файли) |
+
+### 11.4 Security
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Logout revokes refresh and access; refresh reuse revokes the family; algorithm allowlist | `src/auth/auth.service.ts`, `src/auth/keys.ts` | e2e `kills both tokens on logout`, `revokes the whole family`; `npm run demo:auth`, `npm run demo:reuse`; [Auth](#auth-автентифікація-та-авторизація) |
+| 401 vs 403; role by guard, ownership in the service; realtime only to the owner | `src/auth/guards.ts`, `src/orders/orders.service.ts`, `src/realtime/order-access.ts` | contour demo `access and validation` (403 other buyer, 401 no token), `operator ships` (buyer → 403); `npm run demo:realtime` |
+| Validation of the contour input; one error format | `openapi/openapi.yaml` (runtime validator), `src/common/problem.filter.ts` | `qty 0 → 400 application/problem+json` in the contour demo |
+| Secrets not in code, git or image layers | `.gitignore`, `.dockerignore`, `src/config/secret-files.ts`, `src/compose-keys.ts` | `npm run demo:image` → `token-in-history=0 token-in-config=0 token-in-layers=0`; `docker inspect r_d-api-1 --format '{{.Config.Env}}'` shows file paths (`*_FILE`) and URLs without passwords, no secret value |
+| Edge: rate limit 429 + `Retry-After` on a shared store; webhook signature, duplicate, amount | `src/ratelimit/sliding-window.ts`, `src/payments/signature.ts` | `npm run demo:ratelimit`; *compose:* `demo/webhook.mjs` → `accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1` |
+| Bonus: secret store dev ≠ prod, rotation live | `scripts/with-secrets.sh`, `store/`, `rotate.sh`, `scripts/jwt-keys.mjs` | [Secrets and their rotation](#secrets-and-their-rotation) |
+
+### 11.5 Asynchrony
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Background work changes state, read by a separate request | `src/messaging/order-placed.consumer.ts` | contour demo `background: consumer confirmed it`; e2e consumer in-process `pending → confirmed` |
+| Outbox in one `COMMIT`; publisher confirms; prefetch justified; at-least-once with an idempotent effect; dedup survives a restart | `src/outbox/*`, `src/messaging/publisher.ts`, `processed_messages` table | `npm run demo:crash-write`, `demo:crash-relay` (2 deliveries, 1 effect), `demo:duplicate`; [Outbox](#transactional-outbox-and-idempotency-outbox-та-ідемпотентність), [prefetch](#prefetch--32) |
+| Workers exactly once; retry on `40001` / `40P01`; DLQ | `src/concurrency/worker.ts`, `src/concurrency/retry.ts`, `src/messaging/topology.ts` | `npm run demo:workers`, `demo:retry`, `demo:dlq` (reason from `x-death`) |
+| Realtime only to the owner; SSE `Last-Event-ID` | `src/realtime/*` | `npm run demo:realtime` and `:same-room`; [Last-Event-ID](#last-event-id-a-reconnect-that-loses-nothing) |
+
+### 11.6 Delivery
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| `docker compose up -d --wait` from a clean clone per README; no hidden steps; data survives a restart; waits for dependencies | `docker-compose.yml` | [Quick start](#quick-start); `depends_on: service_healthy / service_completed_successfully` everywhere; `down && up -d --wait` keeps orders and keys |
+| Production image: multi-stage, no shell, non-root, no build secret, scanner threshold | `docker/Dockerfile`, `scripts/scan.sh` | `npm run demo:image` → `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `SCAN_MAX=-1 npm run scan` → `gate=fail`, exit 1. See [The image](#the-image), [The scan gate](#the-scan-gate) |
+| IaC deploy, rollout `failed=0`, two probes, SIGTERM | `infra/`, `k8s/`, `src/k8s-pod.ts`, `demo/rollout.sh` | `npm run demo:rollout` → `failed=0`; [Kubernetes](#kubernetes). The pod there is the stateless stub, see [Honest boundaries](#honest-boundaries) |
+| Off-machine deploy: green deploy run by digest, or a teardown run | `.github/workflows/pr.yml`, `deploy.yml`, `teardown.yml` | green `pr` run on PR #23 (built = deployed = registry digest, `failed=0`), teardown run in [AWS](#aws) |
+
+### 11.7 Operations and quality
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Liveness and readiness on different paths; readiness red on SIGTERM | `src/bootstrap.ts`, `src/health/readiness.service.ts`, `src/main.ts` | `curl localhost:3000/readyz` → `{"status":"ready","checks":{"database":"up","broker":"up"}}`; `docker compose kill -s SIGTERM api` → `/readyz` 503 at once, `/healthz` 200 through the 5 s drain, exit 0; e2e `probes.e2e.test.ts` |
+| Structured logs, one `trace_id`, no secrets | `src/observability/logger.ts`, `request-log.ts`, `amqp-trace.ts` | `docker compose logs --no-log-prefix api relay consumer \| grep <checkout_trace>` → lines from all three processes; `npm run demo:logs` → `secret-in-logs=0` |
+| RED metrics, OTel continues `traceparent`, dashboard as a file | `src/observability/metrics.ts`, `observability/grafana/dashboards/marketplace-red.json` | `demo/contour-trace.mjs` → 5 hops, 0 orphans; Grafana row *Main contour*; `npm run demo:metrics`, `demo:trace` |
+| Tests: integration against a real DB, twice green; e2e of the contour; business logic without HTTP | `test/integration`, `test/e2e/orders.e2e.test.ts`, `test/unit/lifecycle.test.ts` | `npm run test:integration` (run it twice), `npm run test:e2e`, `npm run test:unit` |
+| A pipeline in which every gate can say no | `.github/workflows/*`, `demo/gates.sh` | `npm run demo:gates` → `<step>-ok=0`, `<step>-broken=1` for each gate; [CI/CD](#cicd) |
+
+## Environment variables
+
+Declared once in `src/config/env.schema.ts`, documented in `.env.example`, checked by
+`npm run check:env`. In compose every secret arrives as a file: for any variable of the
+store (`JWT_*`, `REFRESH_TOKEN_PEPPER`, `STORAGE_SECRET_KEY`, `PAYMENT_WEBHOOK_SECRET`),
+`NAME_FILE` names a file holding the value (`src/config/secret-files.ts`); a value already
+in the environment wins.
+
+| Variable | Required | Default | Source | Purpose |
+| --- | --- | --- | --- | --- |
+| `NODE_ENV` | no | `development` | environment | `development` \| `test` \| `production` |
+| `PORT` | no | `3000` | environment | HTTP port |
+| `DB_URL` | **yes** (or `DATABASE_URL`) | — | `.env` / compose | Postgres URL **without** a password; the schema rejects one with a password |
+| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | environment (a path) | the password, re-read on every new connection (rotation) |
+| `DATABASE_URL` | no | — | environment | grader-style alternative with the password inside; `DB_URL` wins |
+| `DB_POOL_MAX`, `DB_CONNECTION_TIMEOUT_MS` | no | `10`, `5000` | environment | pool size, wait for a connection |
+| `LOG_LEVEL` | no | `info` | environment | `debug` \| `info` \| `warn` \| `error` |
+| `SHUTDOWN_DRAIN_MS` | no | `5000` | environment | SIGTERM → `/readyz` 503 for this long → close |
+| `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER` | **yes** | — | store / `keys` volume | ES256 signing pair and the refresh pepper ([Auth → Variables](#variables-1)) |
+| `JWT_PREVIOUS_PUBLIC_KEY`, `JWT_PREVIOUS_KID` | no | — | store | the retiring key during a rotation |
+| `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_ACCESS_TTL_SECONDS`, `REFRESH_TTL_SECONDS` | no | `marketplace-api`, `600`, 30 days | environment | token claims and lifetimes |
+| `BROKER_URL` | no | — | environment | RabbitMQ URL without a password; the API's realtime feed |
+| `BROKER_PASSWORD_FILE` | no | — | environment (a path) | the broker password |
+| `STORAGE_ENDPOINT`, `STORAGE_REGION`, `STORAGE_BUCKET`, `STORAGE_ACCESS_KEY` | bucket, key id: **yes** | region `us-east-1` | environment | object storage ([Files → Variables](#variables-2)) |
+| `STORAGE_SECRET_KEY` | **yes** | — | store | storage secret key |
+| `UPLOAD_PUT_TTL_SECONDS` | no | see Files | environment | lifetime of a presigned PUT |
+| `PAYMENT_WEBHOOK_SECRET` | **yes**, ≥ 32 chars | — | store / `keys` volume | HMAC key of the provider's webhook |
+| `METRICS_PORT` | no | — | environment | `/metrics` of the relay and the consumer (compose: `9464`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | environment | where spans go (compose: `http://jaeger:4318`); unset → no export, trace ids still in logs |
+| `SKIP_VAULT` | no | — | environment | `with-secrets.sh` skips the store; the caller exports the values |
+
+## Security: OWASP Top 10:2025
+
+| Risk | What this project does | Where |
+| --- | --- | --- |
+| A01 Broken Access Control | role by `RolesGuard`, ownership checked in the service (403 for another buyer's order), realtime rooms only for the owner, admin-only status changes | `src/auth/guards.ts`, `src/orders/orders.service.ts`, `src/realtime/order-access.ts` |
+| A02 Security Misconfiguration | fail-fast config, no default secrets in code, closed bucket, Grafana without anonymous access or sign-up, management ports bound to `127.0.0.1` for the obs stand | `src/config/env.schema.ts`, `docker-compose.yml` |
+| A03 Software Supply Chain Failures | `npm ci` from a lockfile, every image pinned to a version, Trivy gate on the image, one build promoted by digest | `docker/Dockerfile`, `scripts/scan.sh`, `.github/workflows/build.yml` |
+| A04 Cryptographic Failures | ES256 with an algorithm allowlist, refresh tokens stored as peppered hashes, `timingSafeEqual` for the webhook HMAC, scrypt for passwords | `src/auth/*`, `src/payments/signature.ts` |
+| A05 Injection | parameterised SQL everywhere; request bodies validated against the spec before a controller runs | `src/repositories/*`, `src/bootstrap.ts` |
+| A06 Insecure Design | the lifecycle as a table enforced in SQL, frozen payment amount, idempotency keys, outbox | `src/orders/lifecycle.ts`, `src/orders/place-order.ts` |
+| A07 Authentication Failures | the same 401 for a wrong password and an unknown e-mail, refresh rotation with reuse detection, logout kills both tokens | `src/auth/auth.service.ts`, e2e `auth.e2e.test.ts` |
+| A08 Software or Data Integrity Failures | webhook signed over the raw body, amount mismatch rejected and journaled, append-only payment events | `src/payments/*` |
+| A09 Security Logging and Alerting Failures | structured logs with `trace_id` and `layer`, secrets redacted (`secret-in-logs=0`), 4xx/5xx rates on the dashboard | `src/observability/*`, `demo/logs.mjs` |
+| A10 Mishandling of Exceptional Conditions | one problem+json filter, no stack traces to clients, readiness red while draining, DLQ for poison messages, retry on `40001`/`40P01` | `src/common/problem.filter.ts`, `src/health/*`, `src/messaging/topology.ts` |
+
+## Secrets and their rotation
+
+Nothing secret is in git, in the image or in an environment value of a container. Locally
+the values come from an encrypted store per environment (`store/*.enc`, opened by
+`scripts/with-secrets.sh dev` with a key outside git), so dev and CI never share a value. In
+compose, the infrastructure passwords are the committed dev values from
+`secrets/*.example`, mounted as compose secrets, and the application's own secrets — the
+JWT signing pair, the refresh pepper, the webhook key — are generated by the `keys` one-shot
+into a volume on the first `up` and never leave it. The image has no `ENV` with a secret
+and no secret in a layer (`npm run demo:image`). Rotation is live: the database password
+through `rotate.sh` without a restart ([how](#rotating-the-database-password-without-a-restart)),
+the signing key through `scripts/jwt-keys.mjs rotate|retire` with the previous key still
+verifying during the overlap ([Auth](#auth-автентифікація-та-авторизація)).
+
+## Honest boundaries
+
+- **Kubernetes runs a stub, not the full API.** The rollout homework deploys `src/k8s-pod.ts`
+  (probes, drain, the same image) to kind; the coursework API with Postgres and RabbitMQ is
+  not deployed there (phase 5 of the plan was optional and is not done). The probes and
+  the SIGTERM drain of the real API are shown in compose and in `probes.e2e.test.ts`.
+- **Redis is not in the contour.** Cache-aside, sessions and the shared rate limit live in
+  their homework processes (`src/pod.ts`, the demos), not in the Nest API that compose runs.
+- **Products and files still use the in-memory `IdempotencyService`.** The orders contour
+  uses the Postgres one; the others were not migrated.
+- **The contract gate flags the status enum** (`created` → `pending`, `confirmed` added) as
+  a breaking change against the base branch — expected for this PR.
+- **The payment provider is simulated** by the demos (`demo/lib/api-client.mjs` signs like a
+  provider would); there is no real payment integration.
+
+## Running from source
+
+For the npm demos and the test suites. Needs Node 22, Docker, and either access to the
+store (`npm run start:vault` etc.) or `SKIP_VAULT=1` with the values exported (the
+reviewer blocks under [Grading](#grading) show how).
+
+```bash
+npm ci
+docker compose up -d --wait postgres pgbouncer rabbitmq redis-cache redis-queue storage
+npm run build && npm run migrate && npm run seed
+npm run start:vault           # API on 3000 — stop the compose api first, it holds the port
+npm run relay & npm run consumer &
+BASE_URL=http://localhost:3000 npm run demo:contour
+npm run test:unit && npm run test:integration && npm run test:e2e
+```
+
+`npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode, so the
+fail-fast exit code can be tested. Watch mode is `npm run start:dev`.
 
 ## Commands
 
@@ -53,6 +537,12 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:retry` | provokes `40001` and retries the whole transaction with backoff |
 | `npm run demo:realtime` | two WebSocket clients in different rooms; only the addressed one hears the event |
 | `npm run demo:realtime:same-room` | the control run: both clients in one room, so both must hear it |
+| `npm run demo:contour` | the coursework contour against `BASE_URL`: create, replay, 401/403/400, confirmed, paid, shipped, history |
+| `npm run demo:webhook` | the webhook's four answers: accepted, forged signature, amount mismatch, duplicate |
+| `npm run demo:contour-trace` | one trace across api → relay → consumer, read back from Jaeger (`TRACE_API_URL`) |
+| `npm run test:unit` | business logic without HTTP or a database: lifecycle, signature, checkout identity, trace context |
+| `npm run gate:types` / `gate:contract` / `gate:arch` | the gates of the pipeline, runnable locally |
+| `npm run demo:gates` | every gate on a correct and on a broken input: `<step>-ok=0`, `<step>-broken=1` |
 | `npm run consumer` | the `order.placed` consumer: manual ack, prefetch 32, idempotent effect |
 | `npm run demo:publish` | 5 checkouts → 5 `order.placed` → 5 effects, 5 acks, empty DLQ |
 | `npm run demo:dlq` | a poisoned message is rejected into the DLQ; the reason is read from `x-death` |
@@ -105,6 +595,24 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 `npm run check` and `npm run smoke` perform exactly the same checks as the raw
 commands below, just collected into one run with readable output.
 
+# Appendix: the homeworks one by one
+
+Everything below is the record of the homeworks this project grew from, in the order
+they were done. The coursework part above links here where an older homework is the
+evidence for a grading row. Some commands below predate the compose application (they
+start their own processes from `dist/`); they still work as written.
+
+# Contract first (homework 09)
+
+Chosen contract option: **B — runtime validation at the boundary**
+(NestJS + `express-openapi-validator`).
+
+`openapi/openapi.yaml` is not documentation sitting next to the code — it is the
+source of truth the validator checks **both requests and responses** against.
+Anything that contradicts the spec does not cross the boundary: an invalid request
+is rejected before it reaches a controller (400), and a response that has drifted
+away from its schema never reaches the client (500 instead of silent drift).
+
 # Configuration
 
 Configuration flows in one direction, and every step is enforced rather than assumed:
@@ -123,18 +631,7 @@ Every variable is declared once, in `src/config/env.schema.ts`, and documented i
 `.env.example`. Types come from `z.coerce` because everything arriving from the
 environment is a string.
 
-| Variable | Required | Default | Source | Purpose |
-| --- | --- | --- | --- | --- |
-| `NODE_ENV` | no | `development` | process environment | Runtime mode: `development` \| `test` \| `production`. |
-| `PORT` | no | `3000` | process environment | HTTP port. Coerced to a number. |
-| `DB_URL` | **yes** | — | **secrets store** — the local `.env`, which is git-ignored; `.env.example` carries a fake | Postgres connection string **without a password**. The schema rejects a URL that contains one. |
-| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | process environment (a path, not a secret) | File holding the database password. Re-read on every new connection. |
-| `DB_POOL_MAX` | no | `10` | process environment | Maximum connections in the pool. |
-| `DB_CONNECTION_TIMEOUT_MS` | no | `5000` | process environment | How long to wait for a pooled connection. |
-| `LOG_LEVEL` | no | `info` | process environment | `debug` \| `info` \| `warn` \| `error`. |
-| `DATABASE_URL` | no | — | process environment | Grader-style alternative to `DB_URL` + `DB_PASSWORD_FILE`, password inside; `DB_URL` wins. |
-| `JWT_*`, `REFRESH_TOKEN_PEPPER` | **yes** (four of them) | — | secrets store | Token keys and the refresh pepper — see [Auth → Variables](#variables-1). |
-| `STORAGE_*`, `UPLOAD_PUT_TTL_SECONDS` | bucket, key id and secret: **yes** | — | secrets store / environment | Object storage — see [Files → Variables](#variables-2). |
+The full table, with the coursework's variables, is [Environment variables](#environment-variables).
 
 The database connection lives in the store this project already had, not in a new env
 file: `DB_URL` carries no password, and the password itself is a separate file

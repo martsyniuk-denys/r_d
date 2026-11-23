@@ -226,6 +226,10 @@ services:
   relay:
     image: marketplace-api:compose
     command: ['dist/relay.js']
+    # A background process has no probe that would restart it: an error it cannot
+    # survive (the database or the broker gone for good) ends it, and compose brings
+    # it back. Exit 0 (a SIGTERM) stays stopped.
+    restart: on-failure
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -241,6 +245,7 @@ services:
   consumer:
     image: marketplace-api:compose
     command: ['dist/consumer.js']
+    restart: on-failure
     depends_on:
       migrate:
         condition: service_completed_successfully
