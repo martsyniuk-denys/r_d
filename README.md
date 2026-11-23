@@ -4826,6 +4826,7 @@ correct one.
 
 pr-run: https://github.com/martsyniuk-denys/r_d/pull/23 — the graded run is the latest green `pr` run on the PR head (first green: https://github.com/martsyniuk-denys/r_d/actions/runs/43934560195 — 243 468 requests, failed=0, rollout 24 s, built = deployed = registry digest)
 cost-gate-bypass-label: cost-approved
+contract-gate-bypass-label: breaking-approved
 
 **Paths for the criteria.** The workflows are in `.github/workflows/`. The trust condition is
 `oidc/policy.json`, and the gate that applies it is `scripts/oidc-gate.mjs`. The cost mapping is
@@ -5052,6 +5053,12 @@ from 3 replicas to 8 passes (+$8.40) and going to 9 fails (+$10.08).
 `bypass=cost-approved` on the next line and exits 0. The verdict is still recorded in the log;
 the label only stops it from blocking. The label name is on the `cost-gate-bypass-label:` line at
 the top of this section.
+
+The contract gate has the same kind of bypass, the label `breaking-approved`, added for the
+coursework PR (#24). That PR renames the order statuses (`created` → `pending`, plus `confirmed`),
+which oasdiff rightly reports as a break, and without the label the deploy job behind the gates
+never runs. With the label the job prints `gate=fail` and then `bypass=breaking-approved`. Only
+oasdiff's exit 1 (ERR found) is let through. A missing or unreadable spec (exit 2) still fails.
 
 **Rates** (`RATES` in `src/mapping.ts`). kind bills nothing, so the price is what the same
 requests would cost elsewhere: the pod requests priced as AWS Fargate pods, plus the two
