@@ -91,6 +91,11 @@ export const envSchema = z.object({
 
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
+  // SIGTERM → /readyz 503 → this long still serving (the balancer or the endpoints
+  // controller needs a few probe periods to notice) → close. Below the orchestrator's
+  // grace period (compose stop_grace_period, terminationGracePeriodSeconds).
+  SHUTDOWN_DRAIN_MS: z.coerce.number().int().min(0).max(60_000).default(5000),
+
   JWT_PRIVATE_KEY: privateKey,
 
   JWT_PUBLIC_KEY: publicKey,

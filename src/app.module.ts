@@ -9,6 +9,7 @@ import { DatabaseModule } from './db/database.module';
 import { FilesController } from './files/files.controller';
 import { FilesService } from './files/files.service';
 import { HealthController } from './health/health.controller';
+import { ReadinessService } from './health/readiness.service';
 import { OrdersController } from './orders/orders.controller';
 import { OrdersService } from './orders/orders.service';
 import { PaymentsController } from './payments/payments.controller';
@@ -55,6 +56,7 @@ class TelemetryShutdown implements OnApplicationShutdown {
     PaymentsService,
     FilesService,
     TelemetryShutdown,
+    ReadinessService,
   ],
 })
 export class AppModule {}

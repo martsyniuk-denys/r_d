@@ -206,12 +206,16 @@ services:
       - broker_password
       - storage_secret_key
     healthcheck:
-      # No shell and no curl in the image: the probe is the image's own node.
-      test: ['CMD', '/nodejs/bin/node', '-e', "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      # Readiness, not liveness: `up --wait` returns when the API can serve (Postgres
+      # answers), and a draining API leaves the healthy set. No shell and no curl in
+      # the image: the probe is the image's own node.
+      test: ['CMD', '/nodejs/bin/node', '-e', "fetch('http://127.0.0.1:3000/readyz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
       interval: 3s
       timeout: 3s
       retries: 20
       start_period: 5s
+    # SIGTERM → 5 s of drain (SHUTDOWN_DRAIN_MS) → close; the kill comes after this.
+    stop_grace_period: 15s
 
   # Outbox → broker. Several relays may run: rows are claimed with SKIP LOCKED.
   relay:
