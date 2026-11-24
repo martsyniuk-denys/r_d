@@ -411,7 +411,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | --- | --- | --- |
 | Persistent, constraints, migrations with a working revert, idempotent seed | `src/migrations/*` (8), `src/seed.ts` | *compose:* `down && up -d --wait`, the order is still there; *npm:* `npm run migrate:revert && npm run migrate` both exit 0; `npm run seed` twice → same rows. See [Migrations](#migrations-and-what-was-corrected-by-hand), [Seed](#seed) |
 | `EXPLAIN` / N+1 | `db/OPTIMIZATIONS.md`, `src/demo-nplus1.ts` | [Data layer](#data-layer); `npm run demo:nplus1` (query count of each way) |
-| PgBouncer transaction mode; restore drill `MATCH`; RTO/RPO | `pgbouncer/pgbouncer.ini`, `scripts/restore-drill.sh`, `RESTORE-DRILL.md` | `bash scripts/restore-drill.sh` → `MATCH`; RTO 1.7 s measured / 15 min committed, RPO 24 h |
+| PgBouncer transaction mode; restore drill `MATCH`; RTO/RPO | `pgbouncer/pgbouncer.ini`, `scripts/restore-drill.sh`, `RESTORE-DRILL.md` | `bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh` → `MATCH`; RTO 1.7 s measured / 15 min committed, RPO 24 h |
 | Cache-aside + jitter + single-flight; session survives restart; two Redis | `src/cache/*`, `src/sessions/*`, `docker-compose.yml` (`redis-cache`, `redis-queue`) | `npm run demo:cache` (50 reads of an expired key → 1 query), `npm run demo:session` (survives `kill -9`); [Redis](#redis-cache-sessions-limits-queue-redis-кеш-сесії-ліміти-черга) |
 | Presigned files, closed bucket, CDN | `src/files/*`, `src/edge.ts` | `npm run demo:upload`, `npm run demo:cdn` (bucket 403, edge MISS → HIT); [Files](#files-файли) |
 
@@ -571,16 +571,16 @@ StatefulSets, Jobs and Services and finds 0. Given the Secret itself as a contro
 `infra/config.ts` checks every name before it declares any resource, so a missing one stops
 `pulumi preview` with that name.
 
-**What was measured** (kind v0.33.0, one node, local Docker, 2026-11-23):
+**What was measured** (kind v0.33.0, one node, local Docker, 2026-11-24, commit 5ecd96b):
 
 ```
-npm run image:build && npm run cluster:up && npm run up      # 15 created, 53 s
+npm run image:build && npm run cluster:up && npm run up      # 15 created, 54 s
 BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/contour.mjs
   # created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4, exit 0
 BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/webhook.mjs
   # accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1 second-success-ignored=1 payments=1
-npm run demo:rollout                  # requests=30524 ok=30524 failed=0 rollout-seconds=21
-PROFILE=broken npm run demo:rollout   # requests=13626 failed=5664, exit 1 (no probes, no drain)
+npm run demo:rollout                  # requests=36176 ok=36176 failed=0 rollout-seconds=24
+PROFILE=broken npm run demo:rollout   # requests=8961 failed=311, exit 1 (no probes, no drain)
 npm run demo:pdb                      # healthy=3 evict-1=201 evict-2=429
 ```
 
@@ -735,7 +735,7 @@ docker compose start relay consumer
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
 | `npm run db:psql` | opens a psql shell on the running container |
 | `bash scripts/backup.sh` | `pg_dump -Fc` into a dated file under `backups/` |
-| `bash scripts/restore-drill.sh` | restores the newest dump into a throwaway container and prints `MATCH` |
+| `bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh` | restores the newest dump into a throwaway container and prints `MATCH` |
 | `bash rotate.sh` | rotates the password in Postgres, PgBouncer and the password file |
 | `npm run test:integration` | repositories against a Postgres the test run starts itself |
 | `npm run test:e2e` | the whole application over HTTP, through supertest |
