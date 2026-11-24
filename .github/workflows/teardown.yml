@@ -110,14 +110,23 @@ jobs:
       - name: Stand — base, then demo (RDS and ELBv2 answer 501 here)
         run: |
           bash scripts/aws.sh base up | tail -n 4
-          bash scripts/aws.sh demo up 2>&1 | grep -E 'created|failed|StatusCode: 501' | head -n 20 || true
+          # demo `up` exits non-zero here by design (RDS and ELBv2 → 501), so its exit code
+          # is not the signal; what it left in the state is, and the guard below reads it.
+          # --continue-on-error: the Lambda waits for its log group, and without the flag
+          # the first 501 stops the update before the function is ever created.
+          PULUMI_CONTINUE_ON_ERROR=true bash scripts/aws.sh demo up 2>&1 | grep -E 'created|failed|StatusCode: 501' | head -n 20 || true
+          declare -A before
           for s in base demo; do
             n="$(cd infra/$s && pulumi stack export --stack $s \
               | jq '[.deployment.resources[]? | select(.type | startswith("aws:"))] | length')"
             echo "state-before[$s]=$n"
+            before[$s]=$n
           done
-          # Zeros after a destroy of nothing prove nothing: no base, no teardown.
-          [ "$(cd infra/base && pulumi stack export --stack base | jq '.deployment.resources | length')" -gt 1 ]
+          # Zeros after a destroy of nothing prove nothing: an empty stack and a destroyed
+          # one give the same six zeros. Both stacks must hold something, or no teardown.
+          for s in base demo; do
+            [ "${before[$s]}" -ge 1 ] || { echo "::error::state-before[$s]=0: nothing to tear down, zeros would prove nothing"; exit 1; }
+          done
 
       - name: pulumi destroy — demo, then base
         timeout-minutes: 8 # a hang fails here, visibly, instead of eating the job
