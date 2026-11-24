@@ -6,4 +6,3 @@ config:
       Stack: base
       ManagedBy: pulumi
   hw31:githubSubject: repo:martsyniuk-denys@16865806/r_d@1325481547
-encryptionsalt: v1:KI+sdLFEc80=:v1:8ih5ei9Ij5uqEb0K:9ksHxXMs9xD5RVlLjSOWyTd0LzGAMg==
