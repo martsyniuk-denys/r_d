@@ -1,0 +1,168 @@
+# Deploy to the `kind` environment — reusable, called by pr.yml and deploy.yml.
+#
+# The stand is a single-node kind cluster raised inside this runner and gone with it;
+# the Pulumi program of HW #28 brings it to state, with a file backend in the
+# workspace (no Pulumi account). Order, each step able to stop the job:
+#
+#   1. OIDC gate     GitHub's ID token, signature checked against the issuer's JWKS,
+#                    iss/aud/sub against oidc/policy.json — or nothing below runs
+#   2. kind          the cluster, and the image pulled into its node BY DIGEST
+#   3. preview       pulumi preview --json → plan.json, and the base branch's program
+#                    previewed the same way → base-plan.json
+#   4. cost gate     plan.json vs base-plan.json → src/mapping.ts → USD/month vs the budget
+#   5. pulumi up     the digest from the build job's outputs, never a tag
+#   6. manifest      the digest that went in == the digest that was built; the app
+#                    secret's value occurs 0 times in the Deployment
+#   7. demo:rollout  a new pod template under load; failed ≠ 0 fails the job
+#   8. manifest      read back once more: deployment.json is the state the run left
+#
+# Two sets of secrets that never mix: the pipeline's (registry, cloud) do not exist —
+# GITHUB_TOKEN for the registry, the OIDC token for identity; the app's live in the
+# store (store/ci.enc), opened by STORE_KEY, a secret of this environment only, and
+# reach the pod as a K8s Secret at deploy time.
+name: deploy-kind
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      digest:
+        type: string
+        required: true
+      cost-bypass-label:
+        description: the bypass label when the PR carries it, empty otherwise
+        type: string
+        default: ''
+      base-sha:
+        description: the commit the change is measured against (the PR's base); empty = no base plan
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: deploy to kind, then demo:rollout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: kind
+    # The only job that may ask GitHub for an ID token; a file-level grant would hand
+    # it to every job, the ones running the PR's code included.
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    env:
+      APP_IMAGE: ${{ inputs.repository }}@${{ inputs.digest }}
+      STORE_SLUG: ci
+      MIN_REQUESTS: '2000'
+      OUT: out
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: OIDC gate — signature by jwks_uri, then iss / aud / sub
+        run: |
+          mkdir -p "$OUT"
+          token_file="$RUNNER_TEMP/oidc.jwt"
+          trap 'rm -f "$token_file"' EXIT
+          aud="$(jq -r .audience oidc/policy.json)"
+          # The token goes to a 0600 file and to the gate; it is never printed.
+          umask 077
+          curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$aud" | jq -r .value > "$token_file"
+          node scripts/oidc-gate.mjs --token-file "$token_file" --policy oidc/policy.json | tee "$OUT/oidc.txt"
+
+      - uses: ./.github/actions/node
+
+      - name: Pulumi CLI 3.276.0
+        uses: pulumi/actions@8e5e406f4007fca908480587cb9893c07090f58d # v7.0.0
+        with:
+          pulumi-version: 3.276.0
+
+      - name: kind, and the image pulled into the node by digest
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          kind version
+          npm run --silent cluster:create
+          bash scripts/cluster.sh pull "$APP_IMAGE"
+
+      - name: pulumi preview --json → plan.json
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+        run: npm run --silent plan > "$OUT/plan.json"
+
+      # The stack above is fresh, so plan.json starts from nothing; the base is what the
+      # base branch's own program leads to.
+      - name: pulumi preview --json of the base branch → base-plan.json
+        if: inputs.base-sha != ''
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+          BASE_SHA: ${{ inputs.base-sha }}
+        run: bash scripts/with-secrets.sh ci bash scripts/ci/base-plan.sh "$BASE_SHA" "$OUT/base-plan.json"
+
+      - name: Cost gate
+        env:
+          PLAN_JSON: ${{ env.OUT }}/plan.json
+          BASE_PLAN_JSON: ${{ inputs.base-sha != '' && format('{0}/base-plan.json', env.OUT) || '' }}
+          COST_BYPASS_LABEL: ${{ inputs.cost-bypass-label }}
+        run: npm run --silent gate:cost | tee "$OUT/cost.txt"
+
+      - name: pulumi up
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+        run: npm run up
+
+      - name: The manifest that went in — digest and secret
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+          BUILT_DIGEST: ${{ inputs.digest }}
+        run: |
+          kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "$OUT/deployment.json"
+          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" | tee "$OUT/manifest.txt"
+
+      - name: demo:rollout — failed must be 0
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+        run: npm run demo:rollout 2>&1 | tee "$OUT/rollout.txt"
+
+      # The snapshot above is from before the rollout (generation 1); the artifact keeps
+      # the Deployment as the run left it, checked again for digest and secret.
+      - name: The manifest after demo:rollout
+        env:
+          STORE_KEY: ${{ secrets.STORE_KEY }}
+          BUILT_DIGEST: ${{ inputs.digest }}
+        run: |
+          kubectl --context kind-marketplace -n marketplace get deploy marketplace-api -o json > "$OUT/deployment.json"
+          jq -r '"generation=\(.metadata.generation) observed=\(.status.observedGeneration) rev=\(.spec.template.spec.containers[0].env[] | select(.name=="REV") | .value)"' "$OUT/deployment.json"
+          bash scripts/with-secrets.sh ci bash scripts/ci/manifest.sh "$OUT/deployment.json" "$BUILT_DIGEST" | tee "$OUT/manifest.txt"
+
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl --context kind-marketplace -n marketplace get deploy,rs,pods -o wide || true
+          kubectl --context kind-marketplace -n marketplace get events --sort-by=.lastTimestamp | tail -n 30 || true
+
+      - name: Deploy evidence
+        if: always()
+        run: bash scripts/ci/evidence.sh deploy "$OUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: deploy-evidence
+          path: |
+            out/deploy-evidence.txt
+            out/deployment.json
+            out/plan.json
+            out/base-plan.json
+            out/rollout.txt
+          if-no-files-found: ignore

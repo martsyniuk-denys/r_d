@@ -1,0 +1,19 @@
+name: node
+description: Node 22 with the npm cache keyed on the lock file, then npm ci.
+inputs:
+  install:
+    description: run npm ci in the repository root
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: |
+          package-lock.json
+          infra/package-lock.json
+    - if: inputs.install == 'true'
+      shell: bash
+      run: npm ci --no-audit --no-fund

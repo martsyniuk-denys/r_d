@@ -50,7 +50,9 @@ export function loadSettings(): Settings {
     kubeContext: config.require('kubeContext'),
     namespace: config.require('namespace'),
     name: config.require('name'),
-    image: config.require('image'),
+    // CI deploys by digest (APP_IMAGE=<repo>@sha256:…), the one artifact it built;
+    // locally the stack's tag is the image `npm run image:build` made.
+    image: process.env.APP_IMAGE || config.require('image'),
     replicas,
     nodePort: config.requireNumber('nodePort'),
     // The pod template must change for a rollout to happen; a rebuilt image under

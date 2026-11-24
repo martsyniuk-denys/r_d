@@ -1,0 +1,141 @@
+# The one place the image is built — reusable, called by pr.yml and deploy.yml.
+#
+# Build once, promote by digest: the job pushes to GHCR and hands the digest out
+# through `outputs`; the deploy job takes it from there, never from a tag. The tag
+# ${{ github.sha }} is for people. The same job then checks what it pushed — the
+# image checks of HW #28 and the scan gate (step 4 of the ladder) — on the bytes
+# pulled back by that digest.
+#
+# The registry is reached with this job's GITHUB_TOKEN (packages: write); there is
+# no registry password anywhere. The build-stage npm token is a random decoy, as in
+# HW #28: there is no private npm registry, and it reaches the build only as a
+# BuildKit secret mount.
+name: build
+
+on:
+  workflow_call:
+    outputs:
+      repository:
+        description: ghcr.io/<owner>/<repo>
+        value: ${{ jobs.image.outputs.repository }}
+      image-ref:
+        description: the full reference with the human tag
+        value: ${{ jobs.image.outputs.image-ref }}
+      digest:
+        description: sha256 of the manifest that was pushed
+        value: ${{ jobs.image.outputs.digest }}
+      scan-exit:
+        description: exit code of npm run scan
+        value: ${{ jobs.image.outputs.scan-exit }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image:
+    name: image — build once, push, scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      repository: ${{ steps.names.outputs.repository }}
+      image-ref: ${{ steps.names.outputs.ref }}
+      digest: ${{ steps.build.outputs.digest }}
+      scan-exit: ${{ steps.scan.outputs.exit }}
+    env:
+      # The working threshold of HW #28: CRITICAL+HIGH findings that have a fix. The
+      # scanner's database changes daily, so the team moves this on purpose
+      # (vars.SCAN_MAX); demo:gates shows -1 failing and 99999 passing.
+      SCAN_MAX: ${{ vars.SCAN_MAX || '25' }}
+      # what scan.sh and demo:image look at: the pushed digest, tagged locally
+      IMAGE: marketplace-api:ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/node
+        with:
+          install: 'false'
+
+      - name: Names
+        id: names
+        run: |
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "ref=$repository:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build-stage token (a decoy — no private npm registry)
+        run: openssl rand -hex 16 > .npm_token
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.names.outputs.ref }}
+          secret-files: npm_token=.npm_token
+          # one manifest, not an index with attestations: the digest pushed is the
+          # digest the node pulls and the pod spec names
+          provenance: false
+          sbom: false
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: build.log — one line per build in this run
+        env:
+          REF: ${{ steps.names.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "build ref=$REF digest=$DIGEST run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT job=$GITHUB_JOB" >> build.log
+          cat build.log
+
+      - name: Pull back by digest
+        env:
+          REPOSITORY: ${{ steps.names.outputs.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker pull --quiet "$REPOSITORY@$DIGEST"
+          docker tag "$REPOSITORY@$DIGEST" "$IMAGE"
+
+      - name: Image checks (stages, shell, uid, token in history/config/layers)
+        run: |
+          npm run --silent demo:image | tee image.txt
+          awk -F= '/^stages=/{s=$2}/^shell-inside=/{sh=$2}/^runtime-uid=/{u=$2}/^token-in-/{t+=$2}
+            END{ok=(s>=2 && sh==0 && u!=0 && u!="" && t==0); print ok ? "image OK" : "image NOT production-grade"; exit !ok}' image.txt
+
+      - name: Scan gate (npm run scan, HW #28 threshold)
+        id: scan
+        run: |
+          set +e
+          npm run --silent scan | tee scan.txt
+          code=${PIPESTATUS[0]}
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Remove the token
+        if: always()
+        run: rm -f .npm_token
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-log
+          path: |
+            build.log
+            image.txt
+            scan.txt
+          if-no-files-found: ignore

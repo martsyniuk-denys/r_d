@@ -26,6 +26,33 @@ ENV_SLUG="${1:-dev}"; shift || true
 # the grader has no access to the store: the values are already in the environment
 if [ "${SKIP_VAULT:-0}" = "1" ]; then exec "$@"; fi
 
+# The CI slug. A runner has no .env and no secrets/: its store is store/ci.enc,
+# AES-256 under STORE_KEY — the one value of this store that GitHub holds (a secret
+# of the `kind` environment). The plaintext never touches the runner's disk: it is
+# decrypted into this process, exported, and the key is dropped before the command
+# runs, so neither the app nor Pulumi ever sees it. See scripts/store-ci.sh.
+if [ "$ENV_SLUG" = "ci" ]; then
+  if [ -z "${STORE_KEY:-}" ]; then
+    echo "with-secrets: STORE_KEY is not set — the key of store/ci.enc (in CI: secrets.STORE_KEY of the kind environment)" >&2
+    exit 1
+  fi
+  if ! plain="$(openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$ROOT/store/ci.enc" -pass env:STORE_KEY 2>/dev/null)"; then
+    echo "with-secrets: store/ci.enc does not decrypt with this STORE_KEY" >&2
+    exit 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    name="${line%%=*}"
+    if ! [[ "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+      echo "with-secrets: store/ci.enc has a line that is not NAME=value" >&2
+      exit 1
+    fi
+    export "$name=${line#*=}"
+  done <<< "$plain"
+  unset plain line name STORE_KEY
+  exec "$@"
+fi
+
 case "$ENV_SLUG" in
   dev|development) CREDS="$ROOT/.env" ;;
   *)               CREDS="$ROOT/.env.$ENV_SLUG" ;;
@@ -39,7 +66,7 @@ if [ ! -f "$CREDS" ]; then
   echo "               (tokens: node scripts/jwt-keys.mjs generate $ENV_SLUG)" >&2
   echo "               (files: STORAGE_* in .env, cp secrets/storage_secret_key.example secrets/storage_secret_key)" >&2
   echo "               (cluster: openssl rand -hex 24 > secrets/pulumi_passphrase)" >&2
-  echo "               (aws: AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY_FILE in .env, cp secrets/aws_secret_access_key.example secrets/aws_secret_access_key)" >&2
+  echo "               (aws: AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_KEY_FILE in .env, cp secrets/aws_secret_access_key.example secrets/aws_secret_access_key)" >&2
   echo "               (observability: OTEL_EXPORTER_OTLP_ENDPOINT, PROMETHEUS_URL, TRACE_API_URL, GRAFANA_* in .env, openssl rand -hex 16 > secrets/grafana_admin_password)" >&2
   echo "  no store at hand (CI, grading): export DATABASE_URL BROKER_URL REDIS_URL REDIS_QUEUE_URL JWT_* REFRESH_TOKEN_PEPPER STORAGE_* OTEL_EXPORTER_OTLP_ENDPOINT PROMETHEUS_URL TRACE_API_URL GRAFANA_* SKIP_VAULT=1" >&2
   exit 1
@@ -74,15 +101,18 @@ if [ -n "${STORAGE_SECRET_KEY_FILE:-}" ]; then
 fi
 
 # The AWS secret key of the stand (the fallback lane: LocalStack's `test`) lives in a
-# file named by AWS_SECRET_ACCESS_KEY_FILE and is exported as AWS_SECRET_ACCESS_KEY.
+# file named by AWS_SECRET_KEY_FILE and is exported as AWS_SECRET_ACCESS_KEY.
 # CI never comes here: there the credentials are short-lived, from the OIDC role.
-if [ -n "${AWS_SECRET_ACCESS_KEY_FILE:-}" ]; then
-  if [ ! -f "$AWS_SECRET_ACCESS_KEY_FILE" ]; then
-    echo "with-secrets: $CREDS points at $AWS_SECRET_ACCESS_KEY_FILE, which is missing." >&2
+# AWS_SECRET_KEY_FILE is the name in .env.example; the older AWS_SECRET_ACCESS_KEY_FILE
+# still works in a store written before HW-32.
+AWS_SECRET_KEY_FILE="${AWS_SECRET_KEY_FILE:-${AWS_SECRET_ACCESS_KEY_FILE:-}}"
+if [ -n "$AWS_SECRET_KEY_FILE" ]; then
+  if [ ! -f "$AWS_SECRET_KEY_FILE" ]; then
+    echo "with-secrets: $CREDS points at $AWS_SECRET_KEY_FILE, which is missing." >&2
     echo "  cp secrets/aws_secret_access_key.example secrets/aws_secret_access_key" >&2
     exit 1
   fi
-  AWS_SECRET_ACCESS_KEY="$(tr -d '\r\n' < "$AWS_SECRET_ACCESS_KEY_FILE")"
+  AWS_SECRET_ACCESS_KEY="$(tr -d '\r\n' < "$AWS_SECRET_KEY_FILE")"
   export AWS_SECRET_ACCESS_KEY
 fi
 
