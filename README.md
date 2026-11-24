@@ -446,10 +446,28 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | Criterion | Where | Check |
 | --- | --- | --- |
 | Liveness and readiness on different paths; readiness red on SIGTERM | `src/bootstrap.ts`, `src/health/readiness.service.ts`, `src/main.ts` | `curl localhost:3000/readyz` → `{"status":"ready","checks":{"database":"up","broker":"up"}}`; `docker compose kill -s SIGTERM api` → `/readyz` 503 at once, `/healthz` 200 through the 5 s drain, exit 0; e2e `probes.e2e.test.ts` |
-| Structured logs, one `trace_id`, no secrets | `src/observability/logger.ts`, `request-log.ts`, `amqp-trace.ts` | `docker compose logs --no-log-prefix api relay consumer \| grep <checkout_trace>` → lines from all three processes; `npm run demo:logs` → `secret-in-logs=0` |
-| RED metrics, OTel continues `traceparent`, dashboard as a file | `src/observability/metrics.ts`, `observability/grafana/dashboards/marketplace-red.json` | `demo/contour-trace.mjs` → 5 hops, 0 orphans; Grafana row *Main contour*; `npm run demo:metrics`, `demo:trace` |
+| Structured logs, one `trace_id`, no secrets | `src/observability/logger.ts`, `request-log.ts`, `amqp-trace.ts` | `docker compose logs --no-log-prefix api relay consumer \| grep <checkout_trace>` → lines from all three processes ([screenshot](evidence/logs-one-trace.png)); `npm run demo:logs` → `secret-in-logs=0` |
+| RED metrics, OTel continues `traceparent`, dashboard as a file | `src/observability/metrics.ts`, `observability/grafana/dashboards/marketplace-red.json` | `demo/contour-trace.mjs` → 5 hops, 0 orphans ([Jaeger screenshot](evidence/jaeger-trace.png)); Grafana row *Main contour* ([screenshot](evidence/grafana-dashboard.png)); `npm run demo:metrics`, `demo:trace` |
 | Tests: integration against a real DB, twice green; e2e of the contour; business logic without HTTP | `test/integration` (orders, products, `order-history.test.ts`, `payments.test.ts`), `test/e2e/orders.e2e.test.ts`, `test/unit/lifecycle.test.ts` | `npm run test:integration` (run it twice), `npm run test:e2e`, `npm run test:unit` |
 | A pipeline in which every gate can say no | `.github/workflows/*`, `demo/gates.sh` | `npm run demo:gates` → `<step>-ok=0`, `<step>-broken=1` for each gate; [CI/CD](#cicd) |
+
+#### Screenshots: logs, traces and the dashboard (ТЗ §7)
+
+All three come from one compose stack (`docker compose --profile obs up -d --wait`), after
+three runs of `demo/contour.mjs` and one of `demo/contour-trace.mjs`. The trace and the log
+lines are the same checkout, `trace_id 7bc1f67cff2f0d27bd70a3524e6d3f3d`.
+
+| What | Screenshot | How to get it again |
+| --- | --- | --- |
+| One checkout across api → relay → consumer: 32 spans, 3 services | [`evidence/jaeger-trace.png`](evidence/jaeger-trace.png) | the `ui=` link that `demo/contour-trace.mjs` prints |
+| The log lines of that checkout: 5 from api, 2 from relay, 3 from consumer, one `trace_id`, `authorization` redacted | [`evidence/logs-one-trace.png`](evidence/logs-one-trace.png) | `docker compose logs --timestamps api relay consumer \| grep <trace_id>` |
+| The RED dashboard and the *Main contour* row over the last 30 minutes | [`evidence/grafana-dashboard.png`](evidence/grafana-dashboard.png) | Grafana on `:22903`, dashboard `marketplace-red` |
+
+The *Errors* panel says *No data*: no request ended in 5xx in that window. Fault injection is
+off in the compose API; `npm run demo:metrics` and `demo:trace` turn it on in their own child
+and show the 5xx share and an `ERROR` span.
+
+![Jaeger: one checkout across three services](evidence/jaeger-trace.png)
 
 ## Environment variables
 
