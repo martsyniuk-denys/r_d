@@ -1,36 +1,675 @@
-# Marketplace API — Homework 09: contract first
+# Marketplace API — coursework (Node.js PRO)
 
-Chosen contract option: **B — runtime validation at the boundary**
-(NestJS + `express-openapi-validator`).
+A marketplace backend in NestJS on Postgres, built homework by homework and finished
+as the coursework: one order goes from the buyer's `POST /orders` through a
+transactional outbox, RabbitMQ and a background consumer to a signed payment webhook,
+and every step is read back by a separate request. One `docker compose up -d --wait`
+brings all of it up from a clean clone.
 
-`openapi/openapi.yaml` is not documentation sitting next to the code — it is the
-source of truth the validator checks **both requests and responses** against.
-Anything that contradicts the spec does not cross the boundary: an invalid request
-is rejected before it reaches a controller (400), and a response that has drifted
-away from its schema never reaches the client (500 instead of silent drift).
+The coursework is the part of this file down to [the appendix](#appendix-the-homeworks-one-by-one).
+The appendix is the record of every homework, and the grading table below points into it
+where an older homework is the evidence.
+
+- [Quick start](#quick-start) — clone, one command, three demos
+- [The main contour](#the-main-contour) — the sequence, by hand with curl
+- [Architecture](#architecture) — processes, layers, where the code is
+- [Domain note (ДЗ0)](#domain-note-дз0) — the domain, trade-offs, decision log
+- [Grading, block by block](#grading-block-by-block) — 11.1–11.7: where it is, how to check it
+- [Environment variables](#environment-variables)
+- [Security: OWASP Top 10:2025](#security-owasp-top-102025)
+- [Secrets and their rotation](#secrets-and-their-rotation)
+- [Kubernetes: the full contour](#kubernetes-the-full-contour) — API, workers, Postgres, RabbitMQ in kind via Pulumi
+- [Honest boundaries](#honest-boundaries) — what is not done, and where the edges are
+- [Running from source](#running-from-source) and [Commands](#commands)
 
 ## Quick start
 
+Needs Docker with Compose v2 and nothing else: no Node on the host, no `.env`, no npm
+token, no access to the secret store.
+
 ```bash
-npm install
-cp .env.example .env                 # real values live here; .env is git-ignored
-cp secrets/db_password.example secrets/db_password
-cp secrets/redis_password.example secrets/redis_password
-cp secrets/storage_secret_key.example secrets/storage_secret_key   # + the STORAGE_* lines of .env.example in .env
-node scripts/jwt-keys.mjs generate dev    # ES256 signing key + refresh pepper into secrets/jwt/dev/
-docker compose up -d --wait          # PgBouncer 56432, Postgres behind it, RabbitMQ 5672, Redis 56379/56380, RustFS 59000, Pact broker 9292
-npm run build                        # migrations and scripts run from dist/
-npm run migrate && npm run seed      # schema from src/migrations + fixture rows
-npm run start:vault                  # http://localhost:3000 — bare `npm start` refuses to run without the keys
+git clone https://github.com/martsyniuk-denys/r_d && cd r_d && git checkout feature/homework_31
+docker compose up -d --wait                       # build, keys, migrate + seed, api/relay/consumer; returns when /readyz is 200
+docker compose run --rm demo demo/contour.mjs     # the whole contour, exit 0
+docker compose run --rm demo demo/webhook.mjs     # signature, amount, duplicate: each = 1, exit 0
 ```
 
-The database schema comes from the TypeORM migrations — `npm run db:schema` and
-`npm run db:seed` are the raw-SQL path of the data-layer homework and belong to the
-`EXPLAIN` exercise below, not to running the app.
+`up --wait` builds `docker/Dockerfile` (the production image) once, then runs it in five
+roles, in order: `keys` generates the application's own secrets into a volume (once, kept
+on later runs), `migrate` applies the TypeORM migrations and the idempotent seed, and
+`api`, `relay` and `consumer` start after it. The API's healthcheck is `/readyz`, so the
+command returns when the API can actually serve.
 
-`npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode.
-A watcher never exits, so it can never report a non-zero exit code, and the
-fail-fast criterion below would be untestable. Watch mode lives in `npm run start:dev`.
+The contour demo prints each step and a summary, and its exit code is the verdict:
+
+```
+contour against http://api:3000
+
+  ok    create: HTTP 201, o_92 pending, total 1029700
+  ok    idempotent replay: same key → o_92, Idempotency-Replay: true
+  ok    access and validation: other buyer 403, no token 401, qty 0 → 400 application/problem+json; charset=utf-8
+  ok    background: consumer confirmed it: status confirmed
+  ok    payment webhook: HTTP 200, verdict applied
+  ok    operator ships: admin → 200 shipped; buyer → 403
+  ok    final read: GET /orders/o_92 → shipped
+  ok    history: pending(checkout) → confirmed(fulfilment) → paid(payment-webhook) → shipped(admin:131)
+
+order=o_92
+created=1
+replayed=1
+confirmed=1
+paid=1
+final=shipped
+history=4
+```
+
+```
+webhook against http://api:3000
+
+  ok    forged signature: HTTP 401, order still pending
+  ok    amount mismatch: HTTP 422 https://marketplace.example/problems/amount-mismatch, order still confirmed
+  ok    accepted: HTTP 200, applied → paid
+  ok    duplicate: HTTP 200, verdict duplicate, 'paid' in history 1×
+  ok    second success, another event id: HTTP 200, verdict ignored, 'paid' in history 1×
+
+accepted=1
+rejected-signature=1
+amount-mismatch=1
+duplicates=1
+second-success-ignored=1
+payments=1
+```
+
+All of this section, the curl walk-through below and the checks of the grading table were
+run from a fresh clone by `scripts/acceptance.sh`; its output, with every command and exit
+code, is [`evidence/acceptance.txt`](evidence/acceptance.txt).
+
+**Observability** is a profile of the same file: Prometheus, Jaeger and Grafana with the
+dashboard provisioned from `observability/grafana/dashboards/marketplace-red.json`.
+
+```bash
+docker compose --profile obs up -d --wait
+docker compose run --rm demo demo/contour-trace.mjs   # one trace across api → relay → consumer, read back from Jaeger
+```
+
+```
+checkout: trace f812f14e6a7d581a634d57d6303c4b58, 32 spans from marketplace-api, marketplace-consumer, marketplace-relay
+    ok   marketplace-api       POST /orders                         ← caller (traceparent header)
+    ok   marketplace-relay     order.placed publish                 ← marketplace-api orders.place
+    ok   marketplace-consumer  fulfilment.order-placed process      ← marketplace-relay order.placed publish
+    ok   marketplace-relay     order.status_changed publish         ← marketplace-consumer fulfilment.order-placed process
+    ok   marketplace-api       api.realtime process                 ← marketplace-relay order.status_changed publish
+  ok    checkout: every hop in one trace: 5 hops found
+  ok    checkout: no orphan spans: 0 spans whose parent is not in the trace
+```
+
+| What | Where | Login |
+| --- | --- | --- |
+| API | `http://localhost:3000` (spec: `openapi/openapi.yaml`) | seed users below |
+| Grafana, dashboard | `http://127.0.0.1:22903/d/marketplace-red` | `admin` / `secrets/grafana_admin_password.example` |
+| Jaeger | `http://127.0.0.1:22904` | — |
+| Prometheus | `http://127.0.0.1:22901` | — |
+| RabbitMQ management | `http://localhost:15672` | `marketplace` / `marketplace_dev_password` |
+
+Seed users, all with the password `marketplace-dev-password`: buyers
+`olena.kovalenko@example.com` and `andrii.shevchenko@example.com`, the operator
+`ops.admin@example.com` (role `admin`), seller `leader.shoes@example.com`.
+
+**Before you run it.** The infrastructure containers have fixed names
+(`marketplace-postgres` and so on) and fixed host ports: 3000, 5672, 15672, 9292, 55432,
+56432, 56379, 56380, 59000, and with `obs` 22901, 22903, 22904. If another copy of this
+stack is running, stop it first (`docker compose down` in that directory). The `obs`
+profile and the standalone stand (`npm run obs:up`) use the same ports, so run one of
+them, not both. If an `up` failed half-way on a taken port, the containers it left behind
+may have no network: `docker compose --profile obs up -d --wait --force-recreate`.
+
+**Restart and teardown.** `docker compose down && docker compose up -d --wait` keeps the
+data (named volumes) and the generated keys, so a token issued before the restart still
+works after it. `docker compose --profile obs --profile demo down -v` removes everything.
+The image `marketplace-api:compose` is built only when it is missing (it is never pulled:
+it exists in no registry), so after a `git pull` or a change in the code, rebuild it with
+`docker compose up -d --wait --build`.
+
+## The main contour
+
+An order is placed by a buyer, confirmed by a background consumer, paid by a signed
+provider webhook and read back by separate requests. The buyer hears about every status
+change over SSE or WebSocket.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Buyer
+    participant API as API (Nest)
+    participant DB as Postgres (via PgBouncer)
+    participant Relay
+    participant MQ as RabbitMQ
+    participant Consumer
+    actor Provider as Payment provider
+
+    Buyer->>API: POST /orders + Idempotency-Key
+    API->>DB: BEGIN, reserve stock per line, order 'pending',<br/>payment intent (frozen amount), outbox order.placed, COMMIT
+    API-->>Buyer: 201 {status: pending}
+    Relay->>DB: SELECT … FROM outbox FOR UPDATE SKIP LOCKED
+    Relay->>MQ: publish order.placed (traceparent header), wait for confirm
+    Relay->>DB: UPDATE outbox SET published_at
+    MQ->>Consumer: deliver (prefetch 32, manual ack)
+    Consumer->>DB: BEGIN, inbox mark, fulfilment, pending→confirmed,<br/>history, outbox order.status_changed, COMMIT
+    Consumer->>MQ: ack
+    Relay->>MQ: publish order.status_changed
+    MQ->>API: realtime feed → SSE/WS event to the owner only
+    Provider->>API: POST /payments/webhook, X-Signature: sha256=HMAC(raw body)
+    API->>DB: BEGIN, payment_events (UNIQUE provider event id),<br/>amount == frozen? confirmed→paid, history, outbox, COMMIT
+    API-->>Provider: 200 {verdict: applied}
+    Buyer->>API: GET /orders/{id}, GET /orders/{id}/history
+    API-->>Buyer: paid, and every step with who made it
+```
+
+The lifecycle is one table in `src/orders/lifecycle.ts`, enforced by the SQL rather than
+only by the map: a transition is `UPDATE … WHERE status = ANY(<allowed sources>)`, so two
+concurrent transitions out of one status cannot both win. Every change writes the order
+row, an `order_status_history` row and an `order.status_changed` outbox row in one
+transaction.
+
+```
+pending ──consumer──► confirmed ──webhook──► paid ──admin──► shipped
+   │  └──────────────webhook─────────────────►┘│                │
+   └──────► cancelled ◄──┘                    └──► refunded ◄──┘
+```
+
+### By hand, with curl
+
+Against the compose stack from [Quick start](#quick-start). Needs `curl`, `node` (only to
+pull a field out of JSON) and `openssl` (to sign the webhook like the provider does).
+
+```bash
+B=http://localhost:3000
+TOKEN=$(curl -s $B/auth/login -H 'content-type: application/json' \
+  -d '{"email":"olena.kovalenko@example.com","password":"marketplace-dev-password"}' \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).access_token')
+
+# 1. checkout — Idempotency-Key is required by the contract
+CREATED=$(curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -H "idempotency-key: $(uuidgen)" -d '{"items":[{"product_id":"p_1","qty":1}]}')
+echo "$CREATED"
+# {"id":"o_13","status":"pending","buyer_id":"5","currency":"UAH","items":[{"product_id":"p_1","qty":1,"unit_price_cents":249900}],"total_cents":249900,…}
+ORDER=$(echo "$CREATED" | node -pe 'JSON.parse(require("fs").readFileSync(0)).id')
+TOTAL=$(echo "$CREATED" | node -pe 'JSON.parse(require("fs").readFileSync(0)).total_cents')
+
+# 2. a separate read, a moment later — the consumer has been there
+sleep 1
+curl -s $B/orders/$ORDER -H "authorization: Bearer $TOKEN"; echo
+# {"id":"o_13","status":"confirmed",…}
+
+# 3. the provider's webhook: HMAC-SHA256 over the exact raw body with the key from the keys volume
+SECRET=$(docker compose run --rm -T --no-deps --entrypoint cat demo /keys/PAYMENT_WEBHOOK_SECRET)
+BODY="{\"event_id\":\"evt_$ORDER\",\"order_id\":\"$ORDER\",\"amount_cents\":$TOTAL,\"currency\":\"UAH\",\"outcome\":\"succeeded\"}"
+SIG=sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
+curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"; echo
+# {"event_id":"evt_o_13","order_id":"o_13","verdict":"applied","order_status":"paid"}
+curl -s $B/payments/webhook -H 'content-type: application/json' -H "x-signature: $SIG" -d "$BODY"; echo
+# {"event_id":"evt_o_13","order_id":"o_13","verdict":"duplicate","order_status":"paid"}
+
+# 4. the final state, and how it got there
+curl -s $B/orders/$ORDER/history -H "authorization: Bearer $TOKEN"; echo
+# {"items":[{"id":7,"status":"pending","previous_status":null,"changed_by":"checkout",…},
+#           {"id":8,"status":"confirmed","previous_status":"pending","changed_by":"fulfilment",…},
+#           {"id":9,"status":"paid","previous_status":"confirmed","changed_by":"payment-webhook",…}]}
+
+# 5. the edge: no Idempotency-Key → 400 problem+json, before a controller runs
+curl -s $B/orders -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"items":[{"product_id":"p_1","qty":1}]}'; echo
+# {"type":"https://marketplace.example/problems/validation-error","title":"Bad Request","status":400,
+#  "detail":"request/headers must have required property 'idempotency-key'","instance":"/orders"}
+
+# 6. the owner's SSE stream; Last-Event-ID: 0 replays every change from the history, then it
+#    stays open for live ones (-m 3 closes it after 3 s; drop -m to keep listening)
+curl -sN -m 3 $B/orders/$ORDER/events -H "authorization: Bearer $TOKEN" -H 'last-event-id: 0'
+# id: 7
+# event: order.status
+# data: {"id":7,"order_id":"o_13","status":"pending","previous_status":null,…}
+# …
+```
+
+| Method and path | Who | What |
+| --- | --- | --- |
+| `POST /orders` | buyer | checkout; `Idempotency-Key` required; 201, 409 on shortage (all lines roll back) |
+| `GET /orders?cursor=` | buyer: own, admin: all | cursor pagination |
+| `GET /orders/{id}` | owner or admin | 403 for another buyer, 404 for none |
+| `GET /orders/{id}/history` | owner or admin | every transition, who made it |
+| `GET /orders/{id}/events` | owner or admin | SSE, `Last-Event-ID` replays from the history |
+| `PATCH /orders/{id}/status` | admin (`RolesGuard`) | along the lifecycle only; 409 otherwise |
+| `POST /payments/webhook` | the provider (signature) | 401 bad signature, 422 amount mismatch, 200 duplicate with no effect |
+| `GET /healthz`, `GET /readyz` | probes | liveness; readiness (Postgres, 503 on SIGTERM) |
+| `GET /metrics` | Prometheus | RED + contour metrics |
+
+The full contract, with every schema and error, is `openapi/openapi.yaml`; the
+validator checks requests and responses against it at runtime.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([Buyer / admin]) -->|HTTP, WS, SSE| api
+    provider([Payment provider]) -->|signed webhook| api
+
+    subgraph app[One image, three processes]
+        api[api<br/>dist/main.js<br/>controller → service → repository]
+        relay[relay<br/>dist/relay.js]
+        consumer[consumer<br/>dist/consumer.js]
+    end
+
+    api -->|one COMMIT: order + outbox| pgb[(PgBouncer<br/>transaction mode)]
+    relay -->|SKIP LOCKED| pgb
+    consumer -->|one tx per message| pgb
+    pgb --> pg[(Postgres 16)]
+
+    relay -->|publish + confirm| mq{{RabbitMQ}}
+    mq -->|order.placed| consumer
+    mq -->|order.status_changed| api
+    mq -. delivery limit .-> dlq[(DLQ)]
+
+    api -->|presigned URLs| s3[(RustFS / S3, private)]
+
+    api & relay & consumer -. OTLP .-> jaeger[Jaeger]
+    prom[Prometheus] -. scrape /metrics .-> api & relay & consumer
+    grafana[Grafana] --> prom & jaeger
+```
+
+The API is layered, and the layers are enforced, not only drawn: `npm run gate:arch`
+(dependency-cruiser, `.dependency-cruiser.cjs`) fails the build when a controller imports a
+repository, the pool, the outbox, the broker or a checkout transaction
+(`controllers-stay-thin`), or when the catalog reaches into the order flow
+(`catalog-does-not-know-orders`). `test/gates/arch` holds one planted violation of each, and
+`npm run demo:gates` shows the gate saying no to them. Every log line carries `layer`
+(`http`, `orders.controller`, `orders.service`, …), so the layers are visible at run time too.
+
+| Layer | Where | What it may do |
+| --- | --- | --- |
+| edge | `src/bootstrap.ts`, `openapi/openapi.yaml`, `src/common/problem.filter.ts` | validate against the spec, one error format (`application/problem+json`), raw body for the webhook, probes, `/metrics` |
+| controller | `src/orders/orders.controller.ts`, `src/payments/payments.controller.ts`, … | read the request, call one service method, map the result; guards: `AccessTokenGuard`, `RolesGuard` |
+| service | `src/orders/orders.service.ts`, `src/payments/payments.service.ts` | business rules: ownership, lifecycle, amount check, idempotency |
+| domain operations | `src/orders/place-order.ts`, `src/orders/lifecycle.ts`, `src/orders/place-order-once.ts`, `src/payments/apply-payment.ts`, `src/outbox/outbox.ts` | the transactions themselves; know SQL, not HTTP |
+| repository | `src/repositories/*.ts` | queries; no business decisions |
+| background | `src/relay.ts` + `src/outbox/relay.ts`, `src/consumer.ts` + `src/messaging/order-placed.consumer.ts`, `src/realtime/order-status.feed.ts` | outbox → broker; broker → effect; broker → realtime |
+| config | `src/config/env.schema.ts`, `src/config/secret-files.ts` | the only door to `process.env`; fail-fast |
+
+| Directory | What is in it |
+| --- | --- |
+| `src/orders`, `src/payments` | the contour: checkout, lifecycle, webhook |
+| `src/outbox`, `src/messaging` | outbox table and relay; topology, publisher with confirms, consumer |
+| `src/realtime` | WebSocket gateway, SSE, owner check, the cross-process feed |
+| `src/auth`, `src/health`, `src/observability` | tokens and guards; probes and drain; logs, metrics, tracing |
+| `src/migrations`, `src/entities`, `src/seed.ts`, `src/migrate.ts` | schema of record; the compose one-shot |
+| `src/cache`, `src/sessions`, `src/ratelimit`, `src/queue`, `src/files`, `src/storage` | Redis and file homeworks (see [Honest boundaries](#honest-boundaries)) |
+| `test/unit`, `test/integration`, `test/e2e`, `test/contract`, `test/gates` | the test levels |
+| `docker/Dockerfile`, `docker-compose.yml`, `infra/`, `k8s/`, `.github/workflows/` | image, local stand, Pulumi, kind, pipeline |
+| `demo/`, `scripts/` | measured demos; operational scripts |
+
+## Domain note (ДЗ0)
+
+| | |
+| --- | --- |
+| **Domain and actors** | A marketplace of goods. Buyers order, sellers list products, an operator (`admin`) moves orders after payment, and an external payment provider reports payments by webhook. |
+| **Main entity** | The order: lines with prices frozen at checkout, a total in minor units, an owner, and a status with a recorded history. |
+| **Main scenario** | Checkout (`pending`) → fulfilment by a background consumer (`confirmed`) → payment webhook (`paid`) → operator (`shipped`); read back by `GET /orders/{id}` and `/history`, pushed live to the owner. |
+| **Invariants** | Stock never goes below zero and is never sold twice. The paid amount equals the total frozen at checkout. A status moves only along the lifecycle table and never back. An order is visible only to its owner and the operator. |
+| **Irreversible operations and their keys** | Placing an order — the `Idempotency-Key` header, scoped to route and user, stored with the request hash in Postgres. Applying a payment — the order itself (`payment_intents` primary key `order_id`: a second success under another `event_id` is `ignored`), and the provider's `event_id` (`UNIQUE`) against redelivery. Fulfilment — the event id derived from the order (`processed_messages`). |
+| **Background work** | The relay (outbox → RabbitMQ), the consumer (fulfilment + confirmation), the API's realtime feed. All are at-least-once with an idempotent effect. |
+| **Load and failure expectations** | Bursts on one product (50 parallel checkouts on one SKU must sell exactly the stock). The broker may be down without stopping checkout. A process may die between any two steps. Data survives a restart; RTO 15 min committed (1.7 s measured), RPO 24 h. |
+
+### Trade-offs
+
+- **Transactional outbox, not publish-after-commit**, because the order and the event must
+  be one fact: a crash between `COMMIT` and `publish` loses the event, and a publish before
+  `COMMIT` announces an order that may roll back. Otherwise: a dual write with a
+  reconciliation job. The price is latency of one relay poll and at-least-once delivery.
+- **Atomic `UPDATE … SET stock = stock - n WHERE stock >= n`, not `SELECT … FOR UPDATE`**,
+  because the check and the write are one statement and hold the row lock for the shortest
+  time; lines are reserved in product-id order, so two carts cannot deadlock. Otherwise:
+  `SERIALIZABLE` + retry on `40001` (kept, for the wallet checkout).
+- **Idempotency keys in Postgres, not Redis**, because the key must commit together with
+  the order it protects: a key in Redis can survive a rolled-back order or vanish under
+  one that committed. Otherwise: Redis `SET NX` with a TTL, and the window that comes with it.
+- **Webhook deduplication by a `UNIQUE` provider event id in an append-only table**, because
+  the provider retries and its id is the business identity of the payment. A rejected
+  (422) delivery is journaled too. Otherwise: a check-then-insert, which two retries race.
+- **The broker is reported in `/readyz`, not gating it**, because with the outbox the API
+  takes orders without RabbitMQ — gating would turn a broker outage into a full outage.
+  Otherwise: a readiness that fails with any dependency.
+- **`prefetch = 32`**, because one message is one short transaction and the pool has 10
+  connections: `prefetch = 1` leaves the pool idle across every network round trip, and
+  `32 ×` processing time stays far below RabbitMQ's 30 min consumer timeout.
+- **PgBouncer in transaction mode**, because the API, relay and consumer each want a pool
+  and Postgres pays for every connection. Cost: no session state, so no `LISTEN/NOTIFY` —
+  which is why the realtime feed goes through RabbitMQ.
+- **Runtime validation against the spec (option B), not codegen**, because a response that
+  drifts from the spec becomes a 500 at the boundary instead of a silent contract break.
+- **ES256 with an algorithm allowlist, not HS256**, because the verifying side never holds
+  a key that can sign, and the token cannot choose its own algorithm.
+- **Application secrets as files (`NAME_FILE`), not environment values**, because a file
+  can be rotated without a restart and does not show up in `docker inspect`.
+
+### Decision log
+
+| Date | Decision | Why |
+| --- | --- | --- |
+| 2026-09-01 | Contract first: `openapi/openapi.yaml` is validated at runtime, both ways | the spec cannot drift from the code |
+| 2026-09-01 | Config through one zod schema, fail-fast with every broken variable named | a misconfigured process must not half-start |
+| 2026-09-15 | Money as integer minor units; schema only through migrations (`synchronize: false`) | no rounding; every schema change is read before it runs |
+| 2026-09-15 | Checkout as atomic conditional `UPDATE`s in one transaction | no oversell without long locks |
+| 2026-09-30 | PgBouncer in transaction mode; nightly `pg_dump`; restore drill with `MATCH` | connections are scarce; a backup is only a backup once restored |
+| 2026-10-01 | RabbitMQ with publisher confirms, manual ack after the effect, DLQ by delivery limit | at-least-once, and a poisoned message stops looping |
+| 2026-10-22 | Transactional outbox + inbox; `Idempotency-Key` in Postgres | one commit for the fact and its event |
+| 2026-10-30 | ES256 access + rotated refresh with family revocation; logout = refresh revoke + access denylist | a stolen refresh token is detected on its first reuse |
+| 2026-11-16 | Distroless non-root image, Pulumi on kind, PDB; one build promoted by digest through CI gates | what was tested is what runs |
+| 2026-11-23 | The contour on Postgres: lifecycle table enforced in SQL, payment by signed webhook, history per change | the order's life is auditable and race-free |
+| 2026-11-23 | The app in compose with one-shot `keys` and `migrate`; secrets as files | a clean clone comes up with one command |
+| 2026-11-23 | `/healthz` vs `/readyz`; readiness red on SIGTERM, then drain | no request lands on a closing process |
+| 2026-11-23 | Trace context stored in the outbox row and carried in AMQP headers | one trace across three processes, though the relay runs later |
+
+## Grading, block by block
+
+Each row: where it is, the command that shows it, and what it prints. Commands marked
+*compose* run against the [Quick start](#quick-start) stack; *npm* ones need
+[Running from source](#running-from-source).
+
+### Block → path → what replaced the course tool, and why
+
+| Block | Implemented | Path | Tool here | Replaced, and why |
+| --- | --- | --- | --- | --- |
+| 11.1 Design | yes, every row | course | ДЗ0 note in this README; Nest controller → service → repository, `layer` field in logs (ДЗ 20); one zod schema, fail-fast (ДЗ 7); OpenAPI (ДЗ 6) | — |
+| 11.2 Contour | yes, every row | course | atomic conditional `UPDATE` in one transaction (ДЗ 10); `Idempotency-Key` in Postgres (ДЗ 15); runtime spec validator + Pact (ДЗ 6, 12) | — |
+| 11.3 Data | yes, every row | course | Postgres + TypeORM migrations (ДЗ 8, 9); PgBouncer transaction mode, `pg_dump` + restore drill (ДЗ 11); two Redis (ДЗ 16) | object storage: **RustFS** instead of MinIO — MinIO no longer publishes images; the S3 API is the same. CDN: an edge cache process (`src/edge.ts`), no cloud CDN account |
+| 11.4 Security | yes, every row | course + own | ES256 tokens with rotated refresh (ДЗ 17); webhook HMAC, dedup, amount (ДЗ 15); Redis sliding-window limit (ДЗ 16) | secret store: **own** — git-ignored files + `NAME_FILE` locally, AES-encrypted `store/ci.enc` in CI, instead of Infisical — no external account needed by a reviewer; dev ≠ prod values and live rotation are shown the same way ([Secrets and their rotation](#secrets-and-their-rotation)) |
+| 11.5 Asynchrony | yes, every row | course | RabbitMQ with confirms and DLQ (ДЗ 14); outbox + inbox (ДЗ 15); SKIP LOCKED workers, retry on `40001`/`40P01` (ДЗ 10); WS + SSE (ДЗ 13) | — |
+| 11.6 Delivery | yes, every row | course | compose `up -d --wait` (ДЗ 2, 7–10); distroless image (ДЗ 19); Pulumi on kind (ДЗ 19); GitHub Actions deploy to kind by digest (ДЗ 22) | AWS (ДЗ 21): **LocalStack** as the fallback lane — no paid AWS account; the teardown check is the same script |
+| 11.7 Operations | yes, every row | course | `/healthz` + `/readyz` (ДЗ 19); pino JSON logs with `trace_id` (ДЗ 20); Prometheus, OpenTelemetry → Jaeger, Grafana dashboard as a file (ДЗ 20); Jest + supertest + Pact (ДЗ 12); GitHub Actions gates (ДЗ 22) | — |
+
+### 11.1 Design and architecture
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| ДЗ0 note: domain table, trade-offs, decision log | [Domain note (ДЗ0)](#domain-note-дз0) | — |
+| ≥ 3 layers, logic outside controllers | [Architecture](#architecture); `scripts/gates/arch.sh` | `npm run gate:arch` → exit 0; `demo/gates.sh` shows it failing on a planted violation (`arch-broken=1`) |
+| Config fail-fast, exit ≠ 0, names the variable | `src/config/env.schema.ts`, `src/main.ts` | *compose:* `docker compose run --rm --no-deps -e PAYMENT_WEBHOOK_SECRET_FILE= -e PAYMENT_WEBHOOK_SECRET=short api; echo $?` → `PAYMENT_WEBHOOK_SECRET: must be at least 32 characters (set, value withheld)`, `1`. More in [Fail-fast](#fail-fast-on-a-broken-variable) |
+| Architecture diagram, API description, runbook | [Architecture](#architecture), `openapi/openapi.yaml`, [Quick start](#quick-start) | `npm run lint` → valid spec |
+| Bonus: OWASP Top 10:2025 | [Security](#security-owasp-top-102025) | — |
+
+### 11.2 Main contour and correctness
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Full contour: create → background → status → final read by a separate request | `src/orders/*`, `src/messaging/order-placed.consumer.ts`, `src/payments/*` | *compose:* `docker compose run --rm demo demo/contour.mjs` → `created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4`, exit 0; e2e `runs the whole contour` |
+| 50 concurrent, no oversell or lost update; a shortage rolls everything back | `src/orders/place-order.ts`; `src/concurrency/checkout.ts` | e2e `sells exactly the stock under a parallel burst` (30 requests on stock 5 → 5 × 201, 25 × 409, stock 0) and `rolls the whole checkout back when one line is short`; *npm:* `npm run demo:race` (50 parallel on stock 10, see [Race](#race-npm-run-demorace)) |
+| Contract machine-checked: cursor pagination, `Idempotency-Key` required, problem+json 4xx | `openapi/openapi.yaml`, `src/bootstrap.ts`, `src/common/problem.filter.ts`, `src/common/cursor.ts` | `npm run check`; the curl step 5 above (400 problem+json without the key); e2e `keeps 400, 401, 403 and 422 apart`; Pact: `npm run test:contract && npm run verify:provider` |
+| A repeated irreversible operation has one effect; the key comes from the business entity | The payment is keyed by the order: `payment_intents` has `order_id` as its primary key, and `src/payments/apply-payment.ts` locks that row, so the order can be paid once whatever `event_id` the sender puts in. Fulfilment is keyed by the order too: `eventId = sha256('order.placed:' + orderId)` (`src/messaging/events.ts`, `processed_messages`). Checkout is the one place with a client key (`src/orders/place-order-once.ts`, `route:user:key` + request hash): before the order exists there is no entity to derive a key from, and the hash ties the key to the cart (same key, other cart → 422) | *compose:* `demo/webhook.mjs` → `duplicates=1 second-success-ignored=1 payments=1` (the same order paid twice under two event ids → one `paid`); contour demo `idempotent replay` (`Idempotency-Replay: true`); `npm run demo:outbox` → `requests=2 orders=1 outbox=1 deliveries=1 effect=1`; `payments.test.ts`, unit `checkout-request.test.ts` |
+
+### 11.3 Data
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Persistent, constraints, migrations with a working revert, idempotent seed | `src/migrations/*` (8), `src/seed.ts` | *compose:* `down && up -d --wait`, the order is still there; *npm:* `npm run migrate:revert && npm run migrate` both exit 0; `npm run seed` twice → same rows. See [Migrations](#migrations-and-what-was-corrected-by-hand), [Seed](#seed) |
+| `EXPLAIN` / N+1 | `db/OPTIMIZATIONS.md`, `src/demo-nplus1.ts` | [Data layer](#data-layer); `npm run demo:nplus1` (query count of each way) |
+| PgBouncer transaction mode; restore drill `MATCH`; RTO/RPO | `pgbouncer/pgbouncer.ini`, `scripts/restore-drill.sh`, `RESTORE-DRILL.md` | `bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh` → `MATCH`; RTO 1.7 s measured / 15 min committed, RPO 24 h |
+| Cache-aside + jitter + single-flight; session survives restart; two Redis | `src/cache/*`, `src/sessions/*`, `docker-compose.yml` (`redis-cache`, `redis-queue`) | `npm run demo:cache` (50 reads of an expired key → 1 query), `npm run demo:session` (survives `kill -9`); [Redis](#redis-cache-sessions-limits-queue-redis-кеш-сесії-ліміти-черга) |
+| Presigned files, closed bucket, CDN | `src/files/*`, `src/edge.ts` | `npm run demo:upload`, `npm run demo:cdn` (bucket 403, edge MISS → HIT); [Files](#files-файли) |
+
+### 11.4 Security
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Logout revokes refresh and access; refresh reuse revokes the family; algorithm allowlist | `src/auth/auth.service.ts`, `src/auth/keys.ts` | e2e `kills both tokens on logout`, `revokes the whole family`; `npm run demo:auth`, `npm run demo:reuse`; [Auth](#auth-автентифікація-та-авторизація) |
+| 401 vs 403; role by guard, ownership in the service; realtime only to the owner | `src/auth/guards.ts`, `src/orders/orders.service.ts`, `src/realtime/order-access.ts` | contour demo `access and validation` (403 other buyer, 401 no token), `operator ships` (buyer → 403); `npm run demo:realtime` |
+| Validation of the contour input; one error format | `openapi/openapi.yaml` (runtime validator), `src/common/problem.filter.ts` | `qty 0 → 400 application/problem+json` in the contour demo |
+| Secrets not in code, git or image layers | `.gitignore`, `.dockerignore`, `src/config/secret-files.ts`, `src/compose-keys.ts` | `npm run demo:image` → `token-in-history=0 token-in-config=0 token-in-layers=0`; `docker inspect r_d-api-1 --format '{{.Config.Env}}'` shows file paths (`*_FILE`) and URLs without passwords, no secret value |
+| Edge: rate limit 429 + `Retry-After` on a shared store; webhook signature, duplicate, amount | `src/ratelimit/sliding-window.ts`, `src/payments/signature.ts` | `npm run demo:ratelimit`; *compose:* `demo/webhook.mjs` → `accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1 second-success-ignored=1` |
+| Bonus: secret store dev ≠ prod, rotation live | `scripts/with-secrets.sh`, `store/`, `rotate.sh`, `scripts/jwt-keys.mjs` | [Secrets and their rotation](#secrets-and-their-rotation) |
+
+### 11.5 Asynchrony
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Background work changes state, read by a separate request | `src/messaging/order-placed.consumer.ts` | contour demo `background: consumer confirmed it`; e2e consumer in-process `pending → confirmed` |
+| Outbox in one `COMMIT`; publisher confirms; prefetch justified; at-least-once with an idempotent effect; dedup survives a restart | `src/outbox/*`, `src/messaging/publisher.ts`, `processed_messages` table | `npm run demo:crash-write`, `demo:crash-relay` (2 deliveries, 1 effect), `demo:duplicate`; [Outbox](#transactional-outbox-and-idempotency-outbox-та-ідемпотентність), [prefetch](#prefetch--32) |
+| Workers exactly once; retry on `40001` / `40P01`; DLQ | `src/concurrency/worker.ts`, `src/concurrency/retry.ts`, `src/messaging/topology.ts` | `npm run demo:workers`, `demo:retry`, `demo:dlq` (reason from `x-death`) |
+| Realtime only to the owner; SSE `Last-Event-ID` | `src/realtime/*` | `npm run demo:realtime` and `:same-room`; [Last-Event-ID](#last-event-id-a-reconnect-that-loses-nothing) |
+
+### 11.6 Delivery
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| `docker compose up -d --wait` from a clean clone per README; no hidden steps; data survives a restart; waits for dependencies | `docker-compose.yml`, `scripts/acceptance.sh` | `evidence/acceptance.txt` (fresh clone, cold build, `failed steps and checks: 0`); [Quick start](#quick-start); `depends_on: service_healthy / service_completed_successfully` everywhere; `down && up -d --wait` keeps orders and keys |
+| Production image: multi-stage, no shell, non-root, no build secret, scanner threshold | `docker/Dockerfile`, `scripts/scan.sh` | `npm run demo:image` → `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `SCAN_MAX=-1 npm run scan` → `gate=fail`, exit 1. See [The image](#the-image), [The scan gate](#the-scan-gate) |
+| IaC deploy, rollout `failed=0`, two probes, SIGTERM | `infra/` (API, relay, consumer, Postgres, RabbitMQ, migrate Job), `k8s/`, `demo/rollout.sh` | `npm run up` → the whole contour in kind; `demo/contour.mjs` against it → `final=shipped`; `npm run demo:rollout` under load on `GET /products` → `failed=0`. See [Kubernetes: the full contour](#kubernetes-the-full-contour) |
+| Off-machine deploy: green deploy run by digest, or a teardown run | `.github/workflows/pr.yml`, `deploy.yml`, `teardown.yml` | green `pr` run on PR #24 with the whole contour in kind: https://github.com/martsyniuk-denys/r_d/actions/runs/45259552063 (digest built = digest deployed, `contour-final=shipped`, `contour-history=4`, `failed=0`); earlier green runs on PR #23; teardown run in [AWS](#aws) |
+
+### 11.7 Operations and quality
+
+| Criterion | Where | Check |
+| --- | --- | --- |
+| Liveness and readiness on different paths; readiness red on SIGTERM | `src/bootstrap.ts`, `src/health/readiness.service.ts`, `src/main.ts` | `curl localhost:3000/readyz` → `{"status":"ready","checks":{"database":"up","broker":"up"}}`; `docker compose kill -s SIGTERM api` → `/readyz` 503 at once, `/healthz` 200 through the 5 s drain, exit 0; e2e `probes.e2e.test.ts` |
+| Structured logs, one `trace_id`, no secrets | `src/observability/logger.ts`, `request-log.ts`, `amqp-trace.ts` | `docker compose logs --no-log-prefix api relay consumer \| grep <checkout_trace>` → lines from all three processes ([screenshot](evidence/logs-one-trace.png)); `npm run demo:logs` → `secret-in-logs=0` |
+| RED metrics, OTel continues `traceparent`, dashboard as a file | `src/observability/metrics.ts`, `observability/grafana/dashboards/marketplace-red.json` | `demo/contour-trace.mjs` → 5 hops, 0 orphans ([Jaeger screenshot](evidence/jaeger-trace.png)); Grafana row *Main contour* ([screenshot](evidence/grafana-dashboard.png)); `npm run demo:metrics`, `demo:trace` |
+| Tests: integration against a real DB, twice green; e2e of the contour; business logic without HTTP | `test/integration` (orders, products, `order-history.test.ts`, `payments.test.ts`), `test/e2e/orders.e2e.test.ts`, `test/unit/lifecycle.test.ts` | `npm run test:integration` (run it twice), `npm run test:e2e`, `npm run test:unit` |
+| A pipeline in which every gate can say no | `.github/workflows/*`, `demo/gates.sh` | `npm run demo:gates` → `<step>-ok=0`, `<step>-broken=1` for each gate; [CI/CD](#cicd) |
+
+#### Screenshots: logs, traces and the dashboard (ТЗ §7)
+
+All three come from one compose stack (`docker compose --profile obs up -d --wait`), after
+three runs of `demo/contour.mjs` and one of `demo/contour-trace.mjs`. The trace and the log
+lines are the same checkout, `trace_id 7bc1f67cff2f0d27bd70a3524e6d3f3d`.
+
+| What | Screenshot | How to get it again |
+| --- | --- | --- |
+| One checkout across api → relay → consumer: 32 spans, 3 services | [`evidence/jaeger-trace.png`](evidence/jaeger-trace.png) | the `ui=` link that `demo/contour-trace.mjs` prints |
+| The log lines of that checkout: 5 from api, 2 from relay, 3 from consumer, one `trace_id`, `authorization` redacted | [`evidence/logs-one-trace.png`](evidence/logs-one-trace.png) | `docker compose logs --timestamps api relay consumer \| grep <trace_id>` |
+| The RED dashboard and the *Main contour* row over the last 30 minutes | [`evidence/grafana-dashboard.png`](evidence/grafana-dashboard.png) | Grafana on `:22903`, dashboard `marketplace-red` |
+
+The *Errors* panel says *No data*: no request ended in 5xx in that window. Fault injection is
+off in the compose API; `npm run demo:metrics` and `demo:trace` turn it on in their own child
+and show the 5xx share and an `ERROR` span.
+
+![Jaeger: one checkout across three services](evidence/jaeger-trace.png)
+
+## Environment variables
+
+Declared once in `src/config/env.schema.ts`, documented in `.env.example`, checked by
+`npm run check:env`. In compose every secret arrives as a file: for any variable of the
+store (`JWT_*`, `REFRESH_TOKEN_PEPPER`, `STORAGE_SECRET_KEY`, `PAYMENT_WEBHOOK_SECRET`),
+`NAME_FILE` names a file holding the value (`src/config/secret-files.ts`); a value already
+in the environment wins.
+
+| Variable | Required | Default | Source | Purpose |
+| --- | --- | --- | --- | --- |
+| `NODE_ENV` | no | `development` | environment | `development` \| `test` \| `production` |
+| `PORT` | no | `3000` | environment | HTTP port |
+| `DB_URL` | **yes** (or `DATABASE_URL`) | — | `.env` / compose | Postgres URL **without** a password; the schema rejects one with a password |
+| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | environment (a path) | the password, re-read on every new connection (rotation) |
+| `DATABASE_URL` | no | — | environment | grader-style alternative with the password inside; `DB_URL` wins |
+| `DB_POOL_MAX`, `DB_CONNECTION_TIMEOUT_MS` | no | `10`, `5000` | environment | pool size, wait for a connection |
+| `LOG_LEVEL` | no | `info` | environment | `debug` \| `info` \| `warn` \| `error` |
+| `SHUTDOWN_DRAIN_MS` | no | `5000` | environment | SIGTERM → `/readyz` 503 for this long → close |
+| `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER` | **yes** | — | store / `keys` volume | ES256 signing pair and the refresh pepper ([Auth → Variables](#variables-1)) |
+| `JWT_PREVIOUS_PUBLIC_KEY`, `JWT_PREVIOUS_KID` | no | — | store | the retiring key during a rotation |
+| `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_ACCESS_TTL_SECONDS`, `REFRESH_TTL_SECONDS` | no | `marketplace-api`, `600`, 30 days | environment | token claims and lifetimes |
+| `BROKER_URL` | no | — | environment | RabbitMQ URL without a password; the API's realtime feed |
+| `BROKER_PASSWORD_FILE` | no | — | environment (a path) | the broker password |
+| `STORAGE_ENDPOINT`, `STORAGE_REGION`, `STORAGE_BUCKET`, `STORAGE_ACCESS_KEY` | bucket, key id: **yes** | region `us-east-1` | environment | object storage ([Files → Variables](#variables-2)) |
+| `STORAGE_SECRET_KEY` | **yes** | — | store | storage secret key |
+| `UPLOAD_PUT_TTL_SECONDS` | no | see Files | environment | lifetime of a presigned PUT |
+| `PAYMENT_WEBHOOK_SECRET` | **yes**, ≥ 32 chars | — | store / `keys` volume | HMAC key of the provider's webhook |
+| `METRICS_PORT` | no | — | environment | `/metrics` of the relay and the consumer (compose: `9464`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | — | environment | where spans go (compose: `http://jaeger:4318`); unset → no export, trace ids still in logs |
+| `SKIP_VAULT` | no | — | environment | `with-secrets.sh` skips the store; the caller exports the values |
+
+## Security: OWASP Top 10:2025
+
+| Risk | What this project does | Where |
+| --- | --- | --- |
+| A01 Broken Access Control | role by `RolesGuard`, ownership checked in the service (403 for another buyer's order), realtime rooms only for the owner, admin-only status changes | `src/auth/guards.ts`, `src/orders/orders.service.ts`, `src/realtime/order-access.ts` |
+| A02 Security Misconfiguration | fail-fast config, no default secrets in code, closed bucket, Grafana without anonymous access or sign-up, management ports bound to `127.0.0.1` for the obs stand | `src/config/env.schema.ts`, `docker-compose.yml` |
+| A03 Software Supply Chain Failures | `npm ci` from a lockfile, every image pinned to a version, Trivy gate on the image, one build promoted by digest | `docker/Dockerfile`, `scripts/scan.sh`, `.github/workflows/build.yml` |
+| A04 Cryptographic Failures | ES256 with an algorithm allowlist, refresh tokens stored as peppered hashes, `timingSafeEqual` for the webhook HMAC, scrypt for passwords | `src/auth/*`, `src/payments/signature.ts` |
+| A05 Injection | parameterised SQL everywhere; request bodies validated against the spec before a controller runs | `src/repositories/*`, `src/bootstrap.ts` |
+| A06 Insecure Design | the lifecycle as a table enforced in SQL, frozen payment amount, idempotency keys, outbox | `src/orders/lifecycle.ts`, `src/orders/place-order.ts` |
+| A07 Authentication Failures | the same 401 for a wrong password and an unknown e-mail, refresh rotation with reuse detection, logout kills both tokens | `src/auth/auth.service.ts`, e2e `auth.e2e.test.ts` |
+| A08 Software or Data Integrity Failures | webhook signed over the raw body, amount mismatch rejected and journaled, append-only payment events | `src/payments/*` |
+| A09 Security Logging and Alerting Failures | structured logs with `trace_id` and `layer`, secrets redacted (`secret-in-logs=0`), 4xx/5xx rates on the dashboard | `src/observability/*`, `demo/logs.mjs` |
+| A10 Mishandling of Exceptional Conditions | one problem+json filter, no stack traces to clients, readiness red while draining, DLQ for poison messages, retry on `40001`/`40P01` | `src/common/problem.filter.ts`, `src/health/*`, `src/messaging/topology.ts` |
+
+## Secrets and their rotation
+
+Nothing secret is in git, in the image or in an environment value of a container. The store
+has one slug per environment, read by `scripts/with-secrets.sh <slug>`: `dev` is git-ignored
+files (`.env`, `secrets/*`, `secrets/jwt/dev`), `prod` has its own signing key
+(`secrets/jwt/prod`), and `ci` is `store/ci.enc`, AES-encrypted in git and opened by a key that
+lives outside it. No two slugs share a value. Fingerprints only, never the values:
+
+```bash
+node scripts/jwt-keys.mjs fingerprint dev    # dev: kid=dev-2026-10-30-debb2e sha256:b9548fe8a7668fcfa294a5abb563bf0a
+node scripts/jwt-keys.mjs fingerprint prod   # prod: kid=prod-2026-10-30-3cf2bf sha256:4d4c68f2bc109021152e629a077b7da7
+for slug in dev ci; do STORE_KEY="$(cat secrets/ci_store_key)" bash scripts/with-secrets.sh $slug \
+  sh -c 'printf "%s DB_PASSWORD fp=" "$0"; printf %s "$DB_PASSWORD" | shasum -a 256 | cut -c1-16' $slug; done
+# dev DB_PASSWORD fp=15cbb6cbe6e2c6c3
+# ci DB_PASSWORD fp=520cf598dc51748f
+```
+
+`node scripts/jwt-keys.mjs rotate dev` changes the dev fingerprint, and the API logs the new
+one at start (`ES256 keys: <kid> (signing) sha256:…`, the previous kid as `verify only`). In
+compose, the infrastructure passwords are the committed dev values from
+`secrets/*.example`, mounted as compose secrets, and the application's own secrets — the
+JWT signing pair, the refresh pepper, the webhook key — are generated by the `keys` one-shot
+into a volume on the first `up` and never leave it. The image has no `ENV` with a secret
+and no secret in a layer (`npm run demo:image`). Rotation is live: the database password
+through `rotate.sh` without a restart ([how](#rotating-the-database-password-without-a-restart)),
+the signing key through `scripts/jwt-keys.mjs rotate|retire` with the previous key still
+verifying during the overlap ([Auth](#auth-автентифікація-та-авторизація)).
+
+## Kubernetes: the full contour
+
+`npm run up` deploys the coursework API to the kind cluster with all of its contour, not the
+probe stub of homework 28. One Pulumi program (`infra/index.ts`, `infra/backing.ts`) creates
+15 resources:
+
+| Resource | What runs | Why this shape |
+| --- | --- | --- |
+| StatefulSet `postgres` + headless Service | `postgres:16-alpine`, 1 Gi PVC, `pg_isready` over TCP as readiness | the data outlives a pod restart; the readiness check skips initdb's socket-only server |
+| StatefulSet `rabbitmq` + headless Service | `rabbitmq:4.2-alpine`, 1 Gi PVC, `check_running` as readiness | a stable host name: the node is `rabbit@rabbitmq-0`, and its data directory is tied to that name |
+| Job `migrate-<hash>` | `dist/migrate.js`: migrations, then the idempotent seed | named per image: a Job's template cannot change, so a new digest means a new Job. `pulumi up` waits for it, and everything that reads the schema depends on it |
+| Deployment `marketplace-api` (3), Service NodePort 30080, PDB, HPA | `dist/main.js`, `/readyz` (pg) and `/healthz` as two probes, `SHUTDOWN_DRAIN_MS=5000` | the same rollout rules as homework 28, now on the real Nest app |
+| Deployments `marketplace-api-relay`, `marketplace-api-consumer` (1 each) | `dist/relay.js`, `dist/consumer.js`, `/metrics` on 9464 | the background half: outbox → broker, `order.placed` → `confirmed` |
+| Secret `marketplace-api-secrets`, Namespace | 8 store values | see below |
+
+**Secrets.** Each store value Pulumi reads (`DB_PASSWORD`, `BROKER_PASSWORD`, `STORAGE_SECRET_KEY`,
+`JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER`, `PAYMENT_WEBHOOK_SECRET`) goes
+into one Secret. The app pods mount that Secret as files under `/run/secrets/app` (mode 0440,
+group 65532) and read them through the same `NAME_FILE` variables compose uses. Postgres reads
+`POSTGRES_PASSWORD_FILE`, and RabbitMQ gets its password by `secretKeyRef`. No pod spec holds a
+value: `scripts/ci/manifest.sh` looks for every store value, plain and base64, in all Deployments,
+StatefulSets, Jobs and Services and finds 0. Given the Secret itself as a control, it finds 8.
+`infra/config.ts` checks every name before it declares any resource, so a missing one stops
+`pulumi preview` with that name.
+
+**What was measured** (kind v0.33.0, one node, local Docker, 2026-11-24, commit 5ecd96b):
+
+```
+npm run image:build && npm run cluster:up && npm run up      # 15 created, 54 s
+BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/contour.mjs
+  # created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4, exit 0
+BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/webhook.mjs
+  # accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1 second-success-ignored=1 payments=1
+npm run demo:rollout                  # requests=36176 ok=36176 failed=0 rollout-seconds=24
+PROFILE=broken npm run demo:rollout   # requests=8961 failed=311, exit 1 (no probes, no drain)
+npm run demo:pdb                      # healthy=3 evict-1=201 evict-2=429
+```
+
+`demo:rollout` now puts its load on `GET /products`, a real route through Nest and the pool to
+Postgres. It used to hit the stub's `/`. A probe would be the wrong target: `/readyz` is meant to
+go red while a pod drains, and a request during the drain must still be served.
+
+**Cost gate.** `src/mapping.ts` now charges a StatefulSet for its volume claims too. The stand is
+$11.86 a month at Fargate and EBS rates (API 5.65, RabbitMQ 2.17, Postgres 1.96, relay 1.04,
+consumer 1.04), against a base of about $5.04 for the stub. The delta fits the `max($10, 20 %)` budget.
+
+**In CI** (`deploy-kind.yml`) the same program runs on the digest the build job produced and the
+store `store/ci.enc`. After `pulumi up`, a step runs `demo/contour.mjs` through the NodePort with
+the store's webhook key, so a key that never reached the pods fails the job. `demo:rollout` and
+both manifest checks follow. `contour-final` and `contour-history` go into `deploy-evidence.txt`.
+`scripts/store-ci.sh fill` added the new values to the CI store under the same key, so the
+`STORE_KEY` of the `kind` environment did not change.
+
+First green run with the full contour: https://github.com/martsyniuk-denys/r_d/actions/runs/45259552063
+(`contour-final=shipped`, `contour-history=4`, `secrets-checked=6`, `secret-in-manifest=0`, `cost-plan-usd=11.86`
+against a budget of 15.04, `rollout-requests=35999`, `rollout-failed=0`, `rollout-seconds=21`). In the run before it,
+the smoke started a second after `pulumi up`, before kube-proxy served the new pods on the NodePort, and its
+first request got `fetch failed`. The step now waits for `/readyz` through that same port.
+
+**Without the store** (a grader), the variables are exported first, as in
+[the Kubernetes run](#kubernetes-the-rollout-homework):
+
+```bash
+export SKIP_VAULT=1 PULUMI_BACKEND_URL="file://$PWD/.pulumi" PULUMI_CONFIG_PASSPHRASE=grading
+export DB_PASSWORD="$(openssl rand -hex 16)" BROKER_PASSWORD="$(openssl rand -hex 16)"
+export STORAGE_SECRET_KEY="$(openssl rand -hex 16)" REFRESH_TOKEN_PEPPER="$(openssl rand -hex 16)"
+export PAYMENT_WEBHOOK_SECRET="$(openssl rand -hex 32)" JWT_KID=grading-1
+pem="$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256)"
+export JWT_PRIVATE_KEY="$(printf '%s\n' "$pem" | base64 | tr -d '\n')"
+export JWT_PUBLIC_KEY="$(printf '%s\n' "$pem" | openssl pkey -pubout | base64 | tr -d '\n')"
+npm --prefix infra ci && printf dummy > .npm_token
+npm run image:build && npm run cluster:up && npm run up
+BASE_URL=http://127.0.0.1:30080 node demo/contour.mjs     # final=shipped, exit 0
+npm run demo:rollout                                       # failed=0
+npm run destroy && npm run cluster:down
+```
+
+## Honest boundaries
+
+- **Kubernetes runs the contour, not everything.** kind gets the API, relay, consumer,
+  Postgres and RabbitMQ ([Kubernetes: the full contour](#kubernetes-the-full-contour)).
+  pgbouncer, Redis, object storage and the observability stand stay in compose: no route of the
+  contour needs them, and the file routes answer 5xx there. Postgres and RabbitMQ are single
+  replicas on kind's local-path volumes, which is a stand, not a production database.
+- **Redis is not in the contour.** Cache-aside, sessions and the shared rate limit live in
+  their homework processes (`src/pod.ts`, the demos), not in the Nest API that compose runs.
+- **Products and files still use the in-memory `IdempotencyService`.** The orders contour
+  uses the Postgres one; the others were not migrated.
+- **The contract gate flags the status enum** (`created` → `pending`, `confirmed` added) as
+  a breaking change against the base branch. That is correct, and PR #24 carries the label
+  `breaking-approved`: the gate still prints `gate=fail` and then `bypass=breaking-approved`, and
+  does not block. Remove the label to see it block ([CI/CD](#cicd)).
+- **The payment provider is simulated** by the demos (`demo/lib/api-client.mjs` signs like a
+  provider would); there is no real payment integration.
+
+## Running from source
+
+For the npm demos and the test suites. Needs Node 22, Docker, and either access to the
+store (`npm run start:vault` etc.) or `SKIP_VAULT=1` with the values exported (the
+reviewer blocks under [Grading](#grading) show how).
+
+```bash
+npm ci
+docker compose up -d --wait postgres pgbouncer rabbitmq redis-cache redis-queue storage
+npm run build && npm run migrate && npm run seed
+npm run start:vault           # API on 3000 — stop the compose api first, it holds the port
+npm run relay & npm run consumer &
+BASE_URL=http://localhost:3000 npm run demo:contour
+npm run test:unit && npm run test:integration && npm run test:e2e
+```
+
+`npm start` is `npm run build && node dist/main.js` on purpose — not a watch mode, so the
+fail-fast exit code can be tested. Watch mode is `npm run start:dev`.
+
+**The outbox and queue demos run their own relay and consumer** (`demo:outbox`,
+`demo:crash-relay`, `demo:duplicate`, `demo:publish`, `demo:dlq`) and count what *those*
+processes did. A compose relay or consumer on the same queue takes half the deliveries and the
+demo waits for an event that went elsewhere. Stop them for these demos and bring them back:
+
+```bash
+docker compose stop relay consumer
+npm run demo:outbox && npm run demo:crash-relay && npm run demo:duplicate
+docker compose start relay consumer
+```
 
 ## Commands
 
@@ -53,6 +692,12 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run demo:retry` | provokes `40001` and retries the whole transaction with backoff |
 | `npm run demo:realtime` | two WebSocket clients in different rooms; only the addressed one hears the event |
 | `npm run demo:realtime:same-room` | the control run: both clients in one room, so both must hear it |
+| `npm run demo:contour` | the coursework contour against `BASE_URL`: create, replay, 401/403/400, confirmed, paid, shipped, history |
+| `npm run demo:webhook` | the webhook's four answers: accepted, forged signature, amount mismatch, duplicate |
+| `npm run demo:contour-trace` | one trace across api → relay → consumer, read back from Jaeger (`TRACE_API_URL`) |
+| `npm run test:unit` | business logic without HTTP or a database: lifecycle, signature, checkout identity, trace context |
+| `npm run gate:types` / `gate:contract` / `gate:arch` | the gates of the pipeline, runnable locally |
+| `npm run demo:gates` | every gate on a correct and on a broken input: `<step>-ok=0`, `<step>-broken=1` |
 | `npm run consumer` | the `order.placed` consumer: manual ack, prefetch 32, idempotent effect |
 | `npm run demo:publish` | 5 checkouts → 5 `order.placed` → 5 effects, 5 acks, empty DLQ |
 | `npm run demo:dlq` | a poisoned message is rejected into the DLQ; the reason is read from `x-death` |
@@ -90,7 +735,7 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 | `npm run db:indexes` | applies `db/indexes.sql` + `ANALYZE` |
 | `npm run db:psql` | opens a psql shell on the running container |
 | `bash scripts/backup.sh` | `pg_dump -Fc` into a dated file under `backups/` |
-| `bash scripts/restore-drill.sh` | restores the newest dump into a throwaway container and prints `MATCH` |
+| `bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh` | restores the newest dump into a throwaway container and prints `MATCH` |
 | `bash rotate.sh` | rotates the password in Postgres, PgBouncer and the password file |
 | `npm run test:integration` | repositories against a Postgres the test run starts itself |
 | `npm run test:e2e` | the whole application over HTTP, through supertest |
@@ -104,6 +749,24 @@ fail-fast criterion below would be untestable. Watch mode lives in `npm run star
 
 `npm run check` and `npm run smoke` perform exactly the same checks as the raw
 commands below, just collected into one run with readable output.
+
+# Appendix: the homeworks one by one
+
+Everything below is the record of the homeworks this project grew from, in the order
+they were done. The coursework part above links here where an older homework is the
+evidence for a grading row. Some commands below predate the compose application (they
+start their own processes from `dist/`); they still work as written.
+
+# Contract first (homework 09)
+
+Chosen contract option: **B — runtime validation at the boundary**
+(NestJS + `express-openapi-validator`).
+
+`openapi/openapi.yaml` is not documentation sitting next to the code — it is the
+source of truth the validator checks **both requests and responses** against.
+Anything that contradicts the spec does not cross the boundary: an invalid request
+is rejected before it reaches a controller (400), and a response that has drifted
+away from its schema never reaches the client (500 instead of silent drift).
 
 # Configuration
 
@@ -123,18 +786,7 @@ Every variable is declared once, in `src/config/env.schema.ts`, and documented i
 `.env.example`. Types come from `z.coerce` because everything arriving from the
 environment is a string.
 
-| Variable | Required | Default | Source | Purpose |
-| --- | --- | --- | --- | --- |
-| `NODE_ENV` | no | `development` | process environment | Runtime mode: `development` \| `test` \| `production`. |
-| `PORT` | no | `3000` | process environment | HTTP port. Coerced to a number. |
-| `DB_URL` | **yes** | — | **secrets store** — the local `.env`, which is git-ignored; `.env.example` carries a fake | Postgres connection string **without a password**. The schema rejects a URL that contains one. |
-| `DB_PASSWORD_FILE` | no | `./secrets/db_password` | process environment (a path, not a secret) | File holding the database password. Re-read on every new connection. |
-| `DB_POOL_MAX` | no | `10` | process environment | Maximum connections in the pool. |
-| `DB_CONNECTION_TIMEOUT_MS` | no | `5000` | process environment | How long to wait for a pooled connection. |
-| `LOG_LEVEL` | no | `info` | process environment | `debug` \| `info` \| `warn` \| `error`. |
-| `DATABASE_URL` | no | — | process environment | Grader-style alternative to `DB_URL` + `DB_PASSWORD_FILE`, password inside; `DB_URL` wins. |
-| `JWT_*`, `REFRESH_TOKEN_PEPPER` | **yes** (four of them) | — | secrets store | Token keys and the refresh pepper — see [Auth → Variables](#variables-1). |
-| `STORAGE_*`, `UPLOAD_PUT_TTL_SECONDS` | bucket, key id and secret: **yes** | — | secrets store / environment | Object storage — see [Files → Variables](#variables-2). |
+The full table, with the coursework's variables, is [Environment variables](#environment-variables).
 
 The database connection lives in the store this project already had, not in a new env
 file: `DB_URL` carries no password, and the password itself is a separate file
@@ -476,7 +1128,10 @@ the compose stack nor the root `npm ci`, because the demos use only Node built-i
 
 ```bash
 export SKIP_VAULT=1                                  # the grader has no access to the store
-export DB_PASSWORD=grader-secret                     # store variable → K8s Secret marketplace-api-db
+export DB_PASSWORD=grader-secret                     # store variable → K8s Secret marketplace-api-secrets
+# since the coursework the program also needs BROKER_PASSWORD, STORAGE_SECRET_KEY, JWT_PRIVATE_KEY,
+# JWT_PUBLIC_KEY, JWT_KID, REFRESH_TOKEN_PEPPER, PAYMENT_WEBHOOK_SECRET — the export lines are in
+# "Kubernetes: the full contour"
 export PULUMI_BACKEND_URL="file://$PWD/.pulumi"      # local file backend, no pulumi login
 export PULUMI_CONFIG_PASSPHRASE=hw28-grading         # store variable → encrypts the Pulumi state
 npm --prefix infra ci
@@ -489,14 +1144,14 @@ kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptions
 npm run demo:image     # stages=4 shell-inside=0 runtime-uid=65532 token-in-history=0 token-in-config=0 token-in-layers=0
 SCAN_MAX=-1 npm run scan;    echo "exit=$?"     # gate=fail, exit=1
 SCAN_MAX=99999 npm run scan; echo "exit=$?"     # gate=pass, exit=0
-npm run demo:rollout   # profile=safe requests≈280000 ok=requests failed=0 rollout-seconds≈22, exit 0
+npm run demo:rollout   # profile=safe requests≈30000 ok=requests failed=0 rollout-seconds≈21, exit 0 (GET /products)
 npm run demo:pdb       # healthy=3 minAvailable=2 evict-1=201 evict-2=429
 
 npm run destroy && npm run cluster:down
 ```
 
 The names used by the criteria are namespace `marketplace`, Deployment, Service, PDB and HPA
-`marketplace-api`, and Secret `marketplace-api-db`. Criterion 5 runs `pulumi preview` inside
+`marketplace-api`, and Secret `marketplace-api-secrets`. Criterion 5 runs `pulumi preview` inside
 `infra/`; the stack `dev` is selected by `npm run up`. When Pulumi creates the stack it adds an
 `encryptionsalt:` line to `infra/Pulumi.dev.yaml`. That salt comes from the passphrase, so it is
 different for every person, and it is not committed.
@@ -670,7 +1325,7 @@ compose stack does not have to be up, because `@testcontainers/postgresql` start
 database from inside the run:
 
 ```bash
-npm run test:integration            # 8 tests, two repositories, real Postgres
+npm run test:integration            # 27 tests: repositories, status history, payments; real Postgres
 npm run test:integration            # again: still green, nothing cleaned by hand
 npm run test:e2e                    # 4 tests: create → read, 404 and 400
 npm run test:contract               # writes pacts/marketplace-web-marketplace-api.json
@@ -1331,7 +1986,7 @@ thing it is supposed to be testing.
 
 | Command | What runs | Against what |
 | --- | --- | --- |
-| `npm run test:integration` | repositories, 8 tests | a real Postgres started by the test run |
+| `npm run test:integration` | repositories, status history, payment webhooks — 27 tests | a real Postgres started by the test run |
 | `npm run test:e2e` | the whole HTTP application, 4 tests | the real module graph, the real database |
 | `npm run test:contract` | the consumer side of the contract | Pact's mock provider → `pacts/*.json` |
 | `npm run verify:provider` | the real application answering the contract | the local pact file, or the broker |
@@ -1374,6 +2029,10 @@ rather than a `Pool` of their own: in production they are handed the pool, in te
 client the transaction is open on, and inside `checkout()` the connection the TypeORM
 transaction already owns.
 
+One test does need two real connections: the race of two transitions out of one status in
+`order-history.test.ts`. A single rolled-back transaction cannot race itself, so that test
+commits its order and deletes it (and its outbox rows) in `afterAll`.
+
 ```bash
 npm run test:integration && npm run test:integration   # both green, nothing cleaned by hand
 ```
@@ -1408,6 +2067,26 @@ homework writes its order and its line through the second.
 | same product twice in one order → `23505` | `order_items_order_product_unique` |
 | revenue per seller | three-table `JOIN`, two aggregates, a `GROUP BY` and a status filter |
 | deleting an order | `ON DELETE CASCADE` takes the lines with it |
+
+The coursework added the order's lifecycle and its payments: `transition()` and
+`recordStatus()` in `src/orders/lifecycle.ts`, `applyPayment()` in
+`src/payments/apply-payment.ts` — plain SQL on whatever connection the caller's transaction
+is open on, so the tests hand them the rolled-back one.
+
+| Test (`order-history.test.ts`, `payments.test.ts`) | Why a mock would have missed it |
+| --- | --- |
+| transition writes row + history + outbox event | three tables in one transaction; the event carries the history row's id |
+| a transition the table forbids | the refusal is the `UPDATE … WHERE old.status = ANY(…)` matching nothing — no history, no outbox |
+| replay after a `Last-Event-ID` | `id > $2 ORDER BY id` over an identity column |
+| two concurrent transitions out of one status | the row lock in the sub-select: exactly one wins, the loser reads the winner's status |
+| history goes with a deleted order | `ON DELETE CASCADE` |
+| webhook pays a confirmed or a pending order | intent, journal, status and history change together |
+| redelivery of the same event | `ON CONFLICT (provider_event_id) DO NOTHING` — the state after the second call equals the state after the first |
+| wrong amount, wrong currency | compared with `payment_intents`, frozen at checkout; journaled, order unmoved |
+| failed payment, then a retry | intent `failed`, then `succeeded`; the order stays payable in between |
+| money for a cancelled order | journaled as `ignored`, the order does not move |
+| deleting an order with payment events → `23503` | `ON DELETE RESTRICT` keeps the journal |
+| an unknown verdict → `23514` | `payment_events_verdict_known` |
 
 ## End to end
 
@@ -3231,6 +3910,7 @@ by hand.
 docker/Dockerfile           4 stages; the last is gcr.io/distroless/nodejs22-debian12:nonroot, uid 65532
 k8s/kind-config.yaml        one kind node, NodePort 30080 mapped to 127.0.0.1:30080
 infra/                      Pulumi (TypeScript): Namespace, Secret, Deployment, Service, PDB, HPA
+                            (+ coursework: Postgres, RabbitMQ, migrate Job, relay, consumer)
 scripts/with-secrets.sh     the store from #11 → DB_PASSWORD, PULUMI_CONFIG_PASSPHRASE
 scripts/pulumi.sh           up | preview | destroy against a local file backend
 scripts/load.mjs            load generator: one status code per line, 000 for no response
@@ -3242,6 +3922,10 @@ demo/image.sh, rollout.sh, pdb.sh
 ## Kubernetes
 
 ### What runs in the pod
+
+*Since the coursework the Deployment runs `dist/main.js` with Postgres, RabbitMQ, the relay and
+the consumer next to it ([Kubernetes: the full contour](#kubernetes-the-full-contour)). This section
+describes homework 28's stub, which is still in the image as `dist/k8s-pod.js`.*
 
 The image is the whole application: `dist/main.js` and everything it needs are inside. The
 Deployment runs `dist/k8s-pod.js` from the same image. The full API needs Postgres, Redis, RabbitMQ
@@ -3281,7 +3965,8 @@ than 1800 MB.
 
 | Variable | Source | Purpose |
 | --- | --- | --- |
-| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password`, exported by `with-secrets.sh` | the database password; Pulumi puts it into the K8s Secret `marketplace-api-db`, and the pod reads it by `secretKeyRef` |
+| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password`, exported by `with-secrets.sh` | the database password; Pulumi puts it into the K8s Secret `marketplace-api-secrets`, and the pods read it as a file (`DB_PASSWORD_FILE`) |
+| `BROKER_PASSWORD`, `STORAGE_SECRET_KEY`, `JWT_*`, `REFRESH_TOKEN_PEPPER`, `PAYMENT_WEBHOOK_SECRET` | **сховище**: the same files the API reads locally, exported by `with-secrets.sh` | added by the coursework: the same Secret, the same file mount |
 | `PULUMI_CONFIG_PASSPHRASE` | **сховище** (#11): `secrets/pulumi_passphrase`, exported by `with-secrets.sh` | encrypts the Pulumi state, which holds the Secret's value |
 | `PULUMI_BACKEND_URL` | process environment; `scripts/pulumi.sh` defaults it to `file://<repo>/.pulumi` | a local file backend, never a `pulumi login` to an account |
 | `ROLLOUT_PROFILE` | process environment, set by `demo:rollout` | `safe` (default) or `broken` |
@@ -3292,8 +3977,8 @@ No new env file was added. The value travels this way:
 
 ```
 store (.env + secrets/db_password)  →  with-secrets.sh  →  DB_PASSWORD
-  →  Pulumi (pulumi.secret, Secret.data base64)  →  Secret marketplace-api-db
-  →  env[].valueFrom.secretKeyRef  →  process.env.DB_PASSWORD
+  →  Pulumi (pulumi.secret, Secret.data base64)  →  Secret marketplace-api-secrets
+  →  volume /run/secrets/app/DB_PASSWORD  →  DB_PASSWORD_FILE  (homework 28: secretKeyRef → env)
 ```
 
 The Deployment manifest carries only the reference, never the value. The first thing
@@ -4216,6 +4901,7 @@ correct one.
 
 pr-run: https://github.com/martsyniuk-denys/r_d/pull/23 — the graded run is the latest green `pr` run on the PR head (first green: https://github.com/martsyniuk-denys/r_d/actions/runs/43934560195 — 243 468 requests, failed=0, rollout 24 s, built = deployed = registry digest)
 cost-gate-bypass-label: cost-approved
+contract-gate-bypass-label: breaking-approved
 
 **Paths for the criteria.** The workflows are in `.github/workflows/`. The trust condition is
 `oidc/policy.json`, and the gate that applies it is `scripts/oidc-gate.mjs`. The cost mapping is
@@ -4353,14 +5039,16 @@ own process, never to disk, exports the values and unsets `STORE_KEY` before it 
 The app and Pulumi never see the key. The values were generated for CI (`scripts/store-ci.sh init`)
 and protect only the stand the runner creates; none of them is a value from the dev store. The
 store reaches the pod in the same way as on #28: Pulumi writes a K8s Secret (`data`, base64), and
-the container reads it with `secretKeyRef`. `scripts/ci/manifest.sh` counts how many times the
-value appears in the Deployment, both as plain text and as base64, and the count must be 0.
+the containers read it as files (`NAME_FILE`). `scripts/ci/manifest.sh` counts how many times any
+store value appears in the workloads (Deployments, StatefulSets, Jobs, Services), both as plain text
+and as base64, and the count must be 0.
 Base64 is not encryption: putting the value in a Secret means it is not in git, not that it is
 encrypted.
 
 | Variable | Store | What it is for |
 | --- | --- | --- |
-| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password` locally, `store/ci.enc` in CI; exported by `with-secrets.sh` | the database password. It reaches the pod through the K8s Secret `marketplace-api-db` and `secretKeyRef` |
+| `DB_PASSWORD` | **сховище** (#11): `secrets/db_password` locally, `store/ci.enc` in CI; exported by `with-secrets.sh` | the database password. It reaches the pods through the K8s Secret `marketplace-api-secrets`, mounted as files |
+| `BROKER_PASSWORD`, `STORAGE_SECRET_KEY`, `JWT_*`, `REFRESH_TOKEN_PEPPER`, `PAYMENT_WEBHOOK_SECRET` | `store/ci.enc` (added by `scripts/store-ci.sh fill`) | the rest of what the API, relay and consumer need in kind; the webhook key also signs the contour smoke |
 | `PULUMI_CONFIG_PASSPHRASE` | **сховище** (#11): `secrets/pulumi_passphrase` locally, `store/ci.enc` in CI | encrypts the Pulumi state, which holds the Secret's value |
 | `STORE_KEY` | the key **to** the store, not a value in it: `secrets/ci_store_key` locally, the `kind` environment's secret in CI | decrypts `store/ci.enc`, and is dropped before the wrapped command runs |
 
@@ -4441,6 +5129,12 @@ from 3 replicas to 8 passes (+$8.40) and going to 9 fails (+$10.08).
 the label only stops it from blocking. The label name is on the `cost-gate-bypass-label:` line at
 the top of this section.
 
+The contract gate has the same kind of bypass, the label `breaking-approved`, added for the
+coursework PR (#24). That PR renames the order statuses (`created` → `pending`, plus `confirmed`),
+which oasdiff rightly reports as a break, and without the label the deploy job behind the gates
+never runs. With the label the job prints `gate=fail` and then `bypass=breaking-approved`. Only
+oasdiff's exit 1 (ERR found) is let through. A missing or unreadable spec (exit 2) still fails.
+
 **Rates** (`RATES` in `src/mapping.ts`). kind bills nothing, so the price is what the same
 requests would cost elsewhere: the pod requests priced as AWS Fargate pods, plus the two
 Kubernetes objects that become a bill on any cloud.
@@ -4463,11 +5157,12 @@ The `evidence` job runs with `if: always()`, so a red run has evidence too. It c
 
 | File | Contents |
 | --- | --- |
-| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source` (`oidc` only when `policy-allow=1`), `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secret-in-manifest`, `gate-scan-exit`, plus the cost lines |
+| `evidence.txt` | `run-id`, `head-sha` (`github.event.pull_request.head.sha`, not the merge commit), `image-ref`, `built-digest`, `deployed-digest`, `build-invocations`, `creds-source` (`oidc` only when `policy-allow=1`), `oidc-iss/aud/sub/sig-verified`, `rollout-requests/ok/failed/seconds`, `secrets-checked`, `secret-in-manifest`, `contour-final`, `contour-history`, `gate-scan-exit`, plus the cost lines |
 | `deployment.json` | `kubectl get deploy marketplace-api -o json` after `demo:rollout`, the state the run left (generation 2, `REV=2`); checked again for digest and secret |
 | `plan.json` | `pulumi preview --json`, the input to the cost gate |
 | `base-plan.json` | the same preview of the base commit's program, the cost gate's base |
 | `rollout.txt` | the raw output of `demo:rollout` |
+| `contour.txt` | the raw output of `demo/contour.mjs` against the API in kind |
 | `build.log` | one line per build in this run |
 
 None of the numbers is typed in by hand. `rollout-*` come from the file the load generator

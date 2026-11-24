@@ -6,6 +6,7 @@ import type { ConfigService as ConfigServiceType } from '@nestjs/config';
 
 import { validate } from './config/env.schema';
 import type { Env } from './config/env.schema';
+import { loadSecretFiles } from './config/secret-files';
 import { layerLogger } from './observability/logger';
 import { shutdownTracing } from './observability/tracing-shutdown';
 
@@ -26,6 +27,7 @@ function loadEnvFile(): void {
 
 async function main(): Promise<void> {
   loadEnvFile();
+  loadSecretFiles();
   validate(process.env);
 
   const { ConfigService } = await import('@nestjs/config');
@@ -35,8 +37,29 @@ async function main(): Promise<void> {
   const config: ConfigServiceType<Env, true> = app.get(ConfigService);
 
   const port = config.get('PORT', { infer: true });
-  app.enableShutdownHooks();
+  // SIGINT (a terminal) closes at once; SIGTERM (compose, the kubelet) drains first.
+  app.enableShutdownHooks(['SIGINT']);
   await app.listen(port);
+
+  const { ReadinessService } = await import('./health/readiness.service');
+  const readiness = app.get(ReadinessService);
+  const drainMs = config.get('SHUTDOWN_DRAIN_MS', { infer: true });
+  process.once('SIGTERM', () => {
+    readiness.drain();
+    log.info({ drainMs }, 'SIGTERM: /readyz is 503, draining before close');
+    setTimeout(() => {
+      void app.close().then(
+        () => {
+          log.info('closed after drain');
+          process.exit(0);
+        },
+        (err: unknown) => {
+          log.error({ err }, 'close failed');
+          process.exit(1);
+        },
+      );
+    }, drainMs);
+  });
 
   log.info(
     {

@@ -45,6 +45,9 @@ jobs:
         if: env.USE_LOCAL_BROKER == 'true'
         run: docker compose up -d --wait pact-broker
 
+      - name: Unit suite (domain rules, no I/O)
+        run: npm run test:unit
+
       - name: Integration suite (testcontainers)
         run: npm run test:integration
 

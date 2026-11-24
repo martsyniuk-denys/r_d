@@ -43,6 +43,9 @@ export const unauthorized = (detail: string): ProblemError =>
 export const forbidden = (detail: string): ProblemError =>
   new ProblemError({ status: 403, title: 'Forbidden', detail, type: `${TYPE_BASE}/forbidden` });
 
+export const conflict = (detail: string): ProblemError =>
+  new ProblemError({ status: 409, title: 'Conflict', detail, type: `${TYPE_BASE}/conflict` });
+
 export const idempotencyKeyReuse = (detail: string): ProblemError =>
   new ProblemError({
     status: 422,

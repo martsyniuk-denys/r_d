@@ -50,6 +50,8 @@ const USERS: UserFixture[] = [
   { email: 'andrii.shevchenko@example.com', displayName: 'Андрій Шевченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-02T08:00:00Z', role: 'buyer' },
   { email: 'marta.bondarenko@example.com', displayName: 'Марта Бондаренко', country: 'PL', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-03T08:00:00Z', role: 'buyer' },
   { email: 'yurii.tkachenko@example.com', displayName: 'Юрій Ткаченко', country: 'UA', balanceMinor: BUYER_BALANCE_MINOR, createdAt: '2025-02-04T08:00:00Z', role: 'buyer' },
+  // The operator of the coursework's contour: ships paid orders (PATCH /orders/{id}/status).
+  { email: 'ops.admin@example.com', displayName: 'Оператор', country: 'UA', balanceMinor: 0, createdAt: '2025-01-01T08:00:00Z', role: 'admin' },
 ];
 
 const PRODUCTS: ProductFixture[] = [
@@ -368,7 +370,7 @@ async function seedOrders(
   }
 }
 
-async function main(): Promise<void> {
+export async function seed(): Promise<void> {
   const dataSource = await AppDataSource.initialize();
 
   try {
@@ -395,7 +397,7 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((error: unknown) => {
+  seed().catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);
   });

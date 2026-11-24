@@ -16,7 +16,23 @@ export interface Settings {
   rev: string;
   profile: Profile;
   dbPassword: pulumi.Output<string>;
+  // Everything else the API, relay and consumer refuse to start without, by the
+  // name the app reads it under (src/config/env.schema.ts). They reach the pods as
+  // files of one K8s Secret, never as environment values of the pod spec.
+  appSecrets: Record<AppSecret, pulumi.Output<string>>;
 }
+
+export const APP_SECRETS = [
+  'BROKER_PASSWORD',
+  'STORAGE_SECRET_KEY',
+  'JWT_PRIVATE_KEY',
+  'JWT_PUBLIC_KEY',
+  'JWT_KID',
+  'REFRESH_TOKEN_PEPPER',
+  'PAYMENT_WEBHOOK_SECRET',
+] as const;
+
+export type AppSecret = (typeof APP_SECRETS)[number];
 
 function requireEnv(name: string, purpose: string): string {
   const value = process.env[name];
@@ -39,6 +55,9 @@ function profileFromEnv(): Profile {
 
 export function loadSettings(): Settings {
   const dbPassword = requireEnv('DB_PASSWORD', 'the database password the pods read from a K8s Secret');
+  const appSecrets = Object.fromEntries(
+    APP_SECRETS.map((name) => [name, pulumi.secret(requireEnv(name, 'a secret of the API, relay and consumer'))]),
+  ) as Record<AppSecret, pulumi.Output<string>>;
 
   const config = new pulumi.Config();
   const replicas = config.requireNumber('replicas');
@@ -60,5 +79,6 @@ export function loadSettings(): Settings {
     rev: process.env.APP_REV ?? '1',
     profile: profileFromEnv(),
     dbPassword: pulumi.secret(dbPassword),
+    appSecrets,
   };
 }

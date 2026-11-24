@@ -3,7 +3,18 @@ export { Job, JOB_STATUSES, JobStatus } from './job.entity';
 export { Order, ORDER_STATUSES, OrderStatus } from './order.entity';
 export { OrderFulfilment } from './order-fulfilment.entity';
 export { OrderItem } from './order-item.entity';
+export { OrderStatusChange } from './order-status-change.entity';
 export { OutboxMessage } from './outbox-message.entity';
+export {
+  PAYMENT_INTENT_STATUSES,
+  PAYMENT_OUTCOMES,
+  PAYMENT_VERDICTS,
+  PaymentEvent,
+  PaymentIntent,
+  PaymentIntentStatus,
+  PaymentOutcome,
+  PaymentVerdict,
+} from './payment.entity';
 export { ProcessedMessage } from './processed-message.entity';
 export { RefreshToken } from './refresh-token.entity';
 export { RevokedAccessToken } from './revoked-access-token.entity';

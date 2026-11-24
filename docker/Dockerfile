@@ -14,6 +14,10 @@
 # RUN, never an ARG (that lands in `docker history` and the image config) and never a
 # COPY + rm (the rm is a whiteout; the bytes stay in the earlier layer). It is bound
 # to the scope of the private registry only, so public packages never see it.
+#
+# The secret is optional: package-lock.json has no package of the private scope today,
+# so `docker compose up` (and a reviewer without a token) builds with no secret at
+# all. Without the file no .npmrc line is written; with it, the scope gets the token.
 
 ARG NODE_IMAGE=node:22-bookworm-slim
 ARG RUNTIME_IMAGE=gcr.io/distroless/nodejs22-debian12:nonroot
@@ -21,25 +25,30 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/nodejs22-debian12:nonroot
 FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=secret,id=npm_token,required=true \
+RUN --mount=type=secret,id=npm_token \
     --mount=type=cache,target=/root/.npm \
-    printf '@marketplace-private:registry=https://npm.pkg.github.com/\n//npm.pkg.github.com/:_authToken=%s\n' \
-      "$(cat /run/secrets/npm_token)" > /tmp/npmrc \
+    if [ -s /run/secrets/npm_token ]; then \
+      printf '@marketplace-private:registry=https://npm.pkg.github.com/\n//npm.pkg.github.com/:_authToken=%s\n' \
+        "$(cat /run/secrets/npm_token)" > /tmp/npmrc; \
+    else : > /tmp/npmrc; fi \
  && npm ci --userconfig /tmp/npmrc --no-audit --no-fund \
  ; status=$?; rm -f /tmp/npmrc; exit $status
 
 FROM deps AS build
 COPY tsconfig.json nest-cli.json ./
 COPY src ./src
-RUN npm run build
+RUN npm run build \
+ && mkdir -p /out/keys
 
 FROM ${NODE_IMAGE} AS prod-deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=secret,id=npm_token,required=true \
+RUN --mount=type=secret,id=npm_token \
     --mount=type=cache,target=/root/.npm \
-    printf '@marketplace-private:registry=https://npm.pkg.github.com/\n//npm.pkg.github.com/:_authToken=%s\n' \
-      "$(cat /run/secrets/npm_token)" > /tmp/npmrc \
+    if [ -s /run/secrets/npm_token ]; then \
+      printf '@marketplace-private:registry=https://npm.pkg.github.com/\n//npm.pkg.github.com/:_authToken=%s\n' \
+        "$(cat /run/secrets/npm_token)" > /tmp/npmrc; \
+    else : > /tmp/npmrc; fi \
  && npm ci --omit=dev --userconfig /tmp/npmrc --no-audit --no-fund \
  ; status=$?; rm -f /tmp/npmrc; exit $status
 
@@ -50,6 +59,9 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY openapi ./openapi
+# The mount point of the compose keys volume. A fresh named volume takes the owner of
+# the directory it is mounted over, so the one-shot that writes the keys as 65532 can.
+COPY --from=build --chown=65532:65532 /out/keys /keys
 # The code stays owned by root: uid 65532 can read and run it, never rewrite it.
 # Numeric, not "nonroot": kubelet cannot resolve a name to check runAsNonRoot.
 USER 65532:65532

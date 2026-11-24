@@ -1,6 +1,8 @@
 import { DataSource } from 'typeorm';
 
+import { EVENTS_EXCHANGE } from '../messaging/events';
 import { EventPublisher } from '../messaging/publisher';
+import { TraceCarrier, inPublishSpan } from '../observability/amqp-trace';
 
 export const RELAY_BATCH = 50;
 
@@ -9,6 +11,7 @@ interface OutboxRow {
   type: string;
   payload: Record<string, unknown>;
   created_at: Date;
+  trace_context: TraceCarrier | null;
 }
 
 export interface RelayBatch {
@@ -18,7 +21,8 @@ export interface RelayBatch {
 }
 
 export interface RelayHooks {
-  onPublished?: (id: string) => void;
+  // Runs inside the publish span, so it can read the trace id of the row's trace.
+  onPublished?: (id: string, row: { type: string; payload: Record<string, unknown> }) => void;
   // Runs after every publish of the batch has been confirmed and before the
   // UPDATE that marks them. demo:crash-relay holds the process here and kills it.
   beforeMark?: (published: string[]) => Promise<void>;
@@ -54,7 +58,7 @@ export async function relayBatch(
 
   try {
     const rows: OutboxRow[] = await runner.query(
-      `SELECT id, type, payload, created_at
+      `SELECT id, type, payload, created_at, trace_context
          FROM outbox
         WHERE published_at IS NULL
         ORDER BY created_at, id
@@ -64,14 +68,20 @@ export async function relayBatch(
     );
 
     const outcomes = await Promise.allSettled(
-      rows.map(async (row) => {
-        await publisher.publishRaw(row.type, Buffer.from(JSON.stringify(row.payload)), {
-          messageId: row.id,
-          type: row.type,
-          timestamp: Math.floor(new Date(row.created_at).getTime() / 1000),
-        });
-        hooks.onPublished?.(row.id);
-      }),
+      rows.map((row) =>
+        inPublishSpan(
+          { exchange: EVENTS_EXCHANGE, routingKey: row.type, messageId: row.id, stored: row.trace_context },
+          async (headers) => {
+            await publisher.publishRaw(row.type, Buffer.from(JSON.stringify(row.payload)), {
+              messageId: row.id,
+              type: row.type,
+              timestamp: Math.floor(new Date(row.created_at).getTime() / 1000),
+              headers,
+            });
+            hooks.onPublished?.(row.id, row);
+          },
+        ),
+      ),
     );
 
     const published: string[] = [];

@@ -8,6 +8,7 @@ import * as OpenApiValidator from 'express-openapi-validator';
 import { AppModule } from './app.module';
 import { ProblemFilter } from './common/problem.filter';
 import { toProblem } from './common/problem';
+import { ReadinessService } from './health/readiness.service';
 import { requestContext } from './observability/context';
 import { NestPinoLogger } from './observability/nest-logger';
 import { metricsEndpoint, observeRequests } from './observability/request-log';
@@ -22,13 +23,38 @@ export async function configureApp(app: NestExpressApplication): Promise<NestExp
 
   // Prometheus' scrape: registered before everything else, so it is neither
   // counted, logged nor validated against the contract.
-  app.getHttpAdapter().getInstance().get('/metrics', metricsEndpoint);
+  const server = app.getHttpAdapter().getInstance();
+  server.get('/metrics', metricsEndpoint);
+
+  // The probes, for the same reason: they arrive every few seconds from compose or
+  // the kubelet, and a log line per probe would bury the requests. While draining,
+  // every response says "Connection: close", so keep-alive clients reconnect to
+  // another instance instead of to a socket that is about to close.
+  const readiness = app.get(ReadinessService);
+  server.use((_req: Request, res: Response, next: NextFunction) => {
+    if (readiness.draining) res.setHeader('Connection', 'close');
+    next();
+  });
+  server.get('/healthz', (_req: Request, res: Response) => {
+    res.json({ status: 'alive', uptime_seconds: Math.round(process.uptime() * 1000) / 1000 });
+  });
+  server.get('/readyz', (_req: Request, res: Response) => {
+    void readiness.check().then((result) => res.status(result.status === 'ready' ? 200 : 503).json(result));
+  });
 
   // The order is the point: the request's store first, then the observer (so a
   // 400 from the body parser is still counted and logged), then the parser.
   app.use(requestContext());
   app.use(observeRequests());
-  app.use(express.json());
+  // The raw bytes are kept for the one route that must see them: a webhook's HMAC
+  // is over the body as sent, and JSON.stringify(req.body) is not those bytes.
+  app.use(
+    express.json({
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: Buffer }).rawBody = buf;
+      },
+    }),
+  );
 
   app.use(
     OpenApiValidator.middleware({
@@ -46,7 +72,6 @@ export async function configureApp(app: NestExpressApplication): Promise<NestExp
 
   await app.init();
 
-  const server = app.getHttpAdapter().getInstance();
   server.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) return next(err);
     const problem = toProblem(err, req);

@@ -1,7 +1,7 @@
 import { Queryable } from './queryable';
 import { Currency } from './products.repository';
 
-export type OrderStatus = 'pending' | 'paid' | 'shipped' | 'cancelled' | 'refunded';
+export type OrderStatus = 'pending' | 'confirmed' | 'paid' | 'shipped' | 'cancelled' | 'refunded';
 
 export interface OrderRecord {
   id: string;
@@ -45,6 +45,22 @@ interface LineRow {
   product_name: string;
   qty: number;
   unit_price_minor: number;
+}
+
+export interface StatusHistoryEntry {
+  id: string;
+  status: OrderStatus;
+  previousStatus: OrderStatus | null;
+  changedBy: string;
+  changedAt: Date;
+}
+
+interface HistoryRow {
+  id: string;
+  status: OrderStatus;
+  previous_status: OrderStatus | null;
+  changed_by: string;
+  changed_at: Date;
 }
 
 interface RevenueRow {
@@ -131,6 +147,61 @@ export class OrdersRepository {
         unitPriceMinor: row.unit_price_minor,
       })),
     };
+  }
+
+  // A page of orders, newest first; null buyer = every buyer (an admin's view).
+  // Ownership is in the WHERE, not checked after the read.
+  async page(buyerId: string | null, limit: number, offset: number): Promise<OrderRecord[]> {
+    const { rows } = await this.db.query<OrderRow>(
+      `SELECT ${ORDER_COLUMNS}
+         FROM orders
+        WHERE $1::bigint IS NULL OR buyer_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $3`,
+      [buyerId, limit, offset],
+    );
+    return rows.map(toOrder);
+  }
+
+  // The lines of a whole page in one query — not one query per order.
+  async linesOf(orderIds: string[]): Promise<Map<string, OrderLine[]>> {
+    const byOrder = new Map<string, OrderLine[]>(orderIds.map((id) => [id, []]));
+    if (orderIds.length === 0) return byOrder;
+
+    const { rows } = await this.db.query<LineRow & { order_id: string }>(
+      `SELECT oi.order_id, oi.product_id, p.name AS product_name, oi.qty, oi.unit_price_minor
+         FROM order_items oi
+         JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = ANY($1::bigint[])
+        ORDER BY oi.order_id, oi.id`,
+      [orderIds],
+    );
+    for (const row of rows) {
+      byOrder.get(row.order_id)?.push({
+        productId: row.product_id,
+        productName: row.product_name,
+        qty: row.qty,
+        unitPriceMinor: row.unit_price_minor,
+      });
+    }
+    return byOrder;
+  }
+
+  async history(orderId: string, afterId = '0'): Promise<StatusHistoryEntry[]> {
+    const { rows } = await this.db.query<HistoryRow>(
+      `SELECT id, status, previous_status, changed_by, changed_at
+         FROM order_status_history
+        WHERE order_id = $1 AND id > $2
+        ORDER BY id`,
+      [orderId, afterId],
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      previousStatus: row.previous_status,
+      changedBy: row.changed_by,
+      changedAt: row.changed_at,
+    }));
   }
 
   async countLines(orderId: string): Promise<number> {

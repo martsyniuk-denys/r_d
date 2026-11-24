@@ -9,12 +9,16 @@ import { DatabaseModule } from './db/database.module';
 import { FilesController } from './files/files.controller';
 import { FilesService } from './files/files.service';
 import { HealthController } from './health/health.controller';
+import { ReadinessService } from './health/readiness.service';
 import { OrdersController } from './orders/orders.controller';
 import { OrdersService } from './orders/orders.service';
+import { PaymentsController } from './payments/payments.controller';
+import { PaymentsService } from './payments/payments.service';
 import { ProductsController } from './products/products.controller';
 import { ProductsService } from './products/products.service';
 import { OrderEventsService } from './realtime/order-events.service';
 import { OrdersGateway } from './realtime/orders.gateway';
+import { OrderStatusFeed } from './realtime/order-status.feed';
 import { StorageModule } from './storage/storage.module';
 import { validate } from './config/env.schema';
 import { shutdownTracing } from './observability/tracing-shutdown';
@@ -38,7 +42,7 @@ class TelemetryShutdown implements OnApplicationShutdown {
     DatabaseModule,
     StorageModule,
   ],
-  controllers: [HealthController, AuthController, ProductsController, OrdersController, FilesController],
+  controllers: [HealthController, AuthController, ProductsController, OrdersController, PaymentsController, FilesController],
   providers: [
     AuthService,
     AccessTokenGuard,
@@ -47,9 +51,12 @@ class TelemetryShutdown implements OnApplicationShutdown {
     OrdersService,
     IdempotencyService,
     OrderEventsService,
+    OrderStatusFeed,
     OrdersGateway,
+    PaymentsService,
     FilesService,
     TelemetryShutdown,
+    ReadinessService,
   ],
 })
 export class AppModule {}

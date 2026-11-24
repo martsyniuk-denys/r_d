@@ -5,8 +5,11 @@ const BASE = process.env.BASE_URL ?? 'http://localhost:3000';
 // The password is the seed's dev fixture, overridable for a differently seeded database.
 const OWNER = process.env.DEMO_OWNER_EMAIL ?? 'olena.kovalenko@example.com';
 const INTRUDER = process.env.DEMO_INTRUDER_EMAIL ?? 'andrii.shevchenko@example.com';
+const ADMIN = process.env.DEMO_ADMIN_EMAIL ?? 'ops.admin@example.com';
 const PASSWORD = process.env.DEMO_PASSWORD ?? 'marketplace-dev-password';
-const SETTLE_MS = Number(process.env.DEMO_SETTLE_MS ?? 750);
+// The change travels outbox → relay (polls every 100 ms) → broker → every API
+// instance, so it is not instant within the request; 1.5 s is ample on a laptop.
+const SETTLE_MS = Number(process.env.DEMO_SETTLE_MS ?? 1500);
 const ACK_TIMEOUT_MS = 5000;
 
 // The control run differs from the main run by these two lines and nothing else:
@@ -105,6 +108,7 @@ async function main() {
 
   const owner = await login(OWNER);
   const intruderToken = await login(INTRUDER);
+  const adminToken = await login(ADMIN);
 
   const productId = await firstProductId();
   const orderA = await createOrder(owner, productId, 'a');
@@ -141,10 +145,12 @@ async function main() {
     throw new Error('a client was refused its own order — the demo cannot measure anything');
   }
 
-  log(`\n  PATCH /orders/${orderA}/status {"status":"paid"}`);
+  // A status is changed by the system or an operator, never by the buyer: the
+  // operator cancels order A, and only A's room may hear about it.
+  log(`\n  PATCH /orders/${orderA}/status {"status":"cancelled"} (as admin)`);
   await api('PATCH', `/orders/${orderA}/status`, {
-    body: { status: 'paid' },
-    token: owner,
+    body: { status: 'cancelled' },
+    token: adminToken,
   });
 
   await sleep(SETTLE_MS);

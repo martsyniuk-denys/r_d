@@ -20,6 +20,10 @@ on:
         description: git ref or sha whose openapi.yaml is the contract this change must not break
         type: string
         required: true
+      breaking-bypass-label:
+        description: the bypass label of the contract gate when the PR carries it, empty otherwise
+        type: string
+        default: ''
     secrets:
       PACT_BROKER_URL:
         required: false
@@ -66,7 +70,19 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE"
           git show FETCH_HEAD:openapi/openapi.yaml > "$RUNNER_TEMP/base.yaml"
           echo "base $BASE = $(git rev-parse FETCH_HEAD)"
-      - run: npm run gate:contract -- "$RUNNER_TEMP/base.yaml" openapi/openapi.yaml
+      # A breaking change someone has decided to ship: the PR carries the label, the
+      # verdict is still printed as fail with the label next to it, and only exit 1
+      # (oasdiff found ERR) is let through — a missing spec (exit 2) never is.
+      - name: oasdiff breaking — fails on ERR unless the PR carries the bypass label
+        env:
+          BYPASS: ${{ inputs.breaking-bypass-label }}
+        run: |
+          status=0
+          npm run gate:contract -- "$RUNNER_TEMP/base.yaml" openapi/openapi.yaml || status=$?
+          if [ "$status" -eq 0 ]; then echo "gate=pass"; exit 0; fi
+          echo "gate=fail"
+          if [ "$status" -eq 1 ] && [ -n "$BYPASS" ]; then echo "bypass=$BYPASS"; exit 0; fi
+          exit "$status"
 
   arch:
     name: architecture (dependency-cruiser)

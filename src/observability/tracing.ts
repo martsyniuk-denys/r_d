@@ -27,6 +27,17 @@ const UNTRACED = new Set(['/metrics']);
 
 const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 
+// One image, three processes: the service name in Jaeger and in every log line
+// says which one, unless OTEL_SERVICE_NAME already does. Set here, before the
+// logger module reads it.
+const SERVICE_BY_ENTRYPOINT: Record<string, string> = {
+  'main.js': 'marketplace-api',
+  'relay.js': 'marketplace-relay',
+  'consumer.js': 'marketplace-consumer',
+};
+const entrypoint = (process.argv[1] ?? '').split(/[\\/]/).pop() ?? '';
+process.env.OTEL_SERVICE_NAME ||= SERVICE_BY_ENTRYPOINT[entrypoint] ?? 'marketplace-api';
+
 // An empty or non-numeric OTEL_BSP_SCHEDULE_DELAY would reach setTimeout as 0 or
 // NaN, i.e. an export every millisecond; anything but a positive integer is 1 s.
 const configuredDelay = Number.parseInt(process.env.OTEL_BSP_SCHEDULE_DELAY ?? '', 10);
@@ -49,7 +60,7 @@ const spanProcessors: SpanProcessor[] =
       ];
 
 const sdk = new NodeSDK({
-  resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'marketplace-api' }),
+  resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME }),
   spanProcessors,
   instrumentations: [
     new HttpInstrumentation({
@@ -59,7 +70,10 @@ const sdk = new NodeSDK({
     // validator…) is a dozen spans per request that answer no question; the
     // route handler span stays, and http.route on the server span comes from it.
     new ExpressInstrumentation({ ignoreLayersType: [ExpressLayerType.MIDDLEWARE] }),
-    new PgInstrumentation(),
+    // Only SQL that belongs to something: the relay polls the outbox ten times a
+    // second, and every poll as a trace of its own would bury the ones that matter.
+    // Its publishes and the consumer's transactions run inside spans and keep theirs.
+    new PgInstrumentation({ requireParentSpan: true }),
   ],
 });
 

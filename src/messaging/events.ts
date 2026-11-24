@@ -115,3 +115,32 @@ export function parseOrderPlaced(raw: Buffer): OrderPlacedEvent {
 
   return event as OrderPlacedEvent;
 }
+
+export const ORDER_STATUS_CHANGED = 'order.status_changed';
+
+// Every accepted transition of an order. Producers: the checkout's consumer
+// (pending → confirmed), the payment webhook (confirmed → paid), an admin. The API
+// instances turn it into the realtime event of the owner's WebSocket room and SSE
+// stream, whichever process made the change.
+export interface OrderStatusChangedEvent extends DomainEvent {
+  eventId: string;
+  type: typeof ORDER_STATUS_CHANGED;
+  version: 1;
+  occurredAt: string;
+  data: {
+    orderId: string;
+    buyerId: string;
+    status: string;
+    previousStatus: string | null;
+    // order_status_history.id: the realtime sequence number of this change.
+    historyId: string;
+    changedBy: string;
+  };
+}
+
+// An order reaches a status at most once (the transitions are acyclic), so
+// "order 42 became paid" is the business fact, and its id is derived from it.
+export function orderStatusChangedEventId(orderId: string, status: string): string {
+  const hex = createHash('sha256').update(`${ORDER_STATUS_CHANGED}:${orderId}:${status}`).digest('hex');
+  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join('-');
+}

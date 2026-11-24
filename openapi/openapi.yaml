@@ -40,6 +40,8 @@ tags:
     description: Marketplace product catalogue.
   - name: orders
     description: Customer orders.
+  - name: payments
+    description: The payment provider's webhook.
   - name: files
     description: Two-step uploads straight into object storage, and short-lived downloads.
   - name: ops
@@ -498,7 +500,15 @@ paths:
         Creates an order from catalogue items. Line prices and `total_cents` are
         computed by the server — the client sends only `product_id` and `qty`.
         The buyer is the subject of the access token. The operation is idempotent
-        on the `Idempotency-Key` header, per buyer.
+        on the `Idempotency-Key` header, per buyer; the key is stored with the order
+        in the same transaction, so a retry after a timeout or a restart replays it.
+
+        One transaction reserves the stock of every line (no oversell under any
+        concurrency), creates the order as `pending`, freezes the amount the payment
+        webhook is checked against, and writes the `order.placed` event to the outbox.
+        The fulfilment consumer then moves the order to `confirmed`, and the payment
+        webhook to `paid` — read the result with `GET /orders/{orderId}` or
+        `GET /orders/{orderId}/history`.
       tags: [orders]
       security:
         - bearerAuth: []
@@ -541,6 +551,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/IdempotencyKeyReuse'
         '500':
@@ -583,6 +595,45 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/history:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        description: Order identifier.
+        schema:
+          type: string
+          minLength: 1
+        example: o_1
+    get:
+      operationId: getOrderHistory
+      summary: The status history of an order
+      description: |
+        Every accepted transition, oldest first: what the checkout, the fulfilment
+        consumer, the payment webhook or an operator did, and when. The `id` of an
+        entry is the `id:` of the matching SSE frame. Only the buyer (or an admin)
+        may read it.
+      tags: [orders]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderHistory'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /orders/{orderId}/status:
     parameters:
       - name: orderId
@@ -597,14 +648,15 @@ paths:
       operationId: updateOrderStatus
       summary: Change the status of an order
       description: |
-        Writes the new status and publishes an `order.status` event for this order
-        on the realtime bus. Every connected client in the `orders:<id>` room gets
-        it over WebSocket, and every open `GET /orders/{orderId}/events` stream
-        gets it as an SSE frame — one write, two transports.
+        An operator's action: admin only (a buyer's valid token is 403). Only the
+        transitions of the order's life are accepted —
+        `pending → confirmed | paid | cancelled`, `confirmed → paid | cancelled`,
+        `paid → shipped | refunded`, `shipped → refunded`; anything else is 409.
 
-        Transitions are not restricted: any status in the enum may be written, and
-        each accepted write is one event with the next sequence number. Only the
-        buyer of the order (or an admin) may write it.
+        The change, its history entry and an `order.status_changed` event are one
+        transaction. Every connected client in the `orders:<id>` room gets it over
+        WebSocket, and every open `GET /orders/{orderId}/events` stream gets it as an
+        SSE frame — whichever API instance or process made the change.
       tags: [orders]
       security:
         - bearerAuth: []
@@ -629,6 +681,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -646,9 +700,10 @@ paths:
         in: header
         required: false
         description: |
-          Sequence number of the last event the client already has. The server
-          replays every buffered event with a higher number before switching the
-          stream to live, which is how a reconnect loses nothing. Sent
+          Id of the last event the client already has. The server replays every
+          later entry of the order's history (stored in the database, so this works
+          after a restart and against any instance) before switching the stream to
+          live, which is how a reconnect loses nothing. Sent
           automatically by `EventSource` on reconnect.
         schema:
           type: integer
@@ -680,7 +735,7 @@ paths:
 
                   id: 4
                   event: order.status
-                  data: {"id":4,"order_id":"o_1","status":"paid","previous_status":"created","changed_at":"2026-09-30T20:15:04.000Z"}
+                  data: {"id":4,"order_id":"o_1","status":"paid","previous_status":"confirmed","changed_at":"2026-09-30T20:15:04.000Z"}
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -689,6 +744,58 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /payments/webhook:
+    post:
+      operationId: paymentWebhook
+      summary: Payment provider webhook
+      description: |
+        Called by the payment provider, not by a user: there is no bearer token. The
+        `X-Signature` header is `sha256=<hex HMAC-SHA256 of the raw body>` under the
+        shared `PAYMENT_WEBHOOK_SECRET`; a missing or wrong signature is 401.
+
+        - The same `event_id` delivered again is 200 with `verdict: duplicate` and no
+          second effect.
+        - An amount or currency that differs from the one frozen at checkout is 422;
+          the event is journaled and the order does not move.
+        - `outcome: succeeded` moves the order to `paid`.
+      tags: [payments]
+      security: []
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          description: '`sha256=` followed by the hex HMAC-SHA256 of the raw request body.'
+          schema:
+            type: string
+            pattern: '^sha256=[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentWebhook'
+      responses:
+        '200':
+          description: Accepted (or recognised as a duplicate).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: The amount does not match the one frozen at checkout.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -1136,9 +1243,7 @@ components:
           type: string
           example: o_1
         status:
-          type: string
-          enum: [created, paid, cancelled]
-          example: created
+          $ref: '#/components/schemas/OrderStatus'
         buyer_id:
           type: string
           nullable: true
@@ -1171,10 +1276,87 @@ components:
       required: [status]
       properties:
         status:
+          $ref: '#/components/schemas/OrderStatus'
+
+    OrderStatus:
+      type: string
+      enum: [pending, confirmed, paid, shipped, cancelled, refunded]
+      description: |
+        `pending` — placed, stock reserved; `confirmed` — accepted by fulfilment;
+        `paid` — the provider confirmed the payment; `shipped`, `cancelled`,
+        `refunded` — an operator's later steps.
+      example: paid
+
+    OrderHistory:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [id, status, previous_status, changed_by, changed_at]
+            properties:
+              id:
+                type: integer
+                minimum: 1
+                example: 7
+              status:
+                $ref: '#/components/schemas/OrderStatus'
+              previous_status:
+                type: string
+                nullable: true
+                enum: [pending, confirmed, paid, shipped, cancelled, refunded, null]
+                description: null for the first entry (the checkout).
+              changed_by:
+                type: string
+                description: checkout, fulfilment, payment-webhook or admin:<user id>.
+                example: payment-webhook
+              changed_at:
+                type: string
+                format: date-time
+
+    PaymentWebhook:
+      type: object
+      additionalProperties: false
+      required: [event_id, order_id, amount_cents, currency, outcome]
+      properties:
+        event_id:
           type: string
-          enum: [created, paid, cancelled]
-          description: The status to write. Publishes one realtime event per accepted write.
-          example: paid
+          minLength: 1
+          maxLength: 255
+          description: The provider's own id of this event; the deduplication key.
+          example: evt_3f9a
+        order_id:
+          type: string
+          minLength: 1
+          example: o_1
+        amount_cents:
+          type: integer
+          minimum: 0
+          example: 520000
+        currency:
+          type: string
+          enum: [UAH, USD, EUR]
+          example: UAH
+        outcome:
+          type: string
+          enum: [succeeded, failed]
+          example: succeeded
+
+    WebhookReceipt:
+      type: object
+      required: [event_id, order_id, verdict, order_status]
+      properties:
+        event_id:
+          type: string
+        order_id:
+          type: string
+        verdict:
+          type: string
+          enum: [applied, ignored, duplicate]
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
 
     CreateOrderRequest:
       type: object
