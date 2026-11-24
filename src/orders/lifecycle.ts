@@ -59,11 +59,15 @@ export async function transition(
   const from = input.from ?? sourcesOf(to);
 
   // The old status comes from the row locked by the sub-select, so RETURNING can
-  // name it: an UPDATE's RETURNING only sees the new values.
+  // name it: an UPDATE's RETURNING only sees the new values. NO KEY UPDATE, not
+  // UPDATE: the status is not a key, and FOR UPDATE would conflict with the
+  // KEY SHARE that an insert into a child table (order_fulfilments,
+  // payment_events) already holds on this row — the consumer and the webhook
+  // then wait for each other, 40P01.
   const { rows } = await db.query<ChangedRow>(
     `UPDATE orders o
         SET status = $2
-       FROM (SELECT id, status FROM orders WHERE id = $1 FOR UPDATE) old
+       FROM (SELECT id, status FROM orders WHERE id = $1 FOR NO KEY UPDATE) old
       WHERE o.id = old.id
         AND old.status = ANY($3::text[])
       RETURNING o.buyer_id, old.status AS previous`,

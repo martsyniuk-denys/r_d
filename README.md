@@ -70,11 +70,14 @@ webhook against http://api:3000
   ok    amount mismatch: HTTP 422 https://marketplace.example/problems/amount-mismatch, order still confirmed
   ok    accepted: HTTP 200, applied → paid
   ok    duplicate: HTTP 200, verdict duplicate, 'paid' in history 1×
+  ok    second success, another event id: HTTP 200, verdict ignored, 'paid' in history 1×
 
 accepted=1
 rejected-signature=1
 amount-mismatch=1
 duplicates=1
+second-success-ignored=1
+payments=1
 ```
 
 All of this section, the curl walk-through below and the checks of the grading table were
@@ -311,7 +314,7 @@ repository, the pool, the outbox, the broker or a checkout transaction
 | **Main entity** | The order: lines with prices frozen at checkout, a total in minor units, an owner, and a status with a recorded history. |
 | **Main scenario** | Checkout (`pending`) → fulfilment by a background consumer (`confirmed`) → payment webhook (`paid`) → operator (`shipped`); read back by `GET /orders/{id}` and `/history`, pushed live to the owner. |
 | **Invariants** | Stock never goes below zero and is never sold twice. The paid amount equals the total frozen at checkout. A status moves only along the lifecycle table and never back. An order is visible only to its owner and the operator. |
-| **Irreversible operations and their keys** | Placing an order — the `Idempotency-Key` header, scoped to route and user, stored with the request hash in Postgres. Applying a payment — the provider's `event_id` (`UNIQUE`). Fulfilment — the event id derived from the order (`processed_messages`). |
+| **Irreversible operations and their keys** | Placing an order — the `Idempotency-Key` header, scoped to route and user, stored with the request hash in Postgres. Applying a payment — the order itself (`payment_intents` primary key `order_id`: a second success under another `event_id` is `ignored`), and the provider's `event_id` (`UNIQUE`) against redelivery. Fulfilment — the event id derived from the order (`processed_messages`). |
 | **Background work** | The relay (outbox → RabbitMQ), the consumer (fulfilment + confirmation), the API's realtime feed. All are at-least-once with an idempotent effect. |
 | **Load and failure expectations** | Bursts on one product (50 parallel checkouts on one SKU must sell exactly the stock). The broker may be down without stopping checkout. A process may die between any two steps. Data survives a restart; RTO 15 min committed (1.7 s measured), RPO 24 h. |
 
@@ -400,7 +403,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | Full contour: create → background → status → final read by a separate request | `src/orders/*`, `src/messaging/order-placed.consumer.ts`, `src/payments/*` | *compose:* `docker compose run --rm demo demo/contour.mjs` → `created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4`, exit 0; e2e `runs the whole contour` |
 | 50 concurrent, no oversell or lost update; a shortage rolls everything back | `src/orders/place-order.ts`; `src/concurrency/checkout.ts` | e2e `sells exactly the stock under a parallel burst` (30 requests on stock 5 → 5 × 201, 25 × 409, stock 0) and `rolls the whole checkout back when one line is short`; *npm:* `npm run demo:race` (50 parallel on stock 10, see [Race](#race-npm-run-demorace)) |
 | Contract machine-checked: cursor pagination, `Idempotency-Key` required, problem+json 4xx | `openapi/openapi.yaml`, `src/bootstrap.ts`, `src/common/problem.filter.ts`, `src/common/cursor.ts` | `npm run check`; the curl step 5 above (400 problem+json without the key); e2e `keeps 400, 401, 403 and 422 apart`; Pact: `npm run test:contract && npm run verify:provider` |
-| A repeated irreversible operation has one effect; the key comes from the business entity | `src/orders/place-order-once.ts` (key `route:user:key` + request hash), `src/payments/apply-payment.ts` (provider `event_id`), consumer inbox by event id | contour demo `idempotent replay` (same order, `Idempotency-Replay: true`); `demo/webhook.mjs` → `duplicates=1`; `npm run demo:outbox` → `outbox=1 deliveries=1 effect=1`; a second success for the same order under another event id → `ignored`, one payment (`payments.test.ts`); unit `checkout-request.test.ts` (same cart → same hash, other cart → 422) |
+| A repeated irreversible operation has one effect; the key comes from the business entity | The payment is keyed by the order: `payment_intents` has `order_id` as its primary key, and `src/payments/apply-payment.ts` locks that row, so the order can be paid once whatever `event_id` the sender puts in. Fulfilment is keyed by the order too: `eventId = sha256('order.placed:' + orderId)` (`src/messaging/events.ts`, `processed_messages`). Checkout is the one place with a client key (`src/orders/place-order-once.ts`, `route:user:key` + request hash): before the order exists there is no entity to derive a key from, and the hash ties the key to the cart (same key, other cart → 422) | *compose:* `demo/webhook.mjs` → `duplicates=1 second-success-ignored=1 payments=1` (the same order paid twice under two event ids → one `paid`); contour demo `idempotent replay` (`Idempotency-Replay: true`); `npm run demo:outbox` → `requests=2 orders=1 outbox=1 deliveries=1 effect=1`; `payments.test.ts`, unit `checkout-request.test.ts` |
 
 ### 11.3 Data
 
@@ -420,7 +423,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | 401 vs 403; role by guard, ownership in the service; realtime only to the owner | `src/auth/guards.ts`, `src/orders/orders.service.ts`, `src/realtime/order-access.ts` | contour demo `access and validation` (403 other buyer, 401 no token), `operator ships` (buyer → 403); `npm run demo:realtime` |
 | Validation of the contour input; one error format | `openapi/openapi.yaml` (runtime validator), `src/common/problem.filter.ts` | `qty 0 → 400 application/problem+json` in the contour demo |
 | Secrets not in code, git or image layers | `.gitignore`, `.dockerignore`, `src/config/secret-files.ts`, `src/compose-keys.ts` | `npm run demo:image` → `token-in-history=0 token-in-config=0 token-in-layers=0`; `docker inspect r_d-api-1 --format '{{.Config.Env}}'` shows file paths (`*_FILE`) and URLs without passwords, no secret value |
-| Edge: rate limit 429 + `Retry-After` on a shared store; webhook signature, duplicate, amount | `src/ratelimit/sliding-window.ts`, `src/payments/signature.ts` | `npm run demo:ratelimit`; *compose:* `demo/webhook.mjs` → `accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1` |
+| Edge: rate limit 429 + `Retry-After` on a shared store; webhook signature, duplicate, amount | `src/ratelimit/sliding-window.ts`, `src/payments/signature.ts` | `npm run demo:ratelimit`; *compose:* `demo/webhook.mjs` → `accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1 second-success-ignored=1` |
 | Bonus: secret store dev ≠ prod, rotation live | `scripts/with-secrets.sh`, `store/`, `rotate.sh`, `scripts/jwt-keys.mjs` | [Secrets and their rotation](#secrets-and-their-rotation) |
 
 ### 11.5 Asynchrony
@@ -439,7 +442,7 @@ Each row: where it is, the command that shows it, and what it prints. Commands m
 | `docker compose up -d --wait` from a clean clone per README; no hidden steps; data survives a restart; waits for dependencies | `docker-compose.yml`, `scripts/acceptance.sh` | `evidence/acceptance.txt` (fresh clone, cold build, `failed steps and checks: 0`); [Quick start](#quick-start); `depends_on: service_healthy / service_completed_successfully` everywhere; `down && up -d --wait` keeps orders and keys |
 | Production image: multi-stage, no shell, non-root, no build secret, scanner threshold | `docker/Dockerfile`, `scripts/scan.sh` | `npm run demo:image` → `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `SCAN_MAX=-1 npm run scan` → `gate=fail`, exit 1. See [The image](#the-image), [The scan gate](#the-scan-gate) |
 | IaC deploy, rollout `failed=0`, two probes, SIGTERM | `infra/` (API, relay, consumer, Postgres, RabbitMQ, migrate Job), `k8s/`, `demo/rollout.sh` | `npm run up` → the whole contour in kind; `demo/contour.mjs` against it → `final=shipped`; `npm run demo:rollout` under load on `GET /products` → `failed=0`. See [Kubernetes: the full contour](#kubernetes-the-full-contour) |
-| Off-machine deploy: green deploy run by digest, or a teardown run | `.github/workflows/pr.yml`, `deploy.yml`, `teardown.yml` | green `pr` run on PR #23 (built = deployed = registry digest, `failed=0`), teardown run in [AWS](#aws) |
+| Off-machine deploy: green deploy run by digest, or a teardown run | `.github/workflows/pr.yml`, `deploy.yml`, `teardown.yml` | green `pr` run on PR #24 with the whole contour in kind: https://github.com/martsyniuk-denys/r_d/actions/runs/45259552063 (digest built = digest deployed, `contour-final=shipped`, `contour-history=4`, `failed=0`); earlier green runs on PR #23; teardown run in [AWS](#aws) |
 
 ### 11.7 Operations and quality
 
@@ -575,7 +578,7 @@ npm run image:build && npm run cluster:up && npm run up      # 15 created, 53 s
 BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/contour.mjs
   # created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4, exit 0
 BASE_URL=http://127.0.0.1:30080 bash scripts/with-secrets.sh dev node demo/webhook.mjs
-  # accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1
+  # accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1 second-success-ignored=1 payments=1
 npm run demo:rollout                  # requests=30524 ok=30524 failed=0 rollout-seconds=21
 PROFILE=broken npm run demo:rollout   # requests=13626 failed=5664, exit 1 (no probes, no drain)
 npm run demo:pdb                      # healthy=3 evict-1=201 evict-2=429
@@ -1322,7 +1325,7 @@ compose stack does not have to be up, because `@testcontainers/postgresql` start
 database from inside the run:
 
 ```bash
-npm run test:integration            # 26 tests: repositories, status history, payments; real Postgres
+npm run test:integration            # 27 tests: repositories, status history, payments; real Postgres
 npm run test:integration            # again: still green, nothing cleaned by hand
 npm run test:e2e                    # 4 tests: create → read, 404 and 400
 npm run test:contract               # writes pacts/marketplace-web-marketplace-api.json
@@ -1983,7 +1986,7 @@ thing it is supposed to be testing.
 
 | Command | What runs | Against what |
 | --- | --- | --- |
-| `npm run test:integration` | repositories, status history, payment webhooks — 26 tests | a real Postgres started by the test run |
+| `npm run test:integration` | repositories, status history, payment webhooks — 27 tests | a real Postgres started by the test run |
 | `npm run test:e2e` | the whole HTTP application, 4 tests | the real module graph, the real database |
 | `npm run test:contract` | the consumer side of the contract | Pact's mock provider → `pacts/*.json` |
 | `npm run verify:provider` | the real application answering the contract | the local pact file, or the broker |

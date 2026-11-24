@@ -158,3 +158,68 @@ describe('two concurrent transitions out of one status', () => {
     expect(outbox.rowCount).toBe(1);
   });
 });
+
+// The consumer and the payment webhook on one order, as they really meet: each
+// first inserts a row with a foreign key to the order (order_fulfilments,
+// payment_events), which takes FOR KEY SHARE on the order row, and only then
+// moves the status. A transition that locked the row FOR UPDATE conflicted with
+// the other side's KEY SHARE, so each waited for the other: 40P01, a 500 to the
+// provider. A status change is not a key change — FOR NO KEY UPDATE is enough.
+describe('the consumer and the webhook on one order at once', () => {
+  const pool = testPool();
+  const created: { orderId: string; buyerId: string }[] = [];
+
+  afterAll(async () => {
+    for (const { orderId, buyerId } of created) {
+      await pool.query(`DELETE FROM outbox WHERE aggregate_type = 'order' AND aggregate_id = $1`, [orderId]);
+      await pool.query(`DELETE FROM orders WHERE id = $1`, [orderId]);
+      await pool.query(`DELETE FROM users WHERE id = $1`, [buyerId]);
+    }
+    await pool.end();
+  });
+
+  it('does not deadlock when both already hold the foreign-key lock', async () => {
+    const setup = await pool.connect();
+    let orderId: string;
+    try {
+      const buyer = await aUser().create(setup);
+      orderId = (await anOrder().placedBy(buyer).withStatus('pending').create(setup)).id;
+      created.push({ orderId, buyerId: buyer.id });
+    } finally {
+      setup.release();
+    }
+
+    // both sides take their KEY SHARE before either tries to move the status
+    let arrived = 0;
+    let release!: () => void;
+    const bothHoldKeyShare = new Promise<void>((resolve) => (release = resolve));
+
+    const side = async (to: 'confirmed' | 'paid', changedBy: string) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(`SELECT 1 FROM orders WHERE id = $1 FOR KEY SHARE`, [orderId]);
+        if (++arrived === 2) release();
+        await bothHoldKeyShare;
+        const result = await transition(client, { orderId, to, changedBy });
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+
+    const results = await Promise.all([
+      side('confirmed', 'fulfilment'),
+      side('paid', 'payment-webhook'),
+    ]);
+
+    // whichever ran first, the order ends up paid and nobody got 40P01
+    expect(results.some((r) => r.kind === 'changed')).toBe(true);
+    const { rows } = await pool.query<{ status: string }>(`SELECT status FROM orders WHERE id = $1`, [orderId]);
+    expect(rows[0].status).toBe('paid');
+  });
+});

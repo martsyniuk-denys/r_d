@@ -17,6 +17,9 @@ Open in the browser beforehand: Grafana `http://127.0.0.1:22903/d/marketplace-re
 (`admin` / `secrets/grafana_admin_password.example`), Jaeger `http://127.0.0.1:22904`,
 the green CI run https://github.com/martsyniuk-denys/r_d/actions/runs/45259552063.
 
+The kind cluster is not kept running. Only if the lecturer asks for the rollout or the PDB:
+`npm run image:build && npm run cluster:up && npm run up` (≈ 1–2 min), then `npm run destroy && npm run cluster:down`.
+
 If the laptop cannot run Docker on the day, everything below is also recorded:
 `evidence/acceptance.txt` (a fresh clone, step by step) and the CI run's `deploy-evidence`.
 
@@ -26,7 +29,7 @@ If the laptop cannot run Docker on the day, everything below is also recorded:
 | --- | --- | --- | --- | --- |
 | 1 | 1 min | A marketplace. The order is the main entity; its life is pending → confirmed → paid → shipped, each step by a different actor. | the mermaid sequence in README → *The main contour* | — |
 | 2 | 2 min | The whole contour through the public API, and the exit code is the verdict. | `docker compose run --rm demo demo/contour.mjs` | `created=1 replayed=1 confirmed=1 paid=1 final=shipped history=4`, exit 0 |
-| 3 | 1 min | The webhook: forged signature, wrong amount, a duplicate — each has exactly one outcome. | `docker compose run --rm demo demo/webhook.mjs` | `accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1` |
+| 3 | 1 min | The webhook: forged signature, wrong amount, a duplicate, a second payment under another event id — each has exactly one outcome. | `docker compose run --rm demo demo/webhook.mjs` | `accepted=1 rejected-signature=1 amount-mismatch=1 duplicates=1 second-success-ignored=1 payments=1` |
 | 4 | 1.5 min | One trace across three processes, although the relay sends the event later. | `docker compose run --rm demo demo/contour-trace.mjs`, then the trace in Jaeger | 5 hops, 0 orphan spans |
 | 5 | 1 min | RED metrics and the transitions counter on a dashboard that lives in git. | Grafana, row *Main contour* | request rate, errors, p95; `order_status_transitions_total` |
 | 6 | 1.5 min | Readiness goes red before the process stops, so no request lands on a closing API. | `docker compose kill -s SIGTERM api`; `curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/readyz` and `/healthz` within 5 s; `docker compose up -d --wait api` | `/readyz` 503, `/healthz` 200, container exits 0 |
@@ -62,6 +65,12 @@ If time is short, keep 2, 3 and 6: the contour, the money, and the shutdown.
   in Postgres with a hash of the request in the same transaction as the order. The same key with
   another cart gets 422; the same key with the same cart gets the original order and
   `Idempotency-Replay: true`. Payments are deduplicated by the provider's `event_id` (`UNIQUE`).
+- **Is the key derived from the business entity?** For the payment and the fulfilment, yes: the
+  payment is keyed by the order (`payment_intents` primary key `order_id`, locked `FOR UPDATE`),
+  so a second success under another `event_id` is journaled as `ignored` and the order is paid
+  once — `demo/webhook.mjs` → `second-success-ignored=1 payments=1`. The fulfilment event id is
+  `sha256('order.placed:' + orderId)`. Checkout keeps the client's key: before the order exists
+  there is nothing to derive it from, and the stored request hash binds the key to the cart.
 - **Why the key in Postgres and not Redis?** It must commit or roll back together with the order
   it protects. A Redis key can outlive a rolled-back order.
 
@@ -166,10 +175,10 @@ Every row of README → *Block → path* is "yes". The command for each, with wh
 | Prefetch, DLQ, workers | `npm run demo:publish`, `demo:dlq`, `demo:workers` | `prefetch=32`; `work=0 dlq=1`; every job once |
 | Realtime owner only | `npm run demo:realtime`, `:same-room` | `A_RECEIVED=1 B_RECEIVED=0`; same room `B_RECEIVED=1` |
 | Image | `npm run demo:image`; `SCAN_MAX=-1 npm run scan` | `stages=4 shell-inside=0 runtime-uid=65532 token-in-*=0`; `gate=fail` exit 1 |
-| Rollout | `npm run demo:rollout` (kind up) | `failed=0` |
+| Rollout, PDB | `npm run demo:rollout`, `demo:pdb` — the kind cluster is torn down, so first `npm run image:build && npm run cluster:up && npm run up` (≈ 1–2 min) | `failed=0`; `evict-1=201 evict-2=429` |
 | Logs | `npm run demo:logs` | `layers=3 distinct-trace-ids=1 burst-uneven=0 secret-in-logs=0` |
 | Metrics, trace | `npm run demo:metrics`, `demo:trace` | `errors-delta=8`; `trace-matches-log=1` |
-| Tests | `npm run test:integration` twice, `test:e2e`, `test:unit` | 26, 26, 16, 20 passed |
+| Tests | `npm run test:integration` twice, `test:e2e`, `test:unit` | 27, 27, 16, 20 passed |
 
 The outbox and queue demos run their own relay and consumer: `docker compose stop relay consumer`
 first, `docker compose start relay consumer` after (README → *Running from source*).
@@ -183,4 +192,5 @@ first, `docker compose start relay consumer` after (README → *Running from sou
 | Products and files idempotency? | Still the in-memory one; the orders contour uses Postgres. |
 | The contract gate is red on the PR. | On purpose: the status enum changed. The PR carries `breaking-approved`; the gate still prints `gate=fail`, the label only stops it from blocking. |
 | Is the payment provider real? | Simulated: the demos sign like a provider would. |
+| Did the contour ever fail? | Yes, once, found while auditing on 2026-11-24: the consumer and the webhook on one order each inserted a child row (FK → `FOR KEY SHARE` on the order) and then locked the order `FOR UPDATE`, which conflicts with `KEY SHARE` → `40P01`, a 500 to the provider. `transition()` now locks `FOR NO KEY UPDATE` (the status is not a key); regression test `the consumer and the webhook on one order at once` in `order-history.test.ts` was red before the fix. |
 | Is the kind stand production? | One replica of Postgres and RabbitMQ on local-path volumes — a stand. No pgbouncer, Redis or object storage there. |
