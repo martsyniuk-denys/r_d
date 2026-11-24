@@ -3821,7 +3821,7 @@ numbers". The proof is a teardown run in GitHub Actions whose log ends in six ze
 ## AWS
 
 смуга: запасна (LocalStack)
-teardown-run: https://github.com/martsyniuk-denys/r_d/actions/runs/45222852822
+teardown-run: https://github.com/martsyniuk-denys/r_d/actions/runs/45472023855
 region: eu-central-1 (stack config); every emptiness check also covers us-east-1
 
 **Paths for the criteria.** The programs are `infra/base` and `infra/demo` (A1). The
