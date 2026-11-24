@@ -3956,11 +3956,13 @@ permission policy names every action, and no `Action` is `"*"`:
 | `ec2:DescribeNatGateways` | `nat-left`, and waiting for a NAT to reach `deleted` |
 | `ec2:DescribeAddresses` | `eip-left` |
 | `lambda:GetFunction`, `lambda:GetPolicy`, `lambda:ListVersionsByFunction` | reading the Lambda target and its ALB permission before deleting them |
+| `logs:DescribeLogGroups`, `logs:ListTagsForResource` | reading the target's log group and its tags before deleting it |
 | `iam:GetRole`, `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:ListInstanceProfilesForRole` | a role cannot be deleted before what is attached to it is listed and detached |
 | `rds:DeleteDBInstance`, `rds:DeleteDBSubnetGroup` | delete the database, **only if tagged `Project=nodejs-pro-hw31`** |
 | `elasticloadbalancing:DeleteLoadBalancer`, `DeleteListener`, `DeleteTargetGroup`, `DeregisterTargets` | delete the ALB side, same tag condition |
 | `ec2:DeleteNatGateway`, `ec2:ReleaseAddress`, `ec2:DisassociateAddress` | delete the NAT and give its address back (the `eip-left` trap), same tag condition |
 | `lambda:DeleteFunction`, `lambda:RemovePermission` | delete the target, same tag condition |
+| `logs:DeleteLogGroup` | delete the target's `/aws/lambda/hw31-demo-target`, same tag condition |
 | `iam:DetachRolePolicy`, `iam:DeleteRole` | only on `role/hw31-demo-*`, the Lambda's role |
 
 There is no `Create*` and no `Modify*`. Teardown can only take things away. A role that can create
@@ -4067,13 +4069,20 @@ run linked at the top is a dispatch run, because a schedule may be late or dropp
 
 1. a LocalStack 4.14.0 service container, and OIDC → web identity;
 2. **stand**: `pulumi up` base, then demo. Demo creates what the community edition serves (the
-   Lambda target and its IAM role), and its RDS and ELBv2 calls fail with 501 in the log.
+   Lambda target, its IAM role and its log group), and its RDS and ELBv2 calls fail with 501 in
+   the log. The log group is declared in the stack, not left to Lambda: AWS would create
+   `/aws/lambda/<name>` on the first call, untagged and outside the state, and neither `destroy`
+   nor the checks would ever see it.
    LocalStack gets the runner's Docker socket. Without it the Lambda ends up `Failed: Docker not
    available`, `DeleteFunction` on such a function is an `InternalError`, and `pulumi destroy`
    retried it until the job timed out (an earlier run, cancelled after 19 minutes). The destroy
    step has its own 8-minute limit now. Without this step
    there is nothing to destroy, and six zeros over an empty emulator prove nothing.
-   `state-before[...]` records how much there was;
+   `state-before[...]` records how much there was, and the step fails if either stack holds
+   nothing. Demo's `up` exits non-zero here by design (the 501s), so its exit code is ignored and
+   its state is checked instead: an empty demo and a destroyed one give the same six zeros.
+   Demo goes up with `PULUMI_CONTINUE_ON_ERROR=true`, so the 501s do not stop the Lambda, which
+   waits for its log group;
 3. `pulumi destroy --yes`: demo, then base;
 4. `pulumi stack export` of both stacks, uploaded as an artifact. No `--remove`, because after it
    there is nothing to export;

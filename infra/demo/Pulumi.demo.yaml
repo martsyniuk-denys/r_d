@@ -6,3 +6,4 @@ config:
       Stack: demo
       ManagedBy: pulumi
   hw31:withNat: "false"
+encryptionsalt: v1:Ke6wRAblT/g=:v1:rbYHaoEfpPPeGPU3:WHICcmMSrPnggMivokC8NkhSq9FuHw==
