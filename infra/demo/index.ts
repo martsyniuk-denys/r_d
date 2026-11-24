@@ -74,8 +74,19 @@ new aws.iam.RolePolicyAttachment('target-logs', {
   policyArn: 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
 });
 
+// Declared, not left to Lambda: on the first invocation AWS would create
+// /aws/lambda/<name> itself — outside the stack, untagged, so `destroy` would not
+// delete it and no check would see it. Declared here it carries Project/Stack like
+// the rest, `destroy` removes it, and `tagged-resources-left` counts it while it lives.
+// The function depends on it, so the group exists before the first call can make one.
+const targetLogs = new aws.cloudwatch.LogGroup('target', {
+  name: '/aws/lambda/hw31-demo-target',
+  retentionInDays: 1, // stored log bytes are billed; a session's worth is enough
+});
+
 const target = new aws.lambda.Function('target', {
   name: 'hw31-demo-target',
+  loggingConfig: { logFormat: 'Text', logGroup: targetLogs.name },
   runtime: 'nodejs22.x',
   handler: 'index.handler',
   role: targetRole.arn,
@@ -93,7 +104,7 @@ const target = new aws.lambda.Function('target', {
 `,
     ),
   }),
-});
+}, { dependsOn: [targetLogs] });
 
 const alb = new aws.lb.LoadBalancer('alb', {
   name: 'hw31-alb',
